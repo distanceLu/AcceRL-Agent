@@ -24,13 +24,14 @@ export TEXTWORLD_GAME_DIR=<TEXTWORLD_Z8_GAME_DIR>
 ```bash
 conda create -n accerl-agent python=3.10 -y
 conda activate accerl-agent
-python -m pip install --upgrade pip
+python -m pip install --upgrade pip setuptools wheel
 
-# torch/vLLM 请按你的 CUDA 环境选择匹配版本。
-python -m pip install torch transformers "ray[default]" textworld tensorboard vllm
+python -m pip install -r requirements.txt
+
+python -c "import torch, vllm; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('vllm', vllm.__version__)"
 ```
 
-如果集群已经提供 PyTorch 或 vLLM 模块，优先使用集群环境中验证过的版本。
+当前 `requirements.txt` 锁定了 `vllm==0.21.0`、`torch==2.11.0`。vLLM 和 PyTorch/CUDA 版本强相关；如果集群已经提供 PyTorch 或 vLLM 模块，优先使用集群环境中验证过的版本，并同步调整 `requirements.txt` 里的 `torch`/`vllm` 约束。
 
 ## 2. 跑本地 Trainer Smoke Test
 

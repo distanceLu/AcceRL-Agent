@@ -42,7 +42,7 @@ TextWorld episode -> vLLM 生成动作 -> 环境执行 -> 构造 RLSample
 
 该项目面向 Linux GPU 环境。具体版本需要和你的 CUDA、PyTorch、vLLM 组合匹配，主训练链路至少需要：
 
-- Python 3.10 或更新版本。
+- Python >=3.10,<3.15；建议 conda 环境使用 Python 3.10。
 - NVIDIA GPU 和 CUDA 可用的 PyTorch。
 - 支持 FSDP2 的 PyTorch。
 - 支持 `WeightTransferConfig` 相关 weight transfer API 的 vLLM。
@@ -62,13 +62,14 @@ cd AcceRL-Agent
 
 conda create -n accerl-agent python=3.10 -y
 conda activate accerl-agent
-python -m pip install --upgrade pip
+python -m pip install --upgrade pip setuptools wheel
 
-# torch/vLLM 请按你的 CUDA 环境选择匹配版本。
-python -m pip install torch transformers "ray[default]" textworld tensorboard vllm
+python -m pip install -r requirements.txt
+
+python -c "import torch, vllm; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('vllm', vllm.__version__)"
 ```
 
-如果用于正式实验或多人复现，建议把实际可用的 CUDA/PyTorch/vLLM 版本锁定到 `requirements.txt` 或环境文件中。
+当前 `requirements.txt` 锁定了主链路验证目标：`vllm==0.21.0`、`torch==2.11.0`。vLLM 和 PyTorch/CUDA 版本强相关；如果集群已经提供验证过的 PyTorch 或 vLLM 模块，优先使用集群版本，并同步调整 `requirements.txt` 里的 `torch`/`vllm` 约束。
 
 ## 快速开始
 

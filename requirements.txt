@@ -1,0 +1,15 @@
+# AcceRL-Agent core runtime dependencies.
+# Python >=3.10,<3.15 is recommended for the vLLM stack below.
+#
+# The grader/math-verification stack used by accerl_agent/scripts/drgrpo_grader.py
+# is intentionally excluded.
+#
+# vLLM 0.21.0 is the locally verified target here. Its package metadata pins
+# torch==2.11.0 and requires transformers>=4.56.0.
+torch==2.11.0
+transformers>=4.56.0,<6.0.0,!=5.0.*,!=5.1.*,!=5.2.*,!=5.3.*,!=5.4.*,!=5.5.0
+vllm==0.21.0
+
+ray[default]>=2.40.0,<3.0.0
+textworld>=1.6.0,<2.0.0
+tensorboard>=2.17.0,<3.0.0
