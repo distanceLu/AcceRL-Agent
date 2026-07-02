@@ -1446,9 +1446,7 @@ class StatsActor:
         self.tw_steps = deque(maxlen=window_size)
         self.tw_env_steps = deque(maxlen=window_size)
         self.tw_invalid_actions = deque(maxlen=window_size)
-        self.tw_samples_added = deque(maxlen=window_size)
         self.tw_selected_response_lengths = deque(maxlen=window_size)
-        self.tw_selected_abort_flags = deque(maxlen=window_size)
         self.ppo_token_reward_means = deque(maxlen=window_size)
         self.ppo_raw_advantage_means = deque(maxlen=window_size)
         self.ppo_raw_advantage_stds = deque(maxlen=window_size)
@@ -1468,9 +1466,7 @@ class StatsActor:
         steps: int,
         env_steps: int,
         invalid_actions: int,
-        samples_added: int,
         selected_response_lengths: List[int] | None = None,
-        selected_abort_flags: List[bool] | None = None,
         ppo_token_reward_mean: float | None = None,
         ppo_raw_advantage_mean: float | None = None,
         ppo_raw_advantage_std: float | None = None,
@@ -1481,14 +1477,6 @@ class StatsActor:
         grpo_invalid_actions_mean: float | None = None,
     ) -> None:
         selected_response_lengths = selected_response_lengths or []
-        selected_abort_flags = selected_abort_flags or []
-        if len(selected_response_lengths) != len(selected_abort_flags):
-            raise ValueError(
-                "TextWorld selected_response_lengths and selected_abort_flags "
-                "must match: "
-                f"selected_response_lengths={len(selected_response_lengths)} "
-                f"selected_abort_flags={len(selected_abort_flags)}"
-            )
         self.reward_sums.append(float(trajectory_return))
         self.tw_scores.append(float(score))
         self.tw_max_scores.append(float(max_score))
@@ -1496,12 +1484,8 @@ class StatsActor:
         self.tw_steps.append(int(steps))
         self.tw_env_steps.append(int(env_steps))
         self.tw_invalid_actions.append(int(invalid_actions))
-        self.tw_samples_added.append(int(samples_added))
         self.tw_selected_response_lengths.extend(
             int(value) for value in selected_response_lengths
-        )
-        self.tw_selected_abort_flags.extend(
-            bool(value) for value in selected_abort_flags
         )
         if ppo_token_reward_mean is not None:
             self.ppo_token_reward_means.append(float(ppo_token_reward_mean))
@@ -1531,7 +1515,6 @@ class StatsActor:
         )
         reward_count = len(self.reward_sums)
         tw_selected_response_count = len(self.tw_selected_response_lengths)
-        tw_selected_abort_count = len(self.tw_selected_abort_flags)
         ppo_token_reward_mean_count = len(self.ppo_token_reward_means)
         ppo_raw_advantage_mean_count = len(self.ppo_raw_advantage_means)
         ppo_raw_advantage_std_count = len(self.ppo_raw_advantage_stds)
@@ -1569,18 +1552,9 @@ class StatsActor:
             "tw_env_steps_mean": (
                 tw_total_env_steps / tw_episode_count if tw_episode_count else 0.0
             ),
-            "tw_samples_added_mean": (
-                sum(self.tw_samples_added) / tw_episode_count
-                if tw_episode_count else 0.0
-            ),
             "tw_selected_response_length_mean": (
                 sum(self.tw_selected_response_lengths) / tw_selected_response_count
                 if tw_selected_response_count else 0.0
-            ),
-            "tw_selected_abort_rate": (
-                sum(1 for flag in self.tw_selected_abort_flags if flag)
-                / tw_selected_abort_count
-                if tw_selected_abort_count else 0.0
             ),
             "ppo_token_reward_mean": (
                 sum(self.ppo_token_reward_means) / ppo_token_reward_mean_count
@@ -2069,7 +2043,6 @@ class TextWorldTrajectoryState:
     won: bool = False
     lost: bool = False
     selected_response_lengths: List[int] = field(default_factory=list)
-    selected_abort_flags: List[bool] = field(default_factory=list)
 
 
 @dataclass
@@ -2370,7 +2343,6 @@ class TextWorldRolloutWorkerActor:
         model_action_valid = parsed_action.valid and parsed_action.action is not None
 
         state.selected_response_lengths.append(len(result.output_tokens))
-        state.selected_abort_flags.append(result.stop_reason == "abort")
         state.transcript_ids.extend(result.output_tokens)
         if model_action_valid:
             selected_action = parsed_action.action
@@ -2712,7 +2684,6 @@ class TextWorldRolloutWorkerActor:
             _, advantage_std, _ = self._compute_grpo_group_advantages(advantages)
 
             samples = []
-            sampled_group_indices = set()
             for state, raw_return, grpo_reward, advantage in zip(
                 states,
                 raw_returns,
@@ -2728,7 +2699,6 @@ class TextWorldRolloutWorkerActor:
                 )
                 if sample is not None:
                     samples.append(sample)
-                    sampled_group_indices.add(state.group_index)
 
             if samples:
                 self.replay_buffer.add_samples.remote(samples)
@@ -2748,9 +2718,7 @@ class TextWorldRolloutWorkerActor:
                     len(state.step_records),
                     state.env_steps,
                     state.invalid_actions,
-                    1 if state.group_index in sampled_group_indices else 0,
                     list(state.selected_response_lengths),
-                    list(state.selected_abort_flags),
                     grpo_group_reward_mean=group_reward_mean,
                     grpo_group_reward_std=group_reward_std,
                     grpo_advantage_std=advantage_std,
@@ -2867,9 +2835,7 @@ class TextWorldRolloutWorkerActor:
                     len(state.step_records),
                     state.env_steps,
                     state.invalid_actions,
-                    1 if sample is not None else 0,
                     list(state.selected_response_lengths),
-                    list(state.selected_abort_flags),
                     ppo_token_reward_mean=token_reward_mean,
                     ppo_raw_advantage_mean=raw_advantage_mean,
                     ppo_raw_advantage_std=raw_advantage_std,
@@ -3321,10 +3287,8 @@ async def run_textworld_train(args: argparse.Namespace):
                 f"normalized_score={rollout_stats['tw_normalized_score']:.4f} "
                 f"invalid_action_rate={rollout_stats['tw_invalid_action_rate']:.4f} "
                 f"env_steps_mean={rollout_stats['tw_env_steps_mean']:.2f} "
-                f"samples_added_mean={rollout_stats['tw_samples_added_mean']:.2f} "
                 "selected_response_length_mean="
-                f"{rollout_stats['tw_selected_response_length_mean']:.2f} "
-                f"selected_abort_rate={rollout_stats['tw_selected_abort_rate']:.4f}"
+                f"{rollout_stats['tw_selected_response_length_mean']:.2f}"
             )
             if args.rl_algorithm == "ppo":
                 print(
