@@ -1,25 +1,25 @@
 # Quickstart
 
-这份文档用于从新 checkout 的仓库跑到一个最小端到端 TextWorld 训练闭环，并给出换模型、换任务时的检查顺序。
+This guide takes a fresh checkout to the smallest end-to-end TextWorld training loop. It also gives a recommended checklist for changing models or replacing the task.
 
-所有命令默认从仓库根目录执行：
+All commands are intended to run from the repository root:
 
 ```bash
 cd AcceRL-Agent
 ```
 
-先设置两个路径：
+Set two paths first:
 
 ```bash
 export MODEL_PATH=<LOCAL_HF_MODEL_PATH>
 export TEXTWORLD_GAME_DIR=<TEXTWORLD_Z8_GAME_DIR>
 ```
 
-`MODEL_PATH` 指向本地 HuggingFace Causal LM 模型目录。`TEXTWORLD_GAME_DIR` 指向包含 TextWorld `.z8` 文件的目录。
+`MODEL_PATH` should point to a local HuggingFace Causal LM model directory. `TEXTWORLD_GAME_DIR` should point to a directory containing TextWorld `.z8` files.
 
-## 1. 安装依赖
+## 1. Install Dependencies
 
-建议先创建 conda 环境：
+Create a conda environment first:
 
 ```bash
 conda create -n accerl-agent python=3.10 -y
@@ -31,13 +31,13 @@ python -m pip install -r requirements.txt
 python -c "import torch, vllm; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('vllm', vllm.__version__)"
 ```
 
-当前 `requirements.txt` 锁定了 `vllm==0.21.0`、`torch==2.11.0`。vLLM 和 PyTorch/CUDA 版本强相关；如果集群已经提供 PyTorch 或 vLLM 模块，优先使用集群环境中验证过的版本，并同步调整 `requirements.txt` 里的 `torch`/`vllm` 约束。
+The current `requirements.txt` pins `vllm==0.21.0` and `torch==2.11.0`. vLLM, PyTorch, and CUDA versions are tightly coupled. If your cluster already provides validated PyTorch or vLLM modules, prefer those versions and update the `torch`/`vllm` constraints in `requirements.txt` accordingly.
 
-## 2. 跑本地 Trainer Smoke Test
+## 2. Run the Local Trainer Smoke Test
 
-先跑 `local_trainer.py` 的多 trainer smoke test。它不接 TextWorld、不接 vLLM、不接 rollout worker，只验证 tokenizer/model 加载、response-only labels、Ray FSDP 多 trainer 初始化、forward/backward 和 optimizer step。
+Start with the multi-trainer smoke test in `local_trainer.py`. It does not use TextWorld, vLLM, or rollout workers. It only validates tokenizer/model loading, response-only labels, Ray FSDP multi-trainer initialization, forward/backward, and optimizer steps.
 
-下面示例启动 2 个 FSDP trainer，需要至少 2 张可见 GPU：
+The example below starts 2 FSDP trainers and needs at least 2 visible GPUs:
 
 ```bash
 python accerl_agent/local_trainer.py \
@@ -51,11 +51,11 @@ python accerl_agent/local_trainer.py \
   --trust-remote-code
 ```
 
-验收标准：多个 Ray FSDP worker 都能启动，完成几个 optimizer steps，loss 是有限值，没有 tokenizer/model/FSDP 初始化错误。
+Success criteria: all Ray FSDP workers start, complete a few optimizer steps, produce finite loss values, and report no tokenizer/model/FSDP initialization errors.
 
-## 3. 跑 TextWorld 本地推理
+## 3. Run Local TextWorld Inference
 
-再跑 `textworld_local_infer.py`，只验证 vLLM 推理和环境交互：
+Next, run `textworld_local_infer.py` to validate only vLLM inference and environment interaction:
 
 ```bash
 python accerl_agent/textworld_local_infer.py \
@@ -72,17 +72,17 @@ python accerl_agent/textworld_local_infer.py \
   --vllm-max-num-batched-tokens 2048
 ```
 
-验收标准：episode 能正常运行到结束或达到 step limit，日志中能看到 observation、model output、parsed action、reward 和 done。
+Success criteria: episodes run until completion or the step limit, and logs show observations, model outputs, parsed actions, rewards, and done states.
 
-## 4. 跑最小端到端 RL 闭环
+## 4. Run the Smallest End-to-End RL Loop
 
-完整框架会同时占用 FSDP 训练 GPU 和 vLLM 推理 GPU：
+The full framework uses both FSDP training GPUs and vLLM inference GPUs:
 
 ```text
 total GPUs >= fsdp_world_size + infer_tp_size * infer_size
 ```
 
-下面命令使用 1 张 FSDP GPU 和 1 张 vLLM GPU，适合 smoke test：
+The command below uses 1 FSDP GPU and 1 vLLM GPU, so it is suitable for a smoke test:
 
 ```bash
 python accerl_agent/agent_textworld.py \
@@ -111,114 +111,114 @@ python accerl_agent/agent_textworld.py \
   --trust-remote-code
 ```
 
-验收标准：
+Success criteria:
 
-- rollout worker 能持续产出样本。
-- replay buffer 非空。
-- trainer 能执行 optimizer step。
-- vLLM 能收到初始全量同步和后续 trainable 权重同步。
-- `runs/TextWorld_FSDP/<timestamp>` 下出现 TensorBoard event 文件。
+- Rollout workers keep producing samples.
+- The replay buffer is non-empty.
+- The trainer completes optimizer steps.
+- vLLM receives the initial full sync and later trainable-weight syncs.
+- TensorBoard event files appear under `runs/TextWorld_FSDP/<timestamp>`.
 
-查看指标：
+Open TensorBoard:
 
 ```bash
 tensorboard --logdir runs/TextWorld_FSDP
 ```
 
-## 5. 放大实验
+## 5. Scale the Experiment
 
-smoke test 通过后，建议一次只放大一个维度：
+After the smoke test passes, scale one dimension at a time:
 
-1. 增大 `--tw-game-limit` 和 `--tw-max-episode-steps`。
-2. 增大 `--rollout-batch-size` 和 `--num-rollout-workers`。
-3. 增大 `--batch-size` 或 `--grad-accum-steps`。
-4. 从 `--train-mode lm_head` 切到 `last_layer`，最后再切到 `full`。
-5. 调整 `--sync-every-optimizer-steps` 和 `--replay-capacity` 控制样本滞后。
+1. Increase `--tw-game-limit` and `--tw-max-episode-steps`.
+2. Increase `--rollout-batch-size` and `--num-rollout-workers`.
+3. Increase `--batch-size` or `--grad-accum-steps`.
+4. Move from `--train-mode lm_head` to `last_layer`, then finally to `full`.
+5. Tune `--sync-every-optimizer-steps` and `--replay-capacity` to control sample staleness.
 
-优先观察这些指标：
+Watch these metrics first:
 
-| 指标 | 用途 |
+| Metric | Purpose |
 | --- | --- |
-| `TextWorld/InvalidActionRate` | 判断模型/parser 是否产生有效命令。 |
-| `Replay/FillRatio` | 判断 rollout 是否能喂饱 trainer。 |
-| `Replay/TrainSampleTrainerVersionLagMean` | 判断训练样本是否太旧。 |
-| `Train/LossMeanAcrossRanks` | 判断训练是否稳定。 |
-| `KL/OldNewK3TokenMean` | 判断 policy update 是否过大。 |
-| `Infer/TokensPerSec` | 判断 vLLM 吞吐是否正常。 |
-| `Sync/ElapsedSeconds` | 判断权重同步是否成为瓶颈。 |
+| `TextWorld/InvalidActionRate` | Checks whether the model/parser produces valid commands. |
+| `Replay/FillRatio` | Checks whether rollout keeps the trainer fed. |
+| `Replay/TrainSampleTrainerVersionLagMean` | Checks whether training samples are too stale. |
+| `Train/LossMeanAcrossRanks` | Checks training stability. |
+| `KL/OldNewK3TokenMean` | Checks whether policy updates are too large. |
+| `Infer/TokensPerSec` | Checks vLLM throughput. |
+| `Sync/ElapsedSeconds` | Checks whether weight sync is a bottleneck. |
 
-## 6. 保存 Checkpoint
+## 6. Save Checkpoints
 
-启用 HuggingFace 格式 checkpoint：
+Enable HuggingFace-format checkpoint saving:
 
 ```bash
 --save-checkpoint
 ```
 
-默认路径：
+Default path:
 
 ```text
 <log-dir>/checkpoints/latest
 ```
 
-周期性保存：
+Periodic saving:
 
 ```bash
 --save-checkpoint --checkpoint-every-sync-rounds 5
 ```
 
-默认情况下，周期保存和最终保存都会覆盖 `latest`。如果想保留每个 step 的独立目录，设置：
+By default, periodic and final saves both overwrite `latest`. To keep independent directories for each step, set:
 
 ```bash
 --checkpoint-name ""
 ```
 
-当前 checkpoint 包含模型权重、config、tokenizer 文件和 `trainer_state.json`，不包含 optimizer state 或 replay buffer，因此主要用于推理/评估，不是完整 resume-training checkpoint。
+The current checkpoint contains model weights, config, tokenizer files, and `trainer_state.json`. It does not include optimizer state or the replay buffer, so it is mainly intended for inference/evaluation rather than full training resume.
 
-## 7. 换模型
+## 7. Change Models
 
-换模型时，先从最小训练范围开始：
+When switching models, start with the smallest trainable scope:
 
 1. `--train-mode lm_head`
 2. `--train-mode last_layer`
 3. `--train-mode full`
 
-非 Qwen/Qwen-MoE 风格模型需要重点检查：
+For non-Qwen or non-Qwen-MoE style models, carefully check:
 
 - `build_tokenizer()`
 - `build_model()`
 - `configure_trainable_parameters()`
-- `FSDPTrainWorker.__init__()` 中的 `fully_shard(model.model.layers)` 路径
+- The `fully_shard(model.model.layers)` path in `FSDPTrainWorker.__init__()`
 - `iter_vllm_loadable_weights()`
 
-常见问题：
+Common issues:
 
-- transformer layers 不在 `model.model.layers`。
-- 输出头不叫 `lm_head`。
-- HuggingFace 参数名和 vLLM loader 期望的名字不一致。
-- tokenizer 没有合适的 chat template 或 pad token。
+- Transformer layers are not under `model.model.layers`.
+- The output head is not named `lm_head`.
+- HuggingFace parameter names do not match the names expected by the vLLM loader.
+- The tokenizer does not have a suitable chat template or pad token.
 
-## 8. 换任务
+## 8. Change Tasks
 
-如果不是 TextWorld，建议新建一个 rollout actor，而不是在原类里硬改所有 TextWorld 逻辑。
+For non-TextWorld tasks, prefer creating a new rollout actor instead of editing all TextWorld-specific logic inside the existing class.
 
-需要保留的系统边界主要是：
+The main system boundaries to keep are:
 
 ```python
 result = await infer_actor.request_batch.remote(...)
 replay_buffer.add_samples.remote(samples)
 ```
 
-新的 rollout actor 需要完成：
+The new rollout actor should:
 
-1. 构造模型输入 token。
-2. 调用 vLLM generation。
-3. 把模型输出解析成任务动作或答案。
-4. 计算 task reward。
-5. 构造合法的 `RLSample`。
-6. 写入 replay buffer。
+1. Build model input tokens.
+2. Call vLLM generation.
+3. Parse the model output into a task action or answer.
+4. Compute task reward.
+5. Build valid `RLSample` objects.
+6. Write samples to the replay buffer.
 
-TextWorld 任务里最常替换的函数：
+The TextWorld functions most commonly replaced are:
 
 - `TEXTWORLD_SYSTEM_PROMPT`
 - `format_textworld_user_content()`
@@ -229,47 +229,47 @@ TextWorld 任务里最常替换的函数：
 - `_compute_token_level_advantages()`
 - `_compute_grpo_group_advantages()`
 
-## 9. 检查 RLSample 对齐
+## 9. Check RLSample Alignment
 
-这是最重要的稳定性检查。每条样本都要保证：
+This is the most important stability check. Every sample must guarantee:
 
-- prompt token 的 label 是 `-100`。
-- 参与训练的 response token 的 label 等于 token id。
-- 参与训练的 response token 有 old-policy logprob。
-- abort 或不训练的输出可以保留在 `input_ids`，但 label 必须是 `-100`。
-- `response_ids` 正好包含所有 `labels != -100` 的 token。
-- `output_versions` 和 `response_ids` 等长。
-- 总长度不超过 `--max-length` 和 `--tw-history-token-window`。
+- Prompt-token labels are `-100`.
+- Trainable response-token labels equal the token ids.
+- Trainable response tokens have old-policy logprobs.
+- Aborted or non-trainable outputs may stay in `input_ids`, but their labels must be `-100`.
+- `response_ids` contains exactly all tokens where `labels != -100`.
+- `output_versions` has the same length as `response_ids`.
+- Total sequence length does not exceed `--max-length` or `--tw-history-token-window`.
 
-## 常见问题
+## Troubleshooting
 
-### trainer 一直等 replay
+### The trainer keeps waiting for replay
 
-- 确认 `--num-rollout-workers >= --fsdp-world-size`。
-- 降低 `--min-replay-size-per-rank`。
-- 查看 `TextWorld/InvalidActionRate`。
-- 确认 `--tw-game-dir` 和 `--tw-game-pattern` 能匹配真实 `.z8` 文件。
+- Confirm `--num-rollout-workers >= --fsdp-world-size`.
+- Lower `--min-replay-size-per-rank`.
+- Check `TextWorld/InvalidActionRate`.
+- Confirm `--tw-game-dir` and `--tw-game-pattern` match real `.z8` files.
 
-### invalid action rate 很高
+### Invalid action rate is high
 
-- 降低 temperature。
-- 减小 `--infer-max-tokens` 或 `--max-action-tokens`。
-- 打开更详细的推理日志。
-- 确认 parser 和输出格式一致。
-- 确认 admissible commands 已完整放进 prompt。
+- Lower the temperature.
+- Reduce `--infer-max-tokens` or `--max-action-tokens`.
+- Enable more detailed inference logs.
+- Confirm that the parser matches the output format.
+- Confirm that admissible commands are fully included in the prompt.
 
-### vLLM 权重同步失败
+### vLLM weight sync fails
 
-- 按上面的公式检查 GPU 数量。
-- 检查 NCCL 环境和节点通信。
-- 确认 vLLM 版本支持当前 weight-transfer API。
-- 检查 `iter_vllm_loadable_weights()` 输出的名字、shape 和 dtype。
-- 确认当前 trainable 参数集合不是空的。
+- Check GPU count using the formula above.
+- Check the NCCL environment and node communication.
+- Confirm that the vLLM version supports the current weight-transfer API.
+- Check names, shapes, and dtypes emitted by `iter_vllm_loadable_weights()`.
+- Confirm that the current trainable parameter set is not empty.
 
-### loss 或 KL 不稳定
+### Loss or KL is unstable
 
-- 降低学习率。
-- 减小 `--sync-every-optimizer-steps` 或 `--replay-capacity`，减少样本滞后。
-- 尝试 `--ppo-normalize-advantages`。
-- 增大 `--old-new-kl-coef`。
-- 确认非法、abort 或空输出没有被错误地设成可训练 token。
+- Lower the learning rate.
+- Reduce `--sync-every-optimizer-steps` or `--replay-capacity` to reduce sample staleness.
+- Try `--ppo-normalize-advantages`.
+- Increase `--old-new-kl-coef`.
+- Confirm that invalid, aborted, or empty outputs are not mistakenly marked as trainable tokens.
