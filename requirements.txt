@@ -13,3 +13,4 @@ vllm==0.21.0
 ray[default]>=2.40.0,<3.0.0
 textworld>=1.6.0,<2.0.0
 tensorboard>=2.17.0,<3.0.0
+safetensors>=0.4.0,<1.0.0

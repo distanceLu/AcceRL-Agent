@@ -23,6 +23,7 @@ import textworld.gym
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from safetensors.torch import save_file as save_safetensors
 from torch.distributed.fsdp import fully_shard
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -69,6 +70,9 @@ class EncodedExample:
         token_rewards: List[float],
         token_advantages: List[float],
         response_indices: List[int],
+        old_values: List[float],
+        value_returns: List[float],
+        value_targets_initialized: bool,
     ):
         self.input_ids = input_ids
         self.attention_mask = attention_mask
@@ -79,6 +83,79 @@ class EncodedExample:
         self.token_rewards = token_rewards
         self.token_advantages = token_advantages
         self.response_indices = response_indices
+        self.old_values = old_values
+        self.value_returns = value_returns
+        self.value_targets_initialized = bool(value_targets_initialized)
+
+
+class TokenValueHead(torch.nn.Module):
+    """Two-layer token value head parallel to the causal LM head."""
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        value_hidden_size = max(int(hidden_size) // 2, 1)
+        self.proj = torch.nn.Linear(hidden_size, value_hidden_size)
+        self.activation = torch.nn.SiLU()
+        self.output = torch.nn.Linear(value_hidden_size, 1)
+        torch.nn.init.normal_(self.output.weight, mean=0.0, std=0.01)
+        torch.nn.init.zeros_(self.output.bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.output(self.activation(self.proj(hidden_states)))
+
+
+def compute_token_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    gamma: float,
+    gae_lambda: float,
+    bootstrap: float | torch.Tensor = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute classic GAE and returns over an ordered response-token stream."""
+    if rewards.ndim != 1 or values.ndim != 1 or rewards.shape != values.shape:
+        raise ValueError(
+            "rewards and values must be 1-D tensors with the same shape, got "
+            f"{rewards.shape} and {values.shape}"
+        )
+    if rewards.numel() == 0:
+        return torch.empty_like(rewards), torch.empty_like(values)
+
+    bootstrap_value = torch.as_tensor(
+        bootstrap,
+        device=values.device,
+        dtype=values.dtype,
+    )
+    advantages = torch.empty_like(values)
+    running_gae = torch.zeros((), device=values.device, dtype=values.dtype)
+    for index in range(rewards.numel() - 1, -1, -1):
+        next_value = (
+            bootstrap_value if index + 1 == rewards.numel() else values[index + 1]
+        )
+        delta = rewards[index] + gamma * next_value - values[index]
+        running_gae = delta + gamma * gae_lambda * running_gae
+        advantages[index] = running_gae
+    return advantages, advantages + values
+
+
+def compute_clipped_value_loss(
+    current_values: torch.Tensor,
+    old_values: torch.Tensor,
+    returns: torch.Tensor,
+    clip_eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return PPO clipped value MSE (without coefficient) and clip fraction."""
+    if current_values.shape != old_values.shape or current_values.shape != returns.shape:
+        raise ValueError("current_values, old_values, and returns must share a shape")
+    clipped_values = old_values + torch.clamp(
+        current_values - old_values,
+        -clip_eps,
+        clip_eps,
+    )
+    loss_unclipped = (current_values - returns) ** 2
+    loss_clipped = (clipped_values - returns) ** 2
+    loss = 0.5 * torch.maximum(loss_unclipped, loss_clipped).mean()
+    clip_fraction = ((current_values - old_values).abs() > clip_eps).float().mean()
+    return loss, clip_fraction
 
 
 def set_seed(seed: int) -> None:
@@ -114,6 +191,9 @@ def make_collate_fn(tokenizer):
         token_rewards = []
         token_advantages = []
         response_indices = []
+        old_values = []
+        value_returns = []
+        value_targets_initialized = []
 
         for example in examples:
             pad_len = max_len - len(example.input_ids)
@@ -126,6 +206,9 @@ def make_collate_fn(tokenizer):
             token_rewards.append(example.token_rewards + [0.0] * pad_len)
             token_advantages.append(example.token_advantages + [0.0] * pad_len)
             response_indices.append(example.response_indices + [-1] * pad_len)
+            old_values.append(example.old_values + [0.0] * pad_len)
+            value_returns.append(example.value_returns + [0.0] * pad_len)
+            value_targets_initialized.append(example.value_targets_initialized)
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
@@ -137,6 +220,12 @@ def make_collate_fn(tokenizer):
             "token_rewards": torch.tensor(token_rewards, dtype=torch.float32),
             "token_advantages": torch.tensor(token_advantages, dtype=torch.float32),
             "response_indices": torch.tensor(response_indices, dtype=torch.long),
+            "old_values": torch.tensor(old_values, dtype=torch.float32),
+            "value_returns": torch.tensor(value_returns, dtype=torch.float32),
+            "value_targets_initialized": torch.tensor(
+                value_targets_initialized,
+                dtype=torch.bool,
+            ),
         }
 
     return collate
@@ -195,7 +284,14 @@ def log_parameter_count(model, train_mode: str, rank: int = 0):
 
 
 def move_batch_to_device(batch: Dict, device) -> Dict:
-    return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+    return {
+        key: (
+            value.to(device, non_blocking=True)
+            if isinstance(value, torch.Tensor)
+            else value
+        )
+        for key, value in batch.items()
+    }
 
 
 def build_tokenizer(args: argparse.Namespace, log: bool = True):
@@ -343,24 +439,66 @@ class FSDPTrainWorker:
         configure_trainable_parameters(model, args.train_mode)
         log_parameter_count(model, args.train_mode, rank=rank)
 
-        named_parameters = list(model.named_parameters())
-        all_param_names = [name for name, _ in named_parameters]
-        trainable_param_names = [
-            name for name, param in named_parameters if param.requires_grad
+        policy_named_parameters = list(model.named_parameters())
+        policy_param_names = [name for name, _ in policy_named_parameters]
+        policy_trainable_param_names = [
+            name for name, param in policy_named_parameters if param.requires_grad
         ]
         self.weight_metadata_by_scope = {
-            "all": get_vllm_weight_metadata(named_parameters),
+            "all": get_vllm_weight_metadata(policy_named_parameters),
             "trainable": get_vllm_weight_metadata(
                 [
                     (name, param)
-                    for name, param in named_parameters
+                    for name, param in policy_named_parameters
                     if param.requires_grad
                 ]
             ),
         }
 
+        self.value_head = None
+        self.value_head_param_names = []
+        if args.rl_algorithm == "ppo":
+            hidden_size = int(model.config.hidden_size)
+            value_head = TokenValueHead(hidden_size).to(
+                device=self.device,
+                dtype=torch_dtype,
+            )
+            model.add_module("value_head", value_head)
+            self.value_head = value_head
+            self.value_head_param_names = [
+                f"value_head.{name}" for name, _ in value_head.named_parameters()
+            ]
+            if rank == 0:
+                value_param_count = sum(param.numel() for param in value_head.parameters())
+                print(
+                    "[train] PPO value head: "
+                    f"hidden_size={hidden_size} "
+                    f"value_hidden_size={max(hidden_size // 2, 1)} "
+                    f"parameters={value_param_count:,}"
+                )
+
+        backbone_parameter_ids = {id(param) for param in model.model.parameters()}
+        output_embeddings = model.get_output_embeddings()
+        output_embeddings_has_own_parameters = (
+            output_embeddings is not None
+            and any(
+                id(param) not in backbone_parameter_ids
+                for param in output_embeddings.parameters()
+            )
+        )
         for layer in model.model.layers:
             fully_shard(layer)
+        fully_shard(
+            model.model,
+            # A tied LM head reuses the backbone embedding parameter after the
+            # backbone forward, so keep that directly managed parameter gathered
+            # until the sibling head has consumed it.
+            reshard_after_forward=output_embeddings_has_own_parameters,
+        )
+        if output_embeddings_has_own_parameters:
+            fully_shard(output_embeddings)
+        if self.value_head is not None:
+            fully_shard(self.value_head)
         fully_shard(model)
 
         self.model = model
@@ -368,20 +506,44 @@ class FSDPTrainWorker:
         self.params_by_scope = {
             "all": [
                 (name, sharded_params_by_name[name])
-                for name in all_param_names
+                for name in policy_param_names
             ],
             "trainable": [
                 (name, sharded_params_by_name[name])
-                for name in trainable_param_names
+                for name in policy_trainable_param_names
             ],
         }
+        self.value_head_params = [
+            (name, sharded_params_by_name[name])
+            for name in self.value_head_param_names
+        ]
         self.trainable_parameter_list = list(iter_trainable_parameters(self.model))
         if not self.trainable_parameter_list:
             raise RuntimeError(f"No trainable parameters found for mode: {args.train_mode}")
 
+        policy_trainable_parameters = [
+            sharded_params_by_name[name]
+            for name in policy_trainable_param_names
+        ]
+        optimizer_groups = [
+            {
+                "params": policy_trainable_parameters,
+                "lr": args.learning_rate,
+                "peak_lr": args.learning_rate,
+                "group_name": "policy",
+            }
+        ]
+        if self.value_head_params:
+            optimizer_groups.append(
+                {
+                    "params": [param for _, param in self.value_head_params],
+                    "lr": args.value_learning_rate,
+                    "peak_lr": args.value_learning_rate,
+                    "group_name": "value_head",
+                }
+            )
         self.optimizer = torch.optim.AdamW(
-            self.trainable_parameter_list,
-            lr=args.learning_rate,
+            optimizer_groups,
             weight_decay=args.weight_decay,
         )
         self.optimizer.zero_grad(set_to_none=True)
@@ -403,6 +565,13 @@ class FSDPTrainWorker:
         self.last_old_new_kl_k3_token_mean = 0.0
         self.last_old_new_kl_k3_sample_sum_mean = 0.0
         self.last_old_new_kl_k3_loss = 0.0
+        self.last_value_loss = 0.0
+        self.last_value_clip_frac = 0.0
+        self.last_value_mean = 0.0
+        self.last_value_std = 0.0
+        self.last_return_mean = 0.0
+        self.last_return_std = 0.0
+        self.last_explained_variance = 0.0
 
         self.transfer_port = None
         self.transfer_master_address = None
@@ -459,11 +628,26 @@ class FSDPTrainWorker:
         token_rewards = list(sample.token_rewards)
         token_advantages = list(sample.token_advantages)
         response_indices = list(sample.response_indices)
+        value_targets_initialized = (
+            sample.old_values is not None and sample.value_returns is not None
+        )
+        old_values = (
+            list(sample.old_values)
+            if sample.old_values is not None
+            else [0.0] * len(input_ids)
+        )
+        value_returns = (
+            list(sample.value_returns)
+            if sample.value_returns is not None
+            else [0.0] * len(input_ids)
+        )
         if (
             len(old_logprobs) != len(input_ids)
             or len(token_rewards) != len(input_ids)
             or len(token_advantages) != len(input_ids)
             or len(response_indices) != len(input_ids)
+            or len(old_values) != len(input_ids)
+            or len(value_returns) != len(input_ids)
         ):
             return None
         response_old_logprobs = [
@@ -483,6 +667,8 @@ class FSDPTrainWorker:
             token_rewards = token_rewards[-max_length:]
             token_advantages = token_advantages[-max_length:]
             response_indices = response_indices[-max_length:]
+            old_values = old_values[-max_length:]
+            value_returns = value_returns[-max_length:]
 
         if len(input_ids) < 2:
             return None
@@ -505,6 +691,9 @@ class FSDPTrainWorker:
             token_rewards=token_rewards,
             token_advantages=token_advantages,
             response_indices=response_indices,
+            old_values=old_values,
+            value_returns=value_returns,
+            value_targets_initialized=value_targets_initialized,
         )
 
     def _collate_prepared_rl_samples(
@@ -519,6 +708,7 @@ class FSDPTrainWorker:
             raise RuntimeError("No valid RL samples were available for training.")
 
         batch = self.collate_fn(examples)
+        batch["sample_ids"] = [sample.sample_id for sample in kept_samples]
         batch = move_batch_to_device(batch, self.device)
         response_token_counts = [
             sum(1 for label in example.labels[1:] if label != -100)
@@ -671,7 +861,7 @@ class FSDPTrainWorker:
     def _compute_rl_loss(
         self,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float], List[Dict[str, Any]]]:
         labels = batch["labels"][:, 1:] # labels 对齐 logits 的时间步，去掉第一个 token 的标签（通常是 -100），因为它不对应任何预测
         response_mask = labels.ne(-100) # response_mask 标记哪些位置是有效的响应 token（标签不为 -100），这些位置对应的 log_probs 会被用来计算 loss
         response_token_counts = response_mask.sum(dim=-1).clamp_min(1) # 计算每个样本的响应 token 数量，形状为 [batch_size]，最小值为 1 以避免除零
@@ -680,27 +870,70 @@ class FSDPTrainWorker:
             raise RuntimeError("No valid response tokens found for RL loss.")
 
         valid_sample_indices = valid_positions[:, 0]
-        if self.args.train_logprob_mode == "full_logits_ce":
-            outputs = self.model(
+        current_token_values = None
+        if self.args.rl_algorithm == "ppo":
+            if self.value_head is None:
+                raise RuntimeError("PPO requires a value head.")
+            backbone_outputs = self.model.model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
+                use_cache=False,
             )
-            logits = outputs.logits[:, :-1, :] # logits 对应 input_ids 的每个 token 预测下一个 token，所以去掉最后一个时间步
-            valid_token_log_probs = self._valid_token_log_probs_from_full_logits(
-                logits,
-                labels,
-                response_mask,
+            hidden_states = (
+                backbone_outputs.last_hidden_state
+                if hasattr(backbone_outputs, "last_hidden_state")
+                else backbone_outputs[0]
             )
-        elif self.args.train_logprob_mode == "response_only_lm_head":
-            valid_token_log_probs = self._valid_token_log_probs_from_response_only_lm_head(
-                batch,
-                labels,
-                response_mask,
-            )
+            shifted_hidden_states = hidden_states[:, :-1, :]
+            current_token_values = self.value_head(
+                shifted_hidden_states
+            ).squeeze(-1).float()
+            output_embeddings = self.model.get_output_embeddings()
+            if output_embeddings is None:
+                raise RuntimeError("Model does not define output embeddings.")
+            if self.args.train_logprob_mode == "full_logits_ce":
+                logits = output_embeddings(shifted_hidden_states)
+                valid_token_log_probs = self._valid_token_log_probs_from_full_logits(
+                    logits,
+                    labels,
+                    response_mask,
+                )
+            elif self.args.train_logprob_mode == "response_only_lm_head":
+                valid_hidden_states = shifted_hidden_states[response_mask]
+                valid_logits = output_embeddings(valid_hidden_states)
+                valid_token_log_probs = -F.cross_entropy(
+                    valid_logits,
+                    labels[response_mask],
+                    reduction="none",
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported train_logprob_mode: {self.args.train_logprob_mode}"
+                )
         else:
-            raise ValueError(
-                f"Unsupported train_logprob_mode: {self.args.train_logprob_mode}"
-            )
+            if self.args.train_logprob_mode == "full_logits_ce":
+                outputs = self.model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                )
+                logits = outputs.logits[:, :-1, :]
+                valid_token_log_probs = self._valid_token_log_probs_from_full_logits(
+                    logits,
+                    labels,
+                    response_mask,
+                )
+            elif self.args.train_logprob_mode == "response_only_lm_head":
+                valid_token_log_probs = (
+                    self._valid_token_log_probs_from_response_only_lm_head(
+                        batch,
+                        labels,
+                        response_mask,
+                    )
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported train_logprob_mode: {self.args.train_logprob_mode}"
+                )
 
         old_token_log_probs = batch["old_logprobs"][:, 1:].to(valid_token_log_probs.dtype)
         valid_old_token_log_probs = old_token_log_probs[response_mask]
@@ -709,7 +942,13 @@ class FSDPTrainWorker:
 
         valid_response_indices = None
         valid_token_rewards = None
+        value_target_updates: List[Dict[str, Any]] = []
+        value_loss = valid_token_log_probs.new_zeros((), dtype=torch.float32)
+        value_clip_frac = 0.0
+        valid_current_values = None
+        valid_value_returns = None
         if self.args.rl_algorithm == "ppo":
+            assert current_token_values is not None
             response_indices = batch["response_indices"][:, 1:]
             valid_response_indices = response_indices[response_mask]
             if valid_response_indices.lt(0).any():
@@ -717,12 +956,69 @@ class FSDPTrainWorker:
                     "Valid response tokens must have non-negative response indices."
                 )
 
-            raw_valid_adv = batch["token_advantages"][:, 1:][response_mask].to(
-                torch.float32
-            )
+            effective_advantages = batch["token_advantages"].clone().float()
+            effective_old_values = batch["old_values"].clone().float()
+            effective_value_returns = batch["value_returns"].clone().float()
             valid_token_rewards = batch["token_rewards"][:, 1:][response_mask].to(
                 torch.float32
             )
+            targets_initialized = batch["value_targets_initialized"]
+            for sample_index in range(labels.shape[0]):
+                if bool(targets_initialized[sample_index].item()):
+                    continue
+                sample_mask = response_mask[sample_index]
+                sample_old_values = current_token_values[sample_index][
+                    sample_mask
+                ].detach()
+                sample_rewards = batch["token_rewards"][sample_index, 1:][
+                    sample_mask
+                ].float()
+                sample_advantages, sample_returns = compute_token_gae(
+                    sample_rewards,
+                    sample_old_values,
+                    gamma=self.args.tw_gamma,
+                    gae_lambda=self.args.gae_lambda,
+                    bootstrap=0.0,
+                )
+                effective_advantages[sample_index, 1:][sample_mask] = sample_advantages
+                effective_old_values[sample_index, 1:][sample_mask] = sample_old_values
+                effective_value_returns[sample_index, 1:][sample_mask] = sample_returns
+
+                sequence_length = int(
+                    batch["attention_mask"][sample_index].sum().item()
+                )
+                full_old_values = torch.zeros(
+                    sequence_length,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                full_returns = torch.zeros_like(full_old_values)
+                full_advantages = torch.zeros_like(full_old_values)
+                valid_sequence_positions = sample_mask.nonzero(as_tuple=False).squeeze(-1) + 1
+                full_old_values[valid_sequence_positions] = sample_old_values
+                full_returns[valid_sequence_positions] = sample_returns
+                full_advantages[valid_sequence_positions] = sample_advantages
+                value_target_updates.append(
+                    {
+                        "sample_id": batch["sample_ids"][sample_index],
+                        "old_values": full_old_values.cpu().tolist(),
+                        "value_returns": full_returns.cpu().tolist(),
+                        "token_advantages": full_advantages.cpu().tolist(),
+                    }
+                )
+
+            raw_valid_adv = effective_advantages[:, 1:][response_mask]
+            valid_old_values = effective_old_values[:, 1:][response_mask]
+            valid_value_returns = effective_value_returns[:, 1:][response_mask]
+            valid_current_values = current_token_values[response_mask]
+            unscaled_value_loss, value_clip_fraction = compute_clipped_value_loss(
+                valid_current_values,
+                valid_old_values,
+                valid_value_returns,
+                self.args.value_clip_eps,
+            )
+            value_loss = self.args.value_loss_coef * unscaled_value_loss
+            value_clip_frac = float(value_clip_fraction.detach().item())
             if self.args.ppo_normalize_advantages:
                 adv_mean = raw_valid_adv.mean()
                 adv_std = raw_valid_adv.std(unbiased=False)
@@ -786,7 +1082,19 @@ class FSDPTrainWorker:
         old_new_kl_k3_loss = (
             self.args.old_new_kl_coef * old_new_kl_k3_token_mean
         )
-        loss = policy_loss + old_new_kl_k3_loss
+        policy_training_active = (
+            self.args.rl_algorithm != "ppo"
+            or self.optimizer_step >= self.args.policy_train_start_step
+        )
+        if self.args.rl_algorithm == "ppo":
+            actor_loss = (
+                policy_loss + old_new_kl_k3_loss
+                if policy_training_active
+                else policy_loss.detach().new_zeros(())
+            )
+            loss = actor_loss + value_loss
+        else:
+            loss = policy_loss + old_new_kl_k3_loss
 
         with torch.no_grad():
             loss_stats = {}
@@ -834,6 +1142,29 @@ class FSDPTrainWorker:
                 loss_stats["old_new_kl_k3_sample_sum_mean"] = float(
                     sample_kl_sum.mean().item()
                 )
+                loss_stats["value_loss"] = float(value_loss.item())
+                loss_stats["value_clip_frac"] = value_clip_frac
+                loss_stats["policy_training_active"] = float(policy_training_active)
+                if valid_current_values is not None and valid_value_returns is not None:
+                    detached_values = valid_current_values.detach().float()
+                    detached_returns = valid_value_returns.detach().float()
+                    return_variance = detached_returns.var(unbiased=False)
+                    explained_variance = torch.where(
+                        return_variance > 1e-12,
+                        1.0
+                        - (detached_returns - detached_values).var(unbiased=False)
+                        / return_variance.clamp_min(1e-12),
+                        torch.zeros_like(return_variance),
+                    )
+                    loss_stats.update(
+                        {
+                            "value_mean": float(detached_values.mean().item()),
+                            "value_std": float(detached_values.std(unbiased=False).item()),
+                            "return_mean": float(detached_returns.mean().item()),
+                            "return_std": float(detached_returns.std(unbiased=False).item()),
+                            "explained_variance": float(explained_variance.item()),
+                        }
+                    )
             if self.args.clip_mode == "ppo" and valid_ratio.numel() > 0:
                 clipped_mask = (
                     (valid_ratio < (1.0 - self.args.clip_eps))
@@ -842,7 +1173,7 @@ class FSDPTrainWorker:
                 loss_stats["ppo_clip_frac"] = float(
                     clipped_mask.float().mean().item()
                 )
-            return loss, response_token_counts, loss_stats
+            return loss, response_token_counts, loss_stats, value_target_updates
 
     def _valid_token_log_probs_from_full_logits(
         self,
@@ -1006,15 +1337,31 @@ class FSDPTrainWorker:
         segment_old_new_kl_k3_token_means = []
         segment_old_new_kl_k3_sample_sum_means = []
         segment_old_new_kl_k3_losses = []
+        segment_value_losses = []
+        segment_value_clip_fracs = []
+        segment_value_means = []
+        segment_value_stds = []
+        segment_return_means = []
+        segment_return_stds = []
+        segment_explained_variances = []
 
         while self.optimizer_step < target_optimizer_step:
             trainer_version = self.optimizer_step / self.args.sync_every_optimizer_steps
             batch, train_stats, replay_stats = self._next_rl_training_batch(
                 trainer_version
             )
-            raw_loss, response_token_counts, loss_stats = self._compute_rl_loss(
-                batch,
-            )
+            (
+                raw_loss,
+                response_token_counts,
+                loss_stats,
+                value_target_updates,
+            ) = self._compute_rl_loss(batch)
+            if value_target_updates:
+                ray.get(
+                    self.replay_buffer.update_value_targets.remote(
+                        value_target_updates
+                    )
+                )
 
             loss = raw_loss / self.args.grad_accum_steps
             loss.backward()
@@ -1047,11 +1394,24 @@ class FSDPTrainWorker:
             segment_old_new_kl_k3_losses.append(
                 float(loss_stats.get("old_new_kl_k3_loss", 0.0))
             )
+            segment_value_losses.append(float(loss_stats.get("value_loss", 0.0)))
+            segment_value_clip_fracs.append(
+                float(loss_stats.get("value_clip_frac", 0.0))
+            )
+            segment_value_means.append(float(loss_stats.get("value_mean", 0.0)))
+            segment_value_stds.append(float(loss_stats.get("value_std", 0.0)))
+            segment_return_means.append(float(loss_stats.get("return_mean", 0.0)))
+            segment_return_stds.append(float(loss_stats.get("return_std", 0.0)))
+            segment_explained_variances.append(
+                float(loss_stats.get("explained_variance", 0.0))
+            )
 
             self.train_micro_step += 1
             self.last_loss = float(raw_loss.item())
             self.last_reward_mean = float(train_stats["reward_mean"])
-            self.last_advantage_mean = float(train_stats["advantage_mean"])
+            self.last_advantage_mean = float(
+                loss_stats.get("raw_advantage_mean", train_stats["advantage_mean"])
+            )
             self.last_response_tokens = float(response_token_counts.sum().item())
             self.last_replay_size = int(replay_stats["size"])
             self.last_total_sampled = int(replay_stats["total_samples_sampled"])
@@ -1080,6 +1440,17 @@ class FSDPTrainWorker:
             self.last_old_new_kl_k3_loss = float(
                 loss_stats.get("old_new_kl_k3_loss", 0.0)
             )
+            self.last_value_loss = float(loss_stats.get("value_loss", 0.0))
+            self.last_value_clip_frac = float(
+                loss_stats.get("value_clip_frac", 0.0)
+            )
+            self.last_value_mean = float(loss_stats.get("value_mean", 0.0))
+            self.last_value_std = float(loss_stats.get("value_std", 0.0))
+            self.last_return_mean = float(loss_stats.get("return_mean", 0.0))
+            self.last_return_std = float(loss_stats.get("return_std", 0.0))
+            self.last_explained_variance = float(
+                loss_stats.get("explained_variance", 0.0)
+            )
             should_step = self.train_micro_step % self.args.grad_accum_steps == 0
             if not should_step:
                 continue
@@ -1088,14 +1459,26 @@ class FSDPTrainWorker:
                 self.trainable_parameter_list,
                 max_norm=1.0,
             )
-            current_lr = self._get_current_lr(
-                self.optimizer_step,
-                self.args.learning_rate,
-                self.args.lr_warmup_steps,
-                self.args.max_steps,
-            )
             for param_group in self.optimizer.param_groups:
-                param_group["lr"] = current_lr
+                param_group["lr"] = self._get_current_lr(
+                    self.optimizer_step,
+                    float(param_group["peak_lr"]),
+                    self.args.lr_warmup_steps,
+                    self.args.max_steps,
+                )
+            current_lr = next(
+                group["lr"]
+                for group in self.optimizer.param_groups
+                if group["group_name"] == "policy"
+            )
+            value_lr = next(
+                (
+                    group["lr"]
+                    for group in self.optimizer.param_groups
+                    if group["group_name"] == "value_head"
+                ),
+                0.0,
+            )
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.optimizer_step += 1
@@ -1121,12 +1504,29 @@ class FSDPTrainWorker:
                     "old_new_kl_k3_sample_sum_mean="
                     f"{self.last_old_new_kl_k3_sample_sum_mean:.6f} "
                     f"old_new_kl_k3_loss={self.last_old_new_kl_k3_loss:.6f} "
-                    f"lr={current_lr:.8g}"
+                    f"value_loss={self.last_value_loss:.6f} "
+                    f"value_clip_frac={self.last_value_clip_frac:.4f} "
+                    f"value_mean={self.last_value_mean:.4f} "
+                    f"return_mean={self.last_return_mean:.4f} "
+                    f"explained_variance={self.last_explained_variance:.4f} "
+                    f"lr={current_lr:.8g} value_lr={value_lr:.8g}"
                 )
 
         dist.barrier()
         optimizer_steps_run = self.optimizer_step - start_optimizer_step
-        current_lr = self.optimizer.param_groups[0]["lr"]
+        current_lr = next(
+            group["lr"]
+            for group in self.optimizer.param_groups
+            if group["group_name"] == "policy"
+        )
+        value_lr = next(
+            (
+                group["lr"]
+                for group in self.optimizer.param_groups
+                if group["group_name"] == "value_head"
+            ),
+            0.0,
+        )
         return {
             "rank": self.rank,
             "optimizer_steps_run": optimizer_steps_run,
@@ -1150,6 +1550,13 @@ class FSDPTrainWorker:
                 self.last_old_new_kl_k3_sample_sum_mean
             ),
             "last_old_new_kl_k3_loss": self.last_old_new_kl_k3_loss,
+            "last_value_loss": self.last_value_loss,
+            "last_value_clip_frac": self.last_value_clip_frac,
+            "last_value_mean": self.last_value_mean,
+            "last_value_std": self.last_value_std,
+            "last_return_mean": self.last_return_mean,
+            "last_return_std": self.last_return_std,
+            "last_explained_variance": self.last_explained_variance,
             "segment_loss_mean": (
                 sum(segment_losses) / len(segment_losses) if segment_losses else 0.0
             ),
@@ -1192,11 +1599,40 @@ class FSDPTrainWorker:
                 / len(segment_old_new_kl_k3_losses)
                 if segment_old_new_kl_k3_losses else 0.0
             ),
+            "segment_value_loss": (
+                sum(segment_value_losses) / len(segment_value_losses)
+                if segment_value_losses else 0.0
+            ),
+            "segment_value_clip_frac": (
+                sum(segment_value_clip_fracs) / len(segment_value_clip_fracs)
+                if segment_value_clip_fracs else 0.0
+            ),
+            "segment_value_mean": (
+                sum(segment_value_means) / len(segment_value_means)
+                if segment_value_means else 0.0
+            ),
+            "segment_value_std": (
+                sum(segment_value_stds) / len(segment_value_stds)
+                if segment_value_stds else 0.0
+            ),
+            "segment_return_mean": (
+                sum(segment_return_means) / len(segment_return_means)
+                if segment_return_means else 0.0
+            ),
+            "segment_return_std": (
+                sum(segment_return_stds) / len(segment_return_stds)
+                if segment_return_stds else 0.0
+            ),
+            "segment_explained_variance": (
+                sum(segment_explained_variances) / len(segment_explained_variances)
+                if segment_explained_variances else 0.0
+            ),
             "train_sample_trainer_version_lag_mean": (
                 sum(segment_version_lags) / len(segment_version_lags)
                 if segment_version_lags else 0.0
             ),
             "learning_rate": current_lr,
+            "value_learning_rate": value_lr,
         }
 
     # ---- weight-transfer setup (rank 0 only) ----
@@ -1281,8 +1717,11 @@ class FSDPTrainWorker:
         dist.barrier()
 
         state_dict = None
+        value_head_state_dict = None
         if self.rank == 0:
             state_dict = {}
+            if self.value_head_params:
+                value_head_state_dict = {}
 
         with torch.no_grad():
             for name, param in self.params_by_scope["all"]:
@@ -1290,6 +1729,13 @@ class FSDPTrainWorker:
                 if self.rank == 0:
                     assert state_dict is not None
                     state_dict[name] = full_param.cpu()
+                del full_param
+
+            for name, param in self.value_head_params:
+                full_param = param.full_tensor().detach()
+                if self.rank == 0:
+                    assert value_head_state_dict is not None
+                    value_head_state_dict[name] = full_param.cpu().contiguous()
                 del full_param
 
         result = {
@@ -1306,6 +1752,11 @@ class FSDPTrainWorker:
                 safe_serialization=True,
             )
             self.tokenizer.save_pretrained(output_dir)
+            if value_head_state_dict is not None:
+                save_safetensors(
+                    value_head_state_dict,
+                    os.path.join(output_dir, "value_head.safetensors"),
+                )
             trainer_state = {
                 "optimizer_step": self.optimizer_step,
                 "train_micro_step": self.train_micro_step,
@@ -1314,12 +1765,22 @@ class FSDPTrainWorker:
                 "rl_algorithm": self.args.rl_algorithm,
                 "max_steps": self.args.max_steps,
                 "sync_every_optimizer_steps": self.args.sync_every_optimizer_steps,
+                "value_head_architecture": (
+                    "Linear(H,H/2)-SiLU-Linear(H/2,1)"
+                    if self.value_head_params else None
+                ),
+                "gae_lambda": self.args.gae_lambda,
+                "value_learning_rate": self.args.value_learning_rate,
+                "value_loss_coef": self.args.value_loss_coef,
+                "value_clip_eps": self.args.value_clip_eps,
+                "policy_train_start_step": self.args.policy_train_start_step,
             }
             state_path = os.path.join(output_dir, "trainer_state.json")
             with open(state_path, "w", encoding="utf-8") as file:
                 json.dump(trainer_state, file, ensure_ascii=False, indent=2, sort_keys=True)
                 file.write("\n")
             del state_dict
+            del value_head_state_dict
             result["saved"] = True
             print(f"[checkpoint] Saved checkpoint to {output_dir}")
 
@@ -1429,6 +1890,34 @@ class RLSample:
     response_indices: List[int]
     episode_return: float
     output_versions: List[int]
+    sample_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    old_values: List[float] | None = None
+    value_returns: List[float] | None = None
+
+
+def update_cached_value_targets(
+    samples: Iterable[RLSample],
+    updates: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Apply frozen value targets to matching replay samples in place."""
+    updates_by_id = {
+        str(update["sample_id"]): update
+        for update in updates
+    }
+    updated = 0
+    for sample in samples:
+        update = updates_by_id.get(sample.sample_id)
+        if update is None:
+            continue
+        sample.old_values = list(update["old_values"])
+        sample.value_returns = list(update["value_returns"])
+        sample.token_advantages = list(update["token_advantages"])
+        updated += 1
+    return {
+        "requested": len(updates),
+        "updated": updated,
+        "missing": len(updates) - updated,
+    }
 
 
 @ray.remote
@@ -1625,6 +2114,10 @@ class ReplayBufferActor:
         self.total_samples_sampled += len(samples)
         self.total_batches_sampled += 1
         return samples
+
+    def update_value_targets(self, updates: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Persist trainer-computed PPO value targets for future replay reuse."""
+        return update_cached_value_targets(self.samples, updates)
 
     def get_stats(self) -> Dict[str, int]:
         return {
@@ -3032,7 +3525,12 @@ async def run_textworld_train(args: argparse.Namespace):
         f"rl_algorithm={args.rl_algorithm} "
         f"grpo_group_size={args.grpo_group_size} "
         f"tw_gamma={args.tw_gamma} "
+        f"gae_lambda={args.gae_lambda} "
         f"ppo_normalize_advantages={args.ppo_normalize_advantages} "
+        f"value_learning_rate={args.value_learning_rate} "
+        f"value_loss_coef={args.value_loss_coef} "
+        f"value_clip_eps={args.value_clip_eps} "
+        f"policy_train_start_step={args.policy_train_start_step} "
         f"tw_invalid_action_penalty={args.tw_invalid_action_penalty} "
         f"tw_lost_penalty={args.tw_lost_penalty}"
     )
@@ -3231,7 +3729,15 @@ async def run_textworld_train(args: argparse.Namespace):
                 "old_new_kl_k3_sample_sum_mean="
                 f"{rank0_summary['last_old_new_kl_k3_sample_sum_mean']:.6f} "
                 "old_new_kl_k3_loss="
-                f"{rank0_summary['last_old_new_kl_k3_loss']:.6f}"
+                f"{rank0_summary['last_old_new_kl_k3_loss']:.6f} "
+                f"value_loss={rank0_summary['last_value_loss']:.6f} "
+                f"value_clip_frac={rank0_summary['last_value_clip_frac']:.4f} "
+                f"value_mean={rank0_summary['last_value_mean']:.4f} "
+                f"value_std={rank0_summary['last_value_std']:.4f} "
+                f"return_mean={rank0_summary['last_return_mean']:.4f} "
+                f"return_std={rank0_summary['last_return_std']:.4f} "
+                "explained_variance="
+                f"{rank0_summary['last_explained_variance']:.4f}"
             )
             infer_delta_tokens = (
                 infer_stats_end["total_tokens"] - infer_stats_start["total_tokens"]
@@ -3343,6 +3849,28 @@ async def run_textworld_train(args: argparse.Namespace):
                 )
                 / len(summaries)
             )
+            value_loss_mean = sum(
+                float(summary["segment_value_loss"]) for summary in summaries
+            ) / len(summaries)
+            value_clip_frac_mean = sum(
+                float(summary["segment_value_clip_frac"]) for summary in summaries
+            ) / len(summaries)
+            value_mean = sum(
+                float(summary["segment_value_mean"]) for summary in summaries
+            ) / len(summaries)
+            value_std = sum(
+                float(summary["segment_value_std"]) for summary in summaries
+            ) / len(summaries)
+            return_mean = sum(
+                float(summary["segment_return_mean"]) for summary in summaries
+            ) / len(summaries)
+            return_std = sum(
+                float(summary["segment_return_std"]) for summary in summaries
+            ) / len(summaries)
+            explained_variance = sum(
+                float(summary["segment_explained_variance"])
+                for summary in summaries
+            ) / len(summaries)
             version_lag_mean = (
                 sum(
                     float(summary["train_sample_trainer_version_lag_mean"])
@@ -3437,6 +3965,22 @@ async def run_textworld_train(args: argparse.Namespace):
                 writer.add_scalar(
                     "PPO/TrainEpisodeReturnMeanAcrossRanks",
                     episode_return_mean,
+                    tb_step,
+                )
+                writer.add_scalar("Value/Loss", value_loss_mean, tb_step)
+                writer.add_scalar("Value/ClipFrac", value_clip_frac_mean, tb_step)
+                writer.add_scalar("Value/Mean", value_mean, tb_step)
+                writer.add_scalar("Value/Std", value_std, tb_step)
+                writer.add_scalar("Value/ReturnMean", return_mean, tb_step)
+                writer.add_scalar("Value/ReturnStd", return_std, tb_step)
+                writer.add_scalar(
+                    "Value/ExplainedVariance",
+                    explained_variance,
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Value/LearningRate",
+                    rank0_summary["value_learning_rate"],
                     tb_step,
                 )
             elif args.rl_algorithm == "grpo":
@@ -3653,7 +4197,13 @@ def parse_args() -> argparse.Namespace:
         "--tw-gamma",
         type=float,
         default=1.0,
-        help="Discount factor for token-level Monte Carlo reward-to-go.",
+        help="Discount factor for token-level reward-to-go and PPO GAE.",
+    )
+    parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=0.95,
+        help="Lambda used for classic token-level generalized advantage estimation.",
     )
     parser.add_argument(
         "--tw-step-penalty",
@@ -3707,6 +4257,30 @@ def parse_args() -> argparse.Namespace:
         help="Maximum optimizer steps to run before stopping the demo.",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument(
+        "--value-learning-rate",
+        type=float,
+        default=1e-5,
+        help="Peak learning rate for the PPO value-head optimizer group.",
+    )
+    parser.add_argument(
+        "--value-loss-coef",
+        type=float,
+        default=0.5,
+        help="Coefficient applied to PPO clipped value loss.",
+    )
+    parser.add_argument(
+        "--value-clip-eps",
+        type=float,
+        default=0.2,
+        help="Clipping epsilon for PPO value predictions.",
+    )
+    parser.add_argument(
+        "--policy-train-start-step",
+        type=int,
+        default=0,
+        help="Optimizer step at which policy loss starts; earlier steps train value only.",
+    )
     parser.add_argument(
         "--lr-warmup-steps",
         type=int,
@@ -4016,6 +4590,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--tw-history-token-window must be >= 1")
     if args.tw_gamma < 0:
         raise ValueError("--tw-gamma must be >= 0")
+    if not 0.0 <= args.gae_lambda <= 1.0:
+        raise ValueError("--gae-lambda must be in [0, 1]")
     if args.max_length < args.tw_history_token_window:
         raise ValueError(
             "--max-length must be >= --tw-history-token-window when "
@@ -4028,6 +4604,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-steps must be >= 1")
     if args.learning_rate < 0:
         raise ValueError("--learning-rate must be >= 0")
+    if args.value_learning_rate < 0:
+        raise ValueError("--value-learning-rate must be >= 0")
+    if args.value_loss_coef < 0:
+        raise ValueError("--value-loss-coef must be >= 0")
+    if args.value_clip_eps <= 0:
+        raise ValueError("--value-clip-eps must be > 0")
+    if args.policy_train_start_step < 0:
+        raise ValueError("--policy-train-start-step must be >= 0")
     if args.lr_warmup_steps < 0:
         raise ValueError("--lr-warmup-steps must be >= 0")
     if args.batch_size < 1:
