@@ -1,21 +1,15 @@
 # Quickstart
 
-This guide takes a fresh checkout to the smallest end-to-end TextWorld training loop. It also gives a recommended checklist for changing models or replacing the task.
+This guide takes a fresh checkout through the currently used end-to-end
+TextWorld training configuration. It also gives a recommended checklist for
+changing models or replacing the task.
 
 All commands are intended to run from the repository root:
 
 ```bash
 cd AcceRL-Agent
+export ACCERL_ROOT="$PWD"
 ```
-
-Set two paths first:
-
-```bash
-export MODEL_PATH=<LOCAL_HF_MODEL_PATH>
-export TEXTWORLD_GAME_DIR=<TEXTWORLD_Z8_GAME_DIR>
-```
-
-`MODEL_PATH` should point to a local HuggingFace Causal LM model directory. `TEXTWORLD_GAME_DIR` should point to a directory containing TextWorld `.z8` files.
 
 ## 1. Install Dependencies
 
@@ -24,16 +18,99 @@ Create a conda environment first:
 ```bash
 conda create -n accerl-agent python=3.10 -y
 conda activate accerl-agent
-python -m pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade pip setuptools wheel ninja packaging
 
-python -m pip install -r requirements.txt
+python -m pip install torch==2.11.0
+python -m pip install --no-build-isolation -r requirements.txt
 
-python -c "import torch, vllm; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('vllm', vllm.__version__)"
+python -c "import flash_attn, ray, torch, transformers, vllm; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('transformers', transformers.__version__); print('vllm', vllm.__version__); print('flash-attn', flash_attn.__version__); print('ray', ray.__version__)"
 ```
 
-The current `requirements.txt` pins `vllm==0.21.0` and `torch==2.11.0`. vLLM, PyTorch, and CUDA versions are tightly coupled. If your cluster already provides validated PyTorch or vLLM modules, prefer those versions and update the `torch`/`vllm` constraints in `requirements.txt` accordingly.
+The required stack uses PyTorch 2.11.0, Transformers 5.12.1,
+vLLM 0.21.0 or newer, FlashAttention 2.8.3.post1, and Ray 2.56.0. The current
+local environment uses vLLM 0.24.0. PyTorch is installed first because
+FlashAttention imports it during its build. Keep `--no-build-isolation` on the
+second command. These packages are tightly coupled to the CUDA toolchain; if
+your cluster supplies a different validated stack, update all related pins
+together rather than changing only one package.
 
-## 2. Run the Local Trainer Smoke Test
+## 2. Download the Model and TextWorld Dataset
+
+The verified model is
+[Qwen/Qwen1.5-MoE-A2.7B-Chat](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat).
+It has approximately 14B total BF16 parameters and occupies about 27 GB after
+download. Install the Hugging Face CLI and download it into a repository-local
+artifact directory:
+
+```bash
+python -m pip install --upgrade huggingface_hub
+command -v curl
+command -v unzip
+command -v hf
+
+mkdir -p "$ACCERL_ROOT/artifacts/models"
+
+hf download Qwen/Qwen1.5-MoE-A2.7B-Chat \
+  --local-dir "$ACCERL_ROOT/artifacts/models/Qwen1.5-MoE-A2.7B-Chat"
+
+export MODEL_PATH="$ACCERL_ROOT/artifacts/models/Qwen1.5-MoE-A2.7B-Chat"
+test -f "$MODEL_PATH/config.json"
+test -f "$MODEL_PATH/model.safetensors.index.json"
+```
+
+`hf download` reuses already-downloaded files when the command is run again.
+If Hugging Face requires authentication in your environment, run
+`hf auth login` first. Review the model card and license before use. Install
+the `curl` and `unzip` system utilities first if either check above fails.
+
+The training examples use
+[The First TextWorld Problems dataset](https://www.microsoft.com/en-us/download/details.aspx?id=100932).
+The official archive is about 1.6 GB and contains training, validation, and
+test games. Download and extract it as follows:
+
+```bash
+mkdir -p "$ACCERL_ROOT/artifacts/textworld"
+export FTWP_ARCHIVE="$ACCERL_ROOT/artifacts/textworld/cog2019_ftwp.zip"
+
+if ! unzip -tq "$FTWP_ARCHIVE" >/dev/null 2>&1; then
+  curl --fail --location --continue-at - \
+    "https://download.microsoft.com/download/e/8/0/e80a789f-ed4a-443b-9bd8-a1cf297c1a70/cog2019_ftwp.zip" \
+    --output "$FTWP_ARCHIVE"
+fi
+unzip -tq "$FTWP_ARCHIVE"
+
+unzip -q -o \
+  "$FTWP_ARCHIVE" \
+  -d "$ACCERL_ROOT/artifacts/textworld/ftwp"
+
+export TEXTWORLD_GAME_DIR="$ACCERL_ROOT/artifacts/textworld/ftwp/games/train"
+test -d "$TEXTWORLD_GAME_DIR"
+find "$TEXTWORLD_GAME_DIR" -maxdepth 1 -type f -name "*.z8" | wc -l
+```
+
+The final command must report a non-zero number. Training uses the `train`
+split; switch the environment variable to `games/valid` or `games/test` for
+evaluation. The archive also contains `.json` and `.ulx` files, but the
+commands in this guide intentionally select only `*.z8`. Reserve roughly
+40 GB of free disk space for the model, compressed dataset, and extracted
+games.
+
+If the model and games already exist elsewhere, skip both downloads and set
+absolute paths instead:
+
+```bash
+export MODEL_PATH=/absolute/path/to/Qwen1.5-MoE-A2.7B-Chat
+export TEXTWORLD_GAME_DIR=/absolute/path/to/ftwp/games/train
+
+test -f "$MODEL_PATH/config.json"
+find "$TEXTWORLD_GAME_DIR" -maxdepth 1 -type f -name "*.z8" | head
+```
+
+Keep these two variables exported in the shell used to start the Ray driver;
+the commands below pass their resolved paths to trainer, inference, and
+rollout actors.
+
+## 3. Run the Local Trainer Smoke Test
 
 Start with the multi-trainer smoke test in `local_trainer.py`. It does not use TextWorld, vLLM, or rollout workers. It only validates tokenizer/model loading, response-only labels, Ray FSDP multi-trainer initialization, forward/backward, and optimizer steps.
 
@@ -53,7 +130,7 @@ python accerl_agent/local_trainer.py \
 
 Success criteria: all Ray FSDP workers start, complete a few optimizer steps, produce finite loss values, and report no tokenizer/model/FSDP initialization errors.
 
-## 3. Run Local TextWorld Inference
+## 4. Run Local TextWorld Inference
 
 Next, run `textworld_local_infer.py` to validate only vLLM inference and environment interaction:
 
@@ -74,7 +151,7 @@ python accerl_agent/textworld_local_infer.py \
 
 Success criteria: episodes run until completion or the step limit, and logs show observations, model outputs, parsed actions, rewards, and done states.
 
-## 4. Run the Smallest End-to-End RL Loop
+## 5. Run the Current End-to-End Training Configuration
 
 The full framework uses both FSDP training GPUs and vLLM inference GPUs:
 
@@ -82,41 +159,73 @@ The full framework uses both FSDP training GPUs and vLLM inference GPUs:
 total GPUs >= fsdp_world_size + infer_tp_size * infer_size
 ```
 
-The command below uses 1 FSDP GPU and 1 vLLM GPU, so it is suitable for a smoke test:
+The commonly used configuration below uses 3 FSDP trainer GPUs and one vLLM
+inference GPU, so at least 4 visible GPUs are required. It trains the full
+Qwen-MoE model with PPO, FlashAttention varlen packing, and response-only
+LM-head projection:
 
 ```bash
 python accerl_agent/agent_textworld.py \
   --model-path "$MODEL_PATH" \
   --tw-game-dir "$TEXTWORLD_GAME_DIR" \
   --tw-game-pattern "*.z8" \
-  --tw-game-limit 2 \
-  --tw-max-episode-steps 10 \
-  --tw-history-token-window 1024 \
-  --max-length 1024 \
-  --fsdp-world-size 1 \
+  --tw-max-episode-steps 50 \
+  --tw-history-token-window 8192 \
+  --tw-game-limit 400 \
+  --max-length 8192 \
+  --tw-gamma 1.0 \
+  --tw-lost-penalty 0.0 \
+  --fsdp-world-size 3 \
   --infer-size 1 \
   --infer-tp-size 1 \
-  --num-rollout-workers 1 \
-  --rollout-batch-size 1 \
-  --batch-size 1 \
-  --grad-accum-steps 1 \
-  --replay-capacity 8 \
-  --min-replay-size-per-rank 1 \
-  --max-steps 2 \
-  --max-sync-rounds 1 \
+  --num-rollout-workers 24 \
+  --rollout-batch-size 8 \
+  --infer-max-tokens 16 \
+  --infer-temperature 1.0 \
+  --infer-top-p 1.0 \
+  --batch-size 2 \
+  --grad-accum-steps 32 \
+  --max-steps 500000 \
+  --lr-warmup-steps 500 \
+  --train-mode full \
   --sync-every-optimizer-steps 1 \
-  --train-mode lm_head \
-  --rl-algorithm ppo \
   --clip-mode ppo \
-  --trust-remote-code
+  --trust-remote-code \
+  --replay-capacity 256 \
+  --min-replay-size-per-rank 32 \
+  --rl-algorithm ppo \
+  --train-packing varlen \
+  --train-token-budget 16384 \
+  --train-pack-candidate-pool-size 64 \
+  --train-logprob-mode response_only_lm_head \
+  --dtype bfloat16
 ```
+
+Varlen argument rules:
+
+- `--batch-size` is the maximum number of independent `RLSample` objects in
+  one pack, rather than a padded tensor batch dimension.
+- `--train-token-budget` is the maximum total number of real tokens in a pack
+  and must be at least `--max-length`.
+- Replay stores independent samples; only the trainer constructs packed
+  micro-batches.
+- `response_only_lm_head` uses model-native
+  `logits_to_keep=prediction_indices` and requires varlen packing.
+- Use `--train-packing padded --train-logprob-mode full_logits_ce` to return to
+  the baseline path.
+
+This is a long-running configuration: `--max-steps` counts optimizer steps,
+and no `--max-sync-rounds` limit is set. For a short end-to-end check, append
+`--max-sync-rounds 1 --max-steps 2`, lower
+`--min-replay-size-per-rank`, and use a smaller `--tw-game-limit`.
 
 Success criteria:
 
-- Rollout workers keep producing samples.
-- The replay buffer is non-empty.
-- The trainer completes optimizer steps.
-- vLLM receives the initial full sync and later trainable-weight syncs.
+- All 3 FSDP ranks and the vLLM actor initialize on separate GPUs.
+- Rollout workers keep producing samples and each replay shard reaches its
+  minimum size.
+- `Train/PackTokenUtilization` and `Train/PackSampleCount` become non-zero.
+- The trainer completes optimizer steps and vLLM receives weight updates.
 - TensorBoard event files appear under `runs/TextWorld_FSDP/<timestamp>`.
 
 Open TensorBoard:
@@ -125,15 +234,18 @@ Open TensorBoard:
 tensorboard --logdir runs/TextWorld_FSDP
 ```
 
-## 5. Scale the Experiment
+## 6. Scale the Experiment
 
 After the smoke test passes, scale one dimension at a time:
 
 1. Increase `--tw-game-limit` and `--tw-max-episode-steps`.
 2. Increase `--rollout-batch-size` and `--num-rollout-workers`.
-3. Increase `--batch-size` or `--grad-accum-steps`.
-4. Move from `--train-mode lm_head` to `last_layer`, then finally to `full`.
-5. Tune `--sync-every-optimizer-steps` and `--replay-capacity` to control sample staleness.
+3. For padded training, increase `--batch-size`; for varlen training, tune
+   `--train-token-budget`, `--batch-size`, and
+   `--train-pack-candidate-pool-size` together.
+4. Increase `--grad-accum-steps` if more effective batch size is needed.
+5. Move from `--train-mode lm_head` to `last_layer`, then finally to `full`.
+6. Tune `--sync-every-optimizer-steps` and `--replay-capacity` to control sample staleness.
 
 Watch these metrics first:
 
@@ -143,11 +255,14 @@ Watch these metrics first:
 | `Replay/FillRatio` | Checks whether rollout keeps the trainer fed. |
 | `Replay/TrainSampleTrainerVersionLagMean` | Checks whether training samples are too stale. |
 | `Train/LossMeanAcrossRanks` | Checks training stability. |
+| `Train/PackTokenUtilization` | Checks how much of the varlen token budget is used. |
+| `Train/PackSampleCount` | Shows how many independent samples were packed. |
+| `Train/PackCpuMilliseconds` | Checks whether CPU packing is a bottleneck. |
 | `KL/OldNewK3TokenMean` | Checks whether policy updates are too large. |
 | `Infer/TokensPerSec` | Checks vLLM throughput. |
 | `Sync/ElapsedSeconds` | Checks whether weight sync is a bottleneck. |
 
-## 6. Save Checkpoints
+## 7. Save Checkpoints
 
 Enable HuggingFace-format checkpoint saving:
 
@@ -175,7 +290,7 @@ By default, periodic and final saves both overwrite `latest`. To keep independen
 
 The current checkpoint contains model weights, config, tokenizer files, and `trainer_state.json`. It does not include optimizer state or the replay buffer, so it is mainly intended for inference/evaluation rather than full training resume.
 
-## 7. Change Models
+## 8. Change Models
 
 When switching models, start with the smallest trainable scope:
 
@@ -198,7 +313,7 @@ Common issues:
 - HuggingFace parameter names do not match the names expected by the vLLM loader.
 - The tokenizer does not have a suitable chat template or pad token.
 
-## 8. Change Tasks
+## 9. Change Tasks
 
 For non-TextWorld tasks, prefer creating a new rollout actor instead of editing all TextWorld-specific logic inside the existing class.
 
@@ -229,7 +344,7 @@ The TextWorld functions most commonly replaced are:
 - `_compute_token_level_advantages()`
 - `_compute_grpo_group_advantages()`
 
-## 9. Check RLSample Alignment
+## 10. Check RLSample Alignment
 
 This is the most important stability check. Every sample must guarantee:
 
@@ -273,3 +388,14 @@ This is the most important stability check. Every sample must guarantee:
 - Try `--ppo-normalize-advantages`.
 - Increase `--old-new-kl-coef`.
 - Confirm that invalid, aborted, or empty outputs are not mistakenly marked as trainable tokens.
+
+### Varlen or FlashAttention initialization fails
+
+- Confirm that `flash_attn` imports in the same environment used by Ray
+  trainers.
+- Use `bfloat16`, `float16`, or `auto`; varlen rejects `float32`.
+- Confirm that the model supports Transformers `flash_attention_2`.
+- Confirm that its CausalLM forward accepts tensor `logits_to_keep`; this is
+  verified with Transformers 5.12.1 Qwen/Qwen-MoE.
+- Fall back to `--train-packing padded --train-logprob-mode full_logits_ce` to
+  separate model/FlashAttention compatibility problems from the RL loop.

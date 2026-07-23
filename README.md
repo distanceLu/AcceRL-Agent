@@ -24,6 +24,8 @@ If you only want to run the smallest working flow first, see [QUICKSTART.md](QUI
 - Online vLLM inference and action sampling.
 - Distributed PyTorch FSDP training.
 - Asynchronous replay buffer for caching and reusing training samples.
+- Trainer-side token-budget packing with FlashAttention 2 varlen attention.
+- Response-only LM-head projection through the model-native `logits_to_keep` API.
 - NCCL weight transfer from FSDP to vLLM.
 - PPO/GRPO-style rollout advantage construction.
 
@@ -51,6 +53,11 @@ This project targets Linux GPU environments. Exact package versions must match y
 
 Several parts of the current code assume a model layout close to Qwen/Qwen-MoE, such as `model.model.layers` and `lm_head`. If you use another HuggingFace model family, carefully check `build_model()`, `configure_trainable_parameters()`, the FSDP wrapping path, and `iter_vllm_loadable_weights()`.
 
+The optional varlen path additionally requires a GPU-supported `flash-attn`
+build and a Transformers model that implements tensor `logits_to_keep`.
+Transformers 5.12.1 with Qwen/Qwen-MoE is the currently verified combination.
+Other Transformers versions or model classes may not support this API.
+
 ## Installation
 
 The repository is not packaged as a pip package yet. Run scripts directly from the repository root.
@@ -61,14 +68,20 @@ cd AcceRL-Agent
 
 conda create -n accerl-agent python=3.10 -y
 conda activate accerl-agent
-python -m pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade pip setuptools wheel ninja packaging
 
-python -m pip install -r requirements.txt
+python -m pip install torch==2.11.0
+python -m pip install --no-build-isolation -r requirements.txt
 
-python -c "import torch, vllm; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('vllm', vllm.__version__)"
+python -c "import flash_attn, ray, torch, transformers, vllm; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('transformers', transformers.__version__); print('vllm', vllm.__version__); print('flash-attn', flash_attn.__version__); print('ray', ray.__version__)"
 ```
 
-The current `requirements.txt` pins the locally verified main stack: `vllm==0.21.0` and `torch==2.11.0`. vLLM, PyTorch, and CUDA versions are tightly coupled. If your cluster already provides a validated PyTorch or vLLM module, prefer the cluster stack and adjust the `torch`/`vllm` constraints in `requirements.txt` accordingly.
+The required stack uses PyTorch 2.11.0, Transformers 5.12.1, vLLM 0.21.0 or
+newer, FlashAttention 2.8.3.post1, and Ray 2.56.0. The current local
+environment uses vLLM 0.24.0. Install PyTorch first because FlashAttention
+imports it while building, and keep `--no-build-isolation` on the requirements
+installation command. These packages are tightly coupled to CUDA; update the
+related pins together when using a different cluster-provided stack.
 
 ## Quickstart
 
@@ -139,6 +152,48 @@ python accerl_agent/agent_textworld.py \
   --trust-remote-code
 ```
 
+The command above deliberately uses the default padded trainer path. After it
+passes, validate varlen training with:
+
+```bash
+python accerl_agent/agent_textworld.py \
+  --model-path "$MODEL_PATH" \
+  --tw-game-dir "$TEXTWORLD_GAME_DIR" \
+  --tw-game-pattern "*.z8" \
+  --tw-game-limit 2 \
+  --tw-max-episode-steps 10 \
+  --tw-history-token-window 1024 \
+  --max-length 1024 \
+  --fsdp-world-size 1 \
+  --infer-size 1 \
+  --infer-tp-size 1 \
+  --num-rollout-workers 1 \
+  --rollout-batch-size 2 \
+  --batch-size 2 \
+  --grad-accum-steps 1 \
+  --replay-capacity 8 \
+  --min-replay-size-per-rank 2 \
+  --max-steps 2 \
+  --max-sync-rounds 1 \
+  --sync-every-optimizer-steps 1 \
+  --train-mode lm_head \
+  --rl-algorithm ppo \
+  --clip-mode ppo \
+  --train-packing varlen \
+  --train-token-budget 2048 \
+  --train-pack-candidate-pool-size 8 \
+  --train-logprob-mode response_only_lm_head \
+  --dtype bfloat16 \
+  --trust-remote-code
+```
+
+Replay continues to store independent `RLSample` objects. Each trainer rank
+selects at most `--batch-size` samples and packs no more than
+`--train-token-budget` real tokens into one micro-batch. The token budget must
+be at least `--max-length`. Position IDs restart at zero for every sample so
+Transformers FlashAttention 2 can infer sequence boundaries and prevent
+cross-sample attention.
+
 GPU requirement for full training:
 
 ```text
@@ -186,7 +241,7 @@ flowchart LR
     Trainer -->|"NCCL trainable weights"| Infer
 ```
 
-`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, selects trainable parameters according to `--train-mode`, samples `RLSample` objects from replay, computes the RL loss over response tokens, and sends FSDP weights to vLLM during synchronization.
+`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, selects trainable parameters according to `--train-mode`, and samples independent `RLSample` objects from replay. With `--train-packing varlen`, it dynamically packs those samples locally under the token budget. It computes the RL loss over response tokens and sends FSDP weights to vLLM during synchronization.
 
 `VLLMInferenceActor` handles rollout inference. It starts vLLM with dummy weights, waits for the initial full weight sync, pauses generation during later syncs, aborts requests when needed, updates weights, and then resumes generation.
 
@@ -266,7 +321,11 @@ The trainer computes loss only at positions where `labels != -100`. Prompt token
 | `--infer-tp-size` | vLLM tensor-parallel size. |
 | `--num-rollout-workers` | Number of CPU rollout actors; must be at least `--fsdp-world-size`. |
 | `--rollout-batch-size` | Episode batch size per rollout worker in PPO mode; also the default GRPO group size. |
-| `--batch-size` | Micro-batch size per FSDP rank. |
+| `--batch-size` | Samples per padded micro-batch, or the maximum number of `RLSample` objects in one varlen pack, per FSDP rank. |
+| `--train-packing` | `padded` (default) or `varlen`; varlen removes trainer-side attention padding with FlashAttention 2. |
+| `--train-token-budget` | Maximum real tokens in a varlen pack; required for varlen and must be at least `--max-length`. |
+| `--train-pack-candidate-pool-size` | Replay candidate pool used for length-aware packing; defaults to four times `--batch-size`. |
+| `--train-logprob-mode` | `full_logits_ce` baseline, or `response_only_lm_head` to project only response prediction positions through native `logits_to_keep`; the latter requires varlen. |
 | `--grad-accum-steps` | Gradient accumulation steps. |
 | `--replay-capacity` | Maximum number of samples in each replay buffer. |
 | `--min-replay-size-per-rank` | Minimum replay size required before a trainer rank starts training. |
@@ -308,6 +367,10 @@ Saved checkpoint contents include model weights, config, tokenizer files, and `t
 | `Replay/FillRatio` | Replay-buffer fill ratio. |
 | `Replay/TrainSampleTrainerVersionLagMean` | Version lag between training samples and the current trainer. |
 | `Train/LossMeanAcrossRanks` | Average loss across FSDP ranks. |
+| `Train/PackTokenUtilization` | Fraction of `--train-token-budget` occupied by real tokens in a varlen pack. |
+| `Train/PackSampleCount` | Number of independent samples in a varlen pack. |
+| `Train/PackMaxSequenceLength` | Longest sequence in the current varlen pack. |
+| `Train/PackCpuMilliseconds` | CPU time spent selecting and constructing a pack. |
 | `KL/OldNewK3TokenMean` | Token-level KL-style metric between old and new policies. |
 | `Infer/TokensPerSec` | vLLM generation throughput. |
 | `Sync/ElapsedSeconds` | Weight-sync latency. |
@@ -321,3 +384,10 @@ If many actions are invalid, lower the temperature, reduce `--infer-max-tokens`,
 If vLLM weight sync fails, check GPU counts, vLLM weight-transfer API support, the NCCL environment, the names/shapes/dtypes returned by `iter_vllm_loadable_weights()`, and whether the trainable parameter set is empty.
 
 If loss or KL is unstable, lower the learning rate, reduce replay staleness, try `--ppo-normalize-advantages`, increase the KL penalty, and confirm that invalid, aborted, or empty outputs are not mistakenly labeled as trainable tokens.
+
+If varlen model loading fails, verify that `flash_attn` imports in the trainer
+environment, the model supports `flash_attention_2`, the dtype is `bfloat16`,
+`float16`, or `auto`, and the model forward accepts a tensor
+`logits_to_keep`. Use `--train-packing padded` with
+`--train-logprob-mode full_logits_ce` as the correctness and compatibility
+fallback.
