@@ -130,26 +130,36 @@ python accerl_agent/agent_textworld.py \
   --model-path "$MODEL_PATH" \
   --tw-game-dir "$TEXTWORLD_GAME_DIR" \
   --tw-game-pattern "*.z8" \
-  --tw-game-limit 2 \
-  --tw-max-episode-steps 10 \
-  --tw-history-token-window 1024 \
-  --max-length 1024 \
-  --fsdp-world-size 1 \
+  --tw-max-episode-steps 50 \
+  --tw-history-token-window 8192 \
+  --tw-game-limit 400 \
+  --max-length 8192 \
+  --tw-gamma 1.0 \
+  --tw-lost-penalty 0.0 \
+  --fsdp-world-size 3 \
   --infer-size 1 \
   --infer-tp-size 1 \
-  --num-rollout-workers 1 \
-  --rollout-batch-size 1 \
-  --batch-size 1 \
-  --grad-accum-steps 1 \
-  --replay-capacity 8 \
-  --min-replay-size-per-rank 1 \
-  --max-steps 2 \
-  --max-sync-rounds 1 \
+  --num-rollout-workers 24 \
+  --rollout-batch-size 8 \
+  --infer-max-tokens 16 \
+  --infer-temperature 1.0 \
+  --infer-top-p 1.0 \
+  --batch-size 2 \
+  --grad-accum-steps 32 \
+  --max-steps 500000 \
+  --lr-warmup-steps 500 \
+  --train-mode full \
   --sync-every-optimizer-steps 1 \
-  --train-mode lm_head \
-  --rl-algorithm ppo \
   --clip-mode ppo \
-  --trust-remote-code
+  --trust-remote-code \
+  --replay-capacity 256 \
+  --min-replay-size-per-rank 32 \
+  --rl-algorithm ppo \
+  --train-packing varlen \
+  --train-token-budget 16384 \
+  --train-pack-candidate-pool-size 64 \
+  --train-logprob-mode response_only_lm_head \
+  --dtype bfloat16
 ```
 
 The command above deliberately uses the default padded trainer path. After it
