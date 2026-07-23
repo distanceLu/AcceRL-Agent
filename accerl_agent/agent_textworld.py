@@ -4223,7 +4223,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--infer-temperature",
         type=float,
-        default=0.7,
+        default=1.0,
         help="Sampling temperature for rollout generation.",
     )
     parser.add_argument(
