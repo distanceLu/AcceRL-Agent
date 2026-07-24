@@ -161,8 +161,8 @@ total GPUs >= fsdp_world_size + infer_tp_size * infer_size
 
 The commonly used configuration below uses 3 FSDP trainer GPUs and one vLLM
 inference GPU, so at least 4 visible GPUs are required. It trains the full
-Qwen-MoE model with PPO, FlashAttention varlen packing, and response-only
-LM-head projection:
+Qwen-MoE model with GRPO advantages, PPO-style policy clipping, FlashAttention
+varlen packing, and response-only LM-head projection:
 
 ```bash
 python accerl_agent/agent_textworld.py \
@@ -193,7 +193,7 @@ python accerl_agent/agent_textworld.py \
   --trust-remote-code \
   --replay-capacity 256 \
   --min-replay-size-per-rank 32 \
-  --rl-algorithm ppo \
+  --rl-algorithm grpo \
   --train-packing varlen \
   --train-token-budget 16384 \
   --train-pack-candidate-pool-size 64 \
@@ -354,7 +354,8 @@ This is the most important stability check. Every sample must guarantee:
 - Aborted or non-trainable outputs may stay in `input_ids`, but their labels must be `-100`.
 - `response_ids` contains exactly all tokens where `labels != -100`.
 - `output_versions` has the same length as `response_ids`.
-- Total sequence length does not exceed `--max-length` or `--tw-history-token-window`.
+- Rollout samples do not exceed `--tw-history-token-window`, and argument
+  validation requires `--max-length >= --tw-history-token-window`.
 
 ## Troubleshooting
 
@@ -385,7 +386,8 @@ This is the most important stability check. Every sample must guarantee:
 
 - Lower the learning rate.
 - Reduce `--sync-every-optimizer-steps` or `--replay-capacity` to reduce sample staleness.
-- Try `--ppo-normalize-advantages`.
+- For padded PPO training only, try `--ppo-normalize-advantages`; varlen
+  training rejects this option.
 - Increase `--old-new-kl-coef`.
 - Confirm that invalid, aborted, or empty outputs are not mistakenly marked as trainable tokens.
 
@@ -395,7 +397,11 @@ This is the most important stability check. Every sample must guarantee:
   trainers.
 - Use `bfloat16`, `float16`, or `auto`; varlen rejects `float32`.
 - Confirm that the model supports Transformers `flash_attention_2`.
-- Confirm that its CausalLM forward accepts tensor `logits_to_keep`; this is
-  verified with Transformers 5.12.1 Qwen/Qwen-MoE.
+- When using `--train-logprob-mode response_only_lm_head`, confirm that the
+  CausalLM forward accepts tensor `logits_to_keep`; this is verified with
+  Transformers 5.12.1 Qwen/Qwen-MoE. Varlen with `full_logits_ce` does not
+  require this API.
+- To retain varlen while diagnosing response-only projection compatibility,
+  switch to `--train-logprob-mode full_logits_ce`.
 - Fall back to `--train-packing padded --train-logprob-mode full_logits_ce` to
   separate model/FlashAttention compatibility problems from the RL loop.

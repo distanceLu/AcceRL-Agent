@@ -1,6 +1,6 @@
 # AcceRL-Agent
 
-AcceRL-Agent is a asynchronous framework for online reinforcement learning with language-model agents. The main example in this repository is a TextWorld training loop: the model samples actions online through vLLM, the environment returns rewards, an FSDP trainer asynchronously consumes rollout samples, and updated weights are hot-synced back into vLLM.
+AcceRL-Agent is an asynchronous framework for online reinforcement learning with language-model agents. The main example in this repository is a TextWorld training loop: the model samples actions online through vLLM, the environment returns rewards, an FSDP trainer asynchronously consumes rollout samples, and updated weights are hot-synced back into vLLM.
 
 Main entry point:
 
@@ -54,9 +54,11 @@ This project targets Linux GPU environments. Exact package versions must match y
 Several parts of the current code assume a model layout close to Qwen/Qwen-MoE, such as `model.model.layers` and `lm_head`. If you use another HuggingFace model family, carefully check `build_model()`, `configure_trainable_parameters()`, the FSDP wrapping path, and `iter_vllm_loadable_weights()`.
 
 The optional varlen path additionally requires a GPU-supported `flash-attn`
-build and a Transformers model that implements tensor `logits_to_keep`.
-Transformers 5.12.1 with Qwen/Qwen-MoE is the currently verified combination.
-Other Transformers versions or model classes may not support this API.
+build. The `response_only_lm_head` logprob mode also requires a Transformers
+model that implements tensor `logits_to_keep`; varlen with `full_logits_ce`
+does not require that API. Transformers 5.12.1 with Qwen/Qwen-MoE is the
+currently verified combination for response-only LM-head projection. Other
+Transformers versions or model classes may not support this API.
 
 ## Installation
 
@@ -123,7 +125,9 @@ python accerl_agent/textworld_local_infer.py \
   --vllm-max-num-batched-tokens 2048
 ```
 
-Third, run a tiny end-to-end RL loop. The command below uses 1 FSDP GPU and 1 vLLM GPU, so it needs at least 2 visible GPUs:
+Third, run the current long-running end-to-end configuration. It uses 3 FSDP
+trainer GPUs and 1 vLLM inference GPU, so it needs at least 4 visible GPUs. The
+rollout algorithm is GRPO, while the policy objective uses PPO-style clipping:
 
 ```bash
 python accerl_agent/agent_textworld.py \
@@ -154,7 +158,7 @@ python accerl_agent/agent_textworld.py \
   --trust-remote-code \
   --replay-capacity 256 \
   --min-replay-size-per-rank 32 \
-  --rl-algorithm ppo \
+  --rl-algorithm grpo \
   --train-packing varlen \
   --train-token-budget 16384 \
   --train-pack-candidate-pool-size 64 \
@@ -162,8 +166,8 @@ python accerl_agent/agent_textworld.py \
   --dtype bfloat16
 ```
 
-The command above deliberately uses the default padded trainer path. After it
-passes, validate varlen training with:
+The command above is the full GRPO + varlen configuration and is intended for
+long-running training. For a much smaller 2-GPU varlen validation run, use:
 
 ```bash
 python accerl_agent/agent_textworld.py \
@@ -200,9 +204,9 @@ python accerl_agent/agent_textworld.py \
 Replay continues to store independent `RLSample` objects. Each trainer rank
 selects at most `--batch-size` samples and packs no more than
 `--train-token-budget` real tokens into one micro-batch. The token budget must
-be at least `--max-length`. Position IDs restart at zero for every sample so
-Transformers FlashAttention 2 can infer sequence boundaries and prevent
-cross-sample attention.
+be at least `--max-length`. Position IDs restart at zero for every sample, and
+the trainer passes cumulative sequence lengths and per-pack maximum lengths to
+FlashAttention 2 so attention cannot cross sample boundaries.
 
 GPU requirement for full training:
 
@@ -267,7 +271,8 @@ The TextWorld prompt includes the objective, observation, inventory, and admissi
 
 1. Takes the first line of model output.
 2. Removes common prefixes such as `action:`, `command:`, and `assistant:`.
-3. Removes extra punctuation and quotes.
+3. Removes a leading `>` marker, trailing periods, and wrapping quotes or
+   backticks.
 4. Lowercases and normalizes whitespace.
 5. Exact-matches the normalized action against the current admissible commands.
 
@@ -393,11 +398,17 @@ If many actions are invalid, lower the temperature, reduce `--infer-max-tokens`,
 
 If vLLM weight sync fails, check GPU counts, vLLM weight-transfer API support, the NCCL environment, the names/shapes/dtypes returned by `iter_vllm_loadable_weights()`, and whether the trainable parameter set is empty.
 
-If loss or KL is unstable, lower the learning rate, reduce replay staleness, try `--ppo-normalize-advantages`, increase the KL penalty, and confirm that invalid, aborted, or empty outputs are not mistakenly labeled as trainable tokens.
+If loss or KL is unstable, lower the learning rate, reduce replay staleness,
+increase the KL penalty, and confirm that invalid, aborted, or empty outputs
+are not mistakenly labeled as trainable tokens. For padded PPO training only,
+you can also try `--ppo-normalize-advantages`; the current varlen path rejects
+that option.
 
 If varlen model loading fails, verify that `flash_attn` imports in the trainer
-environment, the model supports `flash_attention_2`, the dtype is `bfloat16`,
-`float16`, or `auto`, and the model forward accepts a tensor
-`logits_to_keep`. Use `--train-packing padded` with
-`--train-logprob-mode full_logits_ce` as the correctness and compatibility
-fallback.
+environment, the model supports `flash_attention_2`, and the dtype is
+`bfloat16`, `float16`, or `auto`. If
+`--train-logprob-mode response_only_lm_head` fails, also confirm that the model
+forward accepts tensor `logits_to_keep`; alternatively, keep varlen packing and
+use `--train-logprob-mode full_logits_ce`. Use `--train-packing padded` with
+`--train-logprob-mode full_logits_ce` as the broader correctness and
+compatibility fallback.

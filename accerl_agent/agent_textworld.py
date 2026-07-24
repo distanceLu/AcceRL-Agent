@@ -92,6 +92,18 @@ class PreparedVarlenPack:
     max_seqlen: int
 
 
+VARLEN_TOKEN_STAT_NAMES = (
+    "policy_token_sum",
+    "old_new_kl_k3_sum",
+    "token_reward_sum",
+    "raw_advantage_sum",
+    "raw_advantage_sum_sq",
+    "used_advantage_sum",
+    "used_advantage_sum_sq",
+    "ppo_clip_count",
+)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -990,7 +1002,11 @@ class FSDPTrainWorker:
         *,
         varlen_max_seqlen: int | None = None,
         return_varlen_token_sums: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Dict[str, float | torch.Tensor],
+    ]:
         is_varlen = self.args.train_packing == "varlen"
         batch_size = int(batch["sample_rewards"].shape[0])
         if is_varlen:
@@ -1047,7 +1063,7 @@ class FSDPTrainWorker:
                 reduction="none",
             )
             valid_old_token_log_probs = batch["old_logprobs"][target_indices].to(
-                valid_token_log_probs.dtype
+                torch.float32
             )
         else:
             labels = batch["labels"][:, 1:]
@@ -1068,9 +1084,15 @@ class FSDPTrainWorker:
                 response_mask,
             )
             old_token_log_probs = batch["old_logprobs"][:, 1:].to(
-                valid_token_log_probs.dtype
+                torch.float32
             )
             valid_old_token_log_probs = old_token_log_probs[response_mask]
+
+        # Ratio-based RL objectives are numerically sensitive. Keep the
+        # subtraction, exponentiation, clipping/gating, and KL construction in
+        # FP32 even when the model forward and logits use BF16/FP16.
+        valid_token_log_probs = valid_token_log_probs.float()
+        valid_old_token_log_probs = valid_old_token_log_probs.float()
         valid_log_ratio = valid_token_log_probs - valid_old_token_log_probs
         valid_ratio = torch.exp(valid_log_ratio)
 
@@ -1105,14 +1127,14 @@ class FSDPTrainWorker:
                     (raw_valid_adv - adv_mean)
                     / (adv_std + self.args.ppo_adv_norm_eps)
                 )
-                valid_adv = normalized_valid_adv.to(valid_token_log_probs.dtype)
+                valid_adv = normalized_valid_adv
             else:
-                valid_adv = raw_valid_adv.to(valid_token_log_probs.dtype)
+                valid_adv = raw_valid_adv
         elif self.args.rl_algorithm == "grpo":
             raw_valid_adv = batch["sample_advantages"][valid_sample_indices].to(
                 torch.float32
             )
-            valid_adv = raw_valid_adv.to(valid_token_log_probs.dtype)
+            valid_adv = raw_valid_adv
         else:
             raise ValueError(f"Unsupported rl_algorithm: {self.args.rl_algorithm}")
 
@@ -1184,6 +1206,41 @@ class FSDPTrainWorker:
         )
 
         with torch.no_grad():
+            if is_varlen and return_varlen_token_sums:
+                if valid_token_rewards is not None:
+                    token_reward_sum = valid_token_rewards.sum()
+                else:
+                    token_reward_sum = policy_token_sum.new_zeros(())
+                if self.args.clip_mode == "ppo":
+                    clipped_mask = (
+                        (valid_ratio < (1.0 - self.args.clip_eps))
+                        | (valid_ratio > (1.0 + self.args.clip_eps))
+                    )
+                    ppo_clip_count = clipped_mask.sum().float()
+                else:
+                    ppo_clip_count = policy_token_sum.new_zeros(())
+
+                # Keep per-pack statistics on the accelerator. The optimizer
+                # window accumulates this detached vector and transfers it to
+                # Python only once after the cross-rank all-reduce.
+                varlen_token_stats = torch.stack(
+                    [
+                        policy_token_sum,
+                        old_new_kl_k3_sum,
+                        token_reward_sum,
+                        raw_valid_adv.sum(),
+                        raw_valid_adv.square().sum(),
+                        valid_adv.sum(),
+                        valid_adv.square().sum(),
+                        ppo_clip_count,
+                    ]
+                ).detach().to(dtype=torch.float64)
+                return (
+                    loss,
+                    response_token_counts,
+                    {"varlen_token_stats": varlen_token_stats},
+                )
+
             loss_stats = {}
             if valid_ratio.numel() > 0:
                 sample_kl_sum = torch.zeros(
@@ -1426,14 +1483,11 @@ class FSDPTrainWorker:
                 "response tokens."
             )
 
-        local_policy_sum = 0.0
-        local_kl_sum = 0.0
-        local_token_reward_sum = 0.0
-        local_raw_advantage_sum = 0.0
-        local_raw_advantage_sum_sq = 0.0
-        local_used_advantage_sum = 0.0
-        local_used_advantage_sum_sq = 0.0
-        local_clip_count = 0.0
+        local_token_stats = torch.zeros(
+            len(VARLEN_TOKEN_STAT_NAMES),
+            device=self.device,
+            dtype=torch.float64,
+        )
         local_episode_return_sum = 0.0
         local_version_lag_sum = 0.0
         local_sample_count = 0.0
@@ -1459,14 +1513,18 @@ class FSDPTrainWorker:
             backward_loss.backward()
 
             train_stats = prepared_pack.train_stats
-            local_policy_sum += loss_stats["policy_token_sum"]
-            local_kl_sum += loss_stats["old_new_kl_k3_sum"]
-            local_token_reward_sum += loss_stats["token_reward_sum"]
-            local_raw_advantage_sum += loss_stats["raw_advantage_sum"]
-            local_raw_advantage_sum_sq += loss_stats["raw_advantage_sum_sq"]
-            local_used_advantage_sum += loss_stats["used_advantage_sum"]
-            local_used_advantage_sum_sq += loss_stats["used_advantage_sum_sq"]
-            local_clip_count += loss_stats.get("ppo_clip_count", 0.0)
+            varlen_token_stats = loss_stats["varlen_token_stats"]
+            if not isinstance(varlen_token_stats, torch.Tensor):
+                raise TypeError(
+                    "Varlen loss statistics must remain an accelerator tensor."
+                )
+            if varlen_token_stats.shape != local_token_stats.shape:
+                raise RuntimeError(
+                    "Unexpected Varlen loss statistics shape: "
+                    f"{tuple(varlen_token_stats.shape)} != "
+                    f"{tuple(local_token_stats.shape)}"
+                )
+            local_token_stats.add_(varlen_token_stats)
             local_episode_return_sum += train_stats["episode_return_sum"]
             local_version_lag_sum += train_stats["trainer_version_lag_sum"]
             local_sample_count += train_stats["sample_count"]
@@ -1482,24 +1540,22 @@ class FSDPTrainWorker:
                 token_loss_sum,
                 response_token_counts,
                 backward_loss,
+                varlen_token_stats,
             )
 
-        global_stats = torch.tensor(
-            [
-                local_policy_sum,
-                local_kl_sum,
-                local_token_reward_sum,
-                local_raw_advantage_sum,
-                local_raw_advantage_sum_sq,
-                local_used_advantage_sum,
-                local_used_advantage_sum_sq,
-                local_clip_count,
-                local_episode_return_sum,
-                local_version_lag_sum,
-                local_sample_count,
-            ],
-            device=self.device,
-            dtype=torch.float64,
+        global_stats = torch.cat(
+            (
+                local_token_stats,
+                torch.tensor(
+                    [
+                        local_episode_return_sum,
+                        local_version_lag_sum,
+                        local_sample_count,
+                    ],
+                    device=self.device,
+                    dtype=torch.float64,
+                ),
+            )
         )
         dist.all_reduce(global_stats, op=dist.ReduceOp.SUM)
         (
