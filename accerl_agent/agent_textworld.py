@@ -17,6 +17,13 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Literal, Tuple
 
+# Keep direct script execution import-compatible, then delegate to the
+# canonical package module in the __main__ block below.
+if __package__ in (None, ""):
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if package_root not in sys.path:
+        sys.path.insert(0, package_root)
+
 import ray
 import textworld
 import textworld.gym
@@ -41,6 +48,13 @@ from vllm.distributed.weight_transfer.nccl_engine import (
     NCCLWeightTransferUpdateInfo,
 )
 from vllm.v1.executor import Executor
+
+from accerl_agent.ppo_value import (
+    TokenValueHead,
+    load_value_head_checkpoint,
+    save_value_head_checkpoint,
+)
+
 
 def get_local_ip() -> str:
     try:
@@ -382,6 +396,19 @@ def get_vllm_weight_metadata(named_parameters):
     return names, dtype_names, shapes
 
 
+def validate_vllm_policy_weight_names(names: Iterable[str]) -> None:
+    forbidden = [
+        name
+        for name in names
+        if "value_head" in name.lower() or "critic" in name.lower()
+    ]
+    if forbidden:
+        raise ValueError(
+            "Critic tensors must not be included in the vLLM policy payload: "
+            f"{forbidden[:5]}"
+        )
+
+
 def validate_weight_scope(scope: str) -> None:
     if scope not in {"all", "trainable"}:
         raise ValueError(f"Unsupported weight scope: {scope!r}")
@@ -455,6 +482,37 @@ class FSDPTrainWorker:
         configure_trainable_parameters(model, args.train_mode)
         log_parameter_count(model, args.train_mode, rank=rank)
 
+        hidden_size = getattr(model.config, "hidden_size", None)
+        if not isinstance(hidden_size, int) or hidden_size < 1:
+            raise ValueError(
+                "The policy model config must define a positive integer "
+                f"hidden_size; got {hidden_size!r}."
+            )
+        value_head = TokenValueHead(hidden_size=hidden_size, bias=True).to(
+            device=self.device
+        )
+        value_head_param_names = [
+            name for name, _ in value_head.named_parameters()
+        ]
+        self.value_head_loaded = load_value_head_checkpoint(
+            value_head,
+            args.model_path,
+        )
+        if rank == 0:
+            policy_total, policy_trainable = count_parameters(model)
+            value_total, value_trainable = count_parameters(value_head)
+            print(
+                "[train] Parameter groups: "
+                f"policy_total={policy_total:,} "
+                f"policy_trainable={policy_trainable:,} "
+                f"value_head_total={value_total:,} "
+                f"value_head_trainable={value_trainable:,} "
+                f"total_trainable={policy_trainable + value_trainable:,} "
+                f"value_head_loaded={self.value_head_loaded}"
+            )
+
+        # vLLM metadata must remain policy-only. Keep this list rooted at the
+        # Hugging Face policy model rather than any future actor-critic wrapper.
         named_parameters = list(model.named_parameters())
         all_param_names = [name for name, _ in named_parameters]
         trainable_param_names = [
@@ -470,15 +528,20 @@ class FSDPTrainWorker:
                 ]
             ),
         }
+        for metadata in self.weight_metadata_by_scope.values():
+            validate_vllm_policy_weight_names(metadata[0])
 
         for layer in model.model.layers:
             fully_shard(layer)
+        fully_shard(value_head)
         fully_shard(model)
 
         self.model = model
+        self.value_head = value_head
         fsdp_modules = [
             module
-            for module in self.model.modules()
+            for root in (self.model, self.value_head)
+            for module in root.modules()
             if hasattr(module, "set_gradient_divide_factor")
         ]
         if not fsdp_modules:
@@ -505,13 +568,38 @@ class FSDPTrainWorker:
                 for name in trainable_param_names
             ],
         }
-        self.trainable_parameter_list = list(iter_trainable_parameters(self.model))
-        if not self.trainable_parameter_list:
+        sharded_value_params_by_name = dict(self.value_head.named_parameters())
+        self.value_head_params = [
+            (name, sharded_value_params_by_name[name])
+            for name in value_head_param_names
+        ]
+        self.policy_trainable_parameters = list(
+            iter_trainable_parameters(self.model)
+        )
+        self.value_head_parameters = [
+            param for _, param in self.value_head_params
+        ]
+        if not self.policy_trainable_parameters:
             raise RuntimeError(f"No trainable parameters found for mode: {args.train_mode}")
+        if not self.value_head_parameters:
+            raise RuntimeError("Value Head has no trainable parameters.")
+        self.trainable_parameter_list = (
+            self.policy_trainable_parameters + self.value_head_parameters
+        )
 
         self.optimizer = torch.optim.AdamW(
-            self.trainable_parameter_list,
-            lr=args.learning_rate,
+            [
+                {
+                    "params": self.policy_trainable_parameters,
+                    "lr": args.learning_rate,
+                    "group_name": "policy",
+                },
+                {
+                    "params": self.value_head_parameters,
+                    "lr": args.learning_rate,
+                    "group_name": "value_head",
+                },
+            ],
             weight_decay=args.weight_decay,
         )
         self.optimizer.zero_grad(set_to_none=True)
@@ -1524,15 +1612,28 @@ class FSDPTrainWorker:
         dist.barrier()
 
         state_dict = None
+        value_head_state_dict = None
         if self.rank == 0:
             state_dict = {}
+            value_head_state_dict = {}
 
         with torch.no_grad():
             for name, param in self.params_by_scope["all"]:
                 full_param = param.full_tensor().detach()
                 if self.rank == 0:
                     assert state_dict is not None
-                    state_dict[name] = full_param.cpu()
+                    state_dict[name] = full_param.cpu().contiguous()
+                del full_param
+
+            # full_tensor() is collective. Every rank must traverse the
+            # independently sharded Value Head parameters in identical order.
+            for name, param in self.value_head_params:
+                full_param = param.full_tensor().detach()
+                if self.rank == 0:
+                    assert value_head_state_dict is not None
+                    value_head_state_dict[name] = (
+                        full_param.cpu().float().contiguous()
+                    )
                 del full_param
 
         result = {
@@ -1540,15 +1641,23 @@ class FSDPTrainWorker:
             "checkpoint_dir": output_dir,
             "optimizer_step": self.optimizer_step,
             "saved": False,
+            "critic_saved": False,
         }
         if self.rank == 0:
             assert state_dict is not None
+            assert value_head_state_dict is not None
             self.model.save_pretrained(
                 output_dir,
                 state_dict=state_dict,
                 safe_serialization=True,
             )
             self.tokenizer.save_pretrained(output_dir)
+            value_weights_path, value_config_path = save_value_head_checkpoint(
+                output_dir,
+                value_head_state_dict,
+                hidden_size=self.value_head.hidden_size,
+                bias=self.value_head.bias is not None,
+            )
             trainer_state = {
                 "optimizer_step": self.optimizer_step,
                 "train_micro_step": self.train_micro_step,
@@ -1557,13 +1666,28 @@ class FSDPTrainWorker:
                 "rl_algorithm": self.args.rl_algorithm,
                 "max_steps": self.args.max_steps,
                 "sync_every_optimizer_steps": self.args.sync_every_optimizer_steps,
+                "critic": {
+                    "architecture": "TokenValueHead",
+                    "hidden_size": self.value_head.hidden_size,
+                    "dtype": "float32",
+                    "weights": os.path.relpath(
+                        value_weights_path,
+                        output_dir,
+                    ),
+                    "config": os.path.relpath(
+                        value_config_path,
+                        output_dir,
+                    ),
+                },
             }
             state_path = os.path.join(output_dir, "trainer_state.json")
             with open(state_path, "w", encoding="utf-8") as file:
                 json.dump(trainer_state, file, ensure_ascii=False, indent=2, sort_keys=True)
                 file.write("\n")
             del state_dict
+            del value_head_state_dict
             result["saved"] = True
+            result["critic_saved"] = True
             print(f"[checkpoint] Saved checkpoint to {output_dir}")
 
         dist.barrier()
@@ -2810,12 +2934,19 @@ async def sync_weights_to_vllm(
     names, dtype_names, shapes = ray.get(
         fsdp_workers[0].get_weight_metadata.remote(scope)
     )
+    validate_vllm_policy_weight_names(names)
+    if not (len(names) == len(dtype_names) == len(shapes)):
+        raise ValueError(
+            "vLLM policy metadata lengths do not match: "
+            f"names={len(names)} dtypes={len(dtype_names)} shapes={len(shapes)}"
+        )
     model_gib = summarize_weight_payload(dtype_names, shapes)
     infer_payload_gib = model_gib * (transfer_world_size - 1)
     print(
         f"[sync] {scope} metadata: tensors={len(names)}, "
         f"logical_payload={model_gib:.3f} GiB, "
-        f"aggregate_infer_payload={infer_payload_gib:.3f} GiB"
+        f"aggregate_infer_payload={infer_payload_gib:.3f} GiB, "
+        "critic_in_vllm_payload=False"
     )
 
     ray.get(infer_actor.start_weight_update.remote())
@@ -3957,4 +4088,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Ray serializes classes defined by __main__ by value. Re-import this file
+    # through its canonical package name so remote workers are referenced as
+    # accerl_agent.agent_textworld.FSDPTrainWorker instead.
+    from accerl_agent.agent_textworld import main as canonical_main
+
+    canonical_main()

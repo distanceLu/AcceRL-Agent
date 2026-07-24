@@ -165,7 +165,7 @@ Qwen-MoE model with GRPO advantages, PPO-style policy clipping, FlashAttention
 varlen packing, and response-only LM-head projection:
 
 ```bash
-python accerl_agent/agent_textworld.py \
+python -m accerl_agent.run_agent_textworld \
   --model-path "$MODEL_PATH" \
   --tw-game-dir "$TEXTWORLD_GAME_DIR" \
   --tw-game-pattern "*.z8" \
@@ -288,7 +288,10 @@ By default, periodic and final saves both overwrite `latest`. To keep independen
 --checkpoint-name ""
 ```
 
-The current checkpoint contains model weights, config, tokenizer files, and `trainer_state.json`. It does not include optimizer state or the replay buffer, so it is mainly intended for inference/evaluation rather than full training resume.
+The current checkpoint contains policy weights, config, tokenizer files,
+`trainer_state.json`, and Value Head weights under `critic/`. It does not
+include optimizer state or the replay buffer, so it can restore model
+parameters but is not a full training-resume checkpoint.
 
 ## 8. Change Models
 

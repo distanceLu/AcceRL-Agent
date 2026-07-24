@@ -33,7 +33,9 @@ If you only want to run the smallest working flow first, see [QUICKSTART.md](QUI
 
 | Path | Description |
 | --- | --- |
-| `accerl_agent/agent_textworld.py` | Full Ray + vLLM + FSDP online RL training entry point. |
+| `accerl_agent/run_agent_textworld.py` | Canonical launcher for Ray-safe TextWorld training startup. |
+| `accerl_agent/agent_textworld.py` | Full Ray + vLLM + FSDP online RL training implementation. |
+| `accerl_agent/ppo_value.py` | Shared-backbone FP32 Value Head and Critic checkpoint helpers. |
 | `accerl_agent/textworld_local_infer.py` | Checks vLLM inference and TextWorld environment interaction without training. |
 | `accerl_agent/local_trainer.py` | Local dummy SFT smoke test for tokenizer/model/FSDP training paths. |
 | `accerl_agent/vllm_*.py` | Experimental scripts for vLLM, NCCL, and rollout-engine work. |
@@ -130,7 +132,7 @@ trainer GPUs and 1 vLLM inference GPU, so it needs at least 4 visible GPUs. The
 rollout algorithm is GRPO, while the policy objective uses PPO-style clipping:
 
 ```bash
-python accerl_agent/agent_textworld.py \
+python -m accerl_agent.run_agent_textworld \
   --model-path "$MODEL_PATH" \
   --tw-game-dir "$TEXTWORLD_GAME_DIR" \
   --tw-game-pattern "*.z8" \
@@ -170,7 +172,7 @@ The command above is the full GRPO + varlen configuration and is intended for
 long-running training. For a much smaller 2-GPU varlen validation run, use:
 
 ```bash
-python accerl_agent/agent_textworld.py \
+python -m accerl_agent.run_agent_textworld \
   --model-path "$MODEL_PATH" \
   --tw-game-dir "$TEXTWORLD_GAME_DIR" \
   --tw-game-pattern "*.z8" \
@@ -255,7 +257,7 @@ flowchart LR
     Trainer -->|"NCCL trainable weights"| Infer
 ```
 
-`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, selects trainable parameters according to `--train-mode`, and samples independent `RLSample` objects from replay. With `--train-packing varlen`, it dynamically packs those samples locally under the token budget. It computes the RL loss over response tokens and sends FSDP weights to vLLM during synchronization.
+`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, selects trainable parameters according to `--train-mode`, and samples independent `RLSample` objects from replay. It also owns a separately sharded FP32 Value Head, which is checkpointed but is not yet connected to a value loss. With `--train-packing varlen`, the trainer dynamically packs samples locally under the token budget. It computes the RL loss over response tokens and sends policy-only FSDP weights to vLLM during synchronization.
 
 `VLLMInferenceActor` handles rollout inference. It starts vLLM with dummy weights, waits for the initial full weight sync, pauses generation during later syncs, aborts requests when needed, updates weights, and then resumes generation.
 
