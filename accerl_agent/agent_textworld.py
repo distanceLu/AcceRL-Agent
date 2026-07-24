@@ -81,6 +81,17 @@ class EncodedExample:
         self.response_indices = response_indices
 
 
+@dataclass
+class PreparedVarlenPack:
+    """One CPU-resident pack prepared for a Varlen optimizer window."""
+
+    batch: Dict[str, torch.Tensor]
+    train_stats: Dict[str, float]
+    replay_stats: Dict[str, int]
+    valid_token_count: int
+    max_seqlen: int
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -180,6 +191,16 @@ def make_varlen_batch(examples: List[EncodedExample]) -> Dict[str, torch.Tensor]
     if not target_indices:
         raise ValueError("A varlen batch must contain at least one RL target.")
     prediction_indices = [index - 1 for index in target_indices]
+    for target_index, prediction_index in zip(
+        target_indices,
+        prediction_indices,
+    ):
+        if sequence_ids[target_index] != sequence_ids[prediction_index]:
+            raise ValueError("A packed target cannot cross a sequence boundary.")
+        if position_ids[target_index] != position_ids[prediction_index] + 1:
+            raise ValueError(
+                "A packed target must immediately follow its prediction position."
+            )
 
     return {
         "input_ids": torch.tensor([input_ids], dtype=torch.long),
@@ -320,6 +341,18 @@ def build_model(args: argparse.Namespace, device, torch_dtype, log: bool = True)
     if args.train_packing == "varlen":
         model_kwargs["attn_implementation"] = "flash_attention_2"
     model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
+    if args.train_packing == "varlen":
+        attention_implementation = getattr(
+            model.config,
+            "_attn_implementation",
+            None,
+        )
+        if attention_implementation != "flash_attention_2":
+            raise RuntimeError(
+                "Varlen training requires the loaded model to use "
+                "flash_attention_2; got "
+                f"{attention_implementation!r}."
+            )
     model.to(device)
     model.train()
     model.config.use_cache = False
@@ -459,6 +492,24 @@ class FSDPTrainWorker:
         fully_shard(model)
 
         self.model = model
+        fsdp_modules = [
+            module
+            for module in self.model.modules()
+            if hasattr(module, "set_gradient_divide_factor")
+        ]
+        if not fsdp_modules:
+            raise RuntimeError(
+                "The pinned FSDP2 runtime must expose "
+                "set_gradient_divide_factor()."
+            )
+        for module in fsdp_modules:
+            module.set_gradient_divide_factor(float(self.fsdp_world_size))
+        if self.rank == 0:
+            print(
+                "[train] FSDP gradient divide factor fixed at "
+                f"{self.fsdp_world_size}; Varlen loss pre-scale uses "
+                "world_size / global_valid_token_count."
+            )
         sharded_params_by_name = dict(self.model.named_parameters())
         self.params_by_scope = {
             "all": [
@@ -502,6 +553,13 @@ class FSDPTrainWorker:
         self.last_pack_sample_count = 0.0
         self.last_pack_max_sequence_length = 0.0
         self.last_pack_cpu_seconds = 0.0
+        self.last_global_training_samples = 0
+        self.cumulative_global_training_samples = 0
+        self.cumulative_global_valid_response_tokens = 0
+        self.total_replay_candidates_fetched = 0
+        self.total_valid_samples_prepared = 0
+        self.total_training_samples_consumed = 0
+        self.total_invalid_candidates = 0
         self.pending_prepared_samples: List[Tuple["RLSample", EncodedExample]] = []
 
         self.transfer_port = None
@@ -620,6 +678,8 @@ class FSDPTrainWorker:
         self,
         prepared_samples: List[Tuple["RLSample", EncodedExample]],
         trainer_version: float,
+        *,
+        move_to_device: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
         kept_samples = [sample for sample, _ in prepared_samples]
         examples = [example for _, example in prepared_samples]
@@ -631,7 +691,8 @@ class FSDPTrainWorker:
             batch = make_varlen_batch(examples)
         else:
             batch = self.collate_fn(examples)
-        batch = move_batch_to_device(batch, self.device)
+        if move_to_device:
+            batch = move_batch_to_device(batch, self.device)
         response_token_counts = [
             sum(1 for label in example.labels[1:] if label != -100)
             for example in examples
@@ -660,6 +721,10 @@ class FSDPTrainWorker:
 
         stats = {
             "sample_count": float(len(kept_samples)),
+            "reward_sum": float(sum(sample_rewards)),
+            "episode_return_sum": float(
+                sum(sample.episode_return for sample in kept_samples)
+            ),
             "reward_mean": (
                 sum(sample_rewards) / len(sample_rewards)
                 if sample_rewards else 0.0
@@ -674,6 +739,7 @@ class FSDPTrainWorker:
             "trainer_version_lag_mean": (
                 sum(version_lags) / len(version_lags) if version_lags else 0.0
             ),
+            "trainer_version_lag_sum": float(sum(version_lags)),
             "pack_tokens": float(sum(len(example.input_ids) for example in examples)),
             "pack_token_utilization": (
                 sum(len(example.input_ids) for example in examples)
@@ -725,14 +791,26 @@ class FSDPTrainWorker:
                     "advantage_std": token_advantage_std,
                     "raw_advantage_mean": token_advantage_mean,
                     "raw_advantage_std": token_advantage_std,
+                    "token_reward_sum": float(sum(valid_token_rewards)),
+                    "raw_advantage_sum": float(sum(valid_token_advantages)),
+                    "raw_advantage_sum_sq": float(
+                        sum(value * value for value in valid_token_advantages)
+                    ),
+                    "advantage_token_count": float(len(valid_token_advantages)),
                 }
             )
         else:
             stats.update(
                 {
                     "token_reward_mean": 0.0,
+                    "token_reward_sum": 0.0,
                     "raw_advantage_mean": sample_advantage_mean,
                     "raw_advantage_std": sample_advantage_std,
+                    "raw_advantage_sum": float(sum(sample_advantages)),
+                    "raw_advantage_sum_sq": float(
+                        sum(value * value for value in sample_advantages)
+                    ),
+                    "advantage_token_count": float(len(sample_advantages)),
                 }
             )
         return batch, stats
@@ -785,37 +863,15 @@ class FSDPTrainWorker:
             replay_stats = self.get_replay_stats()
 
         if self.args.train_packing == "varlen":
-            candidate_target = self.args.train_pack_candidate_pool_size
-            deadline = None
-            if self.args.replay_sample_timeout_seconds > 0:
-                deadline = time.monotonic() + self.args.replay_sample_timeout_seconds
-
-            while not self.pending_prepared_samples:
-                sampled = ray.get(
-                    self.replay_buffer.sample.remote(candidate_target)
-                )
-                replay_stats = self.get_replay_stats()
-                for sample in sampled:
-                    example = self._prepare_rl_sample(sample)
-                    if example is not None:
-                        self.pending_prepared_samples.append((sample, example))
-                if self.pending_prepared_samples:
-                    break
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "Timed out waiting for valid replay candidates: "
-                        f"rank={self.rank} target={candidate_target} stats={replay_stats}"
-                    )
-                time.sleep(self.args.replay_wait_sleep_seconds)
-
-            packing_start = time.perf_counter()
-            collected = self._select_varlen_pack()
-            batch, train_stats = self._collate_prepared_rl_samples(
-                collected,
+            prepared = self._next_varlen_cpu_pack(
                 trainer_version,
+                replay_stats=replay_stats,
             )
-            train_stats["pack_cpu_seconds"] = time.perf_counter() - packing_start
-            return batch, train_stats, replay_stats
+            return (
+                move_batch_to_device(prepared.batch, self.device),
+                prepared.train_stats,
+                prepared.replay_stats,
+            )
 
         while len(collected) < self.args.batch_size:
             need = self.args.batch_size - len(collected)
@@ -851,13 +907,98 @@ class FSDPTrainWorker:
         train_stats["pack_cpu_seconds"] = 0.0
         return batch, train_stats, replay_stats
 
+    def _next_varlen_cpu_pack(
+        self,
+        trainer_version: float,
+        *,
+        replay_stats: Dict[str, int] | None = None,
+    ) -> PreparedVarlenPack:
+        """Prepare one Varlen pack without moving any tensor to the GPU."""
+        if replay_stats is None:
+            replay_stats = self.get_replay_stats()
+            warmup_deadline = None
+            if self.args.replay_sample_timeout_seconds > 0:
+                warmup_deadline = (
+                    time.monotonic() + self.args.replay_sample_timeout_seconds
+                )
+            while replay_stats["size"] < self.args.min_replay_size_per_rank:
+                if (
+                    warmup_deadline is not None
+                    and time.monotonic() >= warmup_deadline
+                ):
+                    raise TimeoutError(
+                        "Timed out waiting for replay warmup: "
+                        f"rank={self.rank} size={replay_stats['size']} "
+                        "min_replay_size_per_rank="
+                        f"{self.args.min_replay_size_per_rank} "
+                        f"stats={replay_stats}"
+                    )
+                time.sleep(self.args.replay_wait_sleep_seconds)
+                replay_stats = self.get_replay_stats()
+
+        candidate_target = self.args.train_pack_candidate_pool_size
+        deadline = None
+        if self.args.replay_sample_timeout_seconds > 0:
+            deadline = time.monotonic() + self.args.replay_sample_timeout_seconds
+
+        while not self.pending_prepared_samples:
+            sampled = ray.get(self.replay_buffer.sample.remote(candidate_target))
+            self.total_replay_candidates_fetched += len(sampled)
+            replay_stats = self.get_replay_stats()
+            valid_count = 0
+            for sample in sampled:
+                example = self._prepare_rl_sample(sample)
+                if example is None:
+                    self.total_invalid_candidates += 1
+                    continue
+                self.pending_prepared_samples.append((sample, example))
+                valid_count += 1
+            self.total_valid_samples_prepared += valid_count
+            if self.pending_prepared_samples:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for valid replay candidates: "
+                    f"rank={self.rank} target={candidate_target} "
+                    f"stats={replay_stats}"
+                )
+            time.sleep(self.args.replay_wait_sleep_seconds)
+
+        packing_start = time.perf_counter()
+        collected = self._select_varlen_pack()
+        batch, train_stats = self._collate_prepared_rl_samples(
+            collected,
+            trainer_version,
+            move_to_device=False,
+        )
+        train_stats["pack_cpu_seconds"] = time.perf_counter() - packing_start
+        valid_token_count = int(batch["target_indices"].numel())
+        if valid_token_count <= 0:
+            raise RuntimeError("A Varlen pack must contain at least one target.")
+        max_seqlen = max(len(example.input_ids) for _, example in collected)
+        return PreparedVarlenPack(
+            batch=batch,
+            train_stats=train_stats,
+            replay_stats=replay_stats,
+            valid_token_count=valid_token_count,
+            max_seqlen=max_seqlen,
+        )
+
     def _compute_rl_loss(
         self,
         batch: Dict[str, torch.Tensor],
+        *,
+        varlen_max_seqlen: int | None = None,
+        return_varlen_token_sums: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         is_varlen = self.args.train_packing == "varlen"
         batch_size = int(batch["sample_rewards"].shape[0])
         if is_varlen:
+            if return_varlen_token_sums and varlen_max_seqlen is None:
+                raise ValueError(
+                    "Varlen token-sum training requires an explicit "
+                    "max sequence length and cumulative sequence boundaries."
+                )
             target_indices = batch["target_indices"]
             prediction_indices = batch["prediction_indices"]
             if target_indices.numel() == 0:
@@ -867,13 +1008,22 @@ class FSDPTrainWorker:
                 valid_sample_indices,
                 minlength=batch_size,
             ).clamp_min(1)
-            valid_labels = batch["input_ids"][0, target_indices]
+            valid_labels = batch["labels"][target_indices]
             model_kwargs = {
                 "input_ids": batch["input_ids"],
                 "position_ids": batch["position_ids"],
                 "attention_mask": None,
                 "use_cache": False,
             }
+            if varlen_max_seqlen is not None:
+                model_kwargs.update(
+                    {
+                        "cu_seq_lens_q": batch["cu_seqlens"],
+                        "cu_seq_lens_k": batch["cu_seqlens"],
+                        "max_length_q": int(varlen_max_seqlen),
+                        "max_length_k": int(varlen_max_seqlen),
+                    }
+                )
             model_type = str(getattr(self.model.config, "model_type", ""))
             if "moe" in model_type or hasattr(self.model.config, "num_experts"):
                 model_kwargs["output_router_logits"] = False
@@ -990,28 +1140,48 @@ class FSDPTrainWorker:
         else:
             raise ValueError(f"Unsupported clip_mode: {self.args.clip_mode}")
 
+        objective_for_diagnostics = (
+            valid_objective.detach()
+            if is_varlen and return_varlen_token_sums
+            else valid_objective
+        )
         if self.args.rl_algorithm == "ppo":
             assert valid_response_indices is not None
             sample_objective = self._aggregate_valid_objective_by_response(
-                valid_objective,
+                objective_for_diagnostics,
                 valid_sample_indices,
                 valid_response_indices,
                 batch_size=batch_size,
             )
         else:
             sample_objective = self._aggregate_valid_objective(
-                valid_objective,
+                objective_for_diagnostics,
                 valid_sample_indices,
                 response_token_counts,
                 batch_size=batch_size,
             )
-        policy_loss = -sample_objective.mean()
         old_new_kl_k3 = valid_ratio - 1.0 - valid_log_ratio
-        old_new_kl_k3_token_mean = old_new_kl_k3.mean()
+        policy_token_sum = -valid_objective.float().sum()
+        old_new_kl_k3_sum = old_new_kl_k3.float().sum()
+        valid_token_count = int(valid_objective.numel())
+        if is_varlen and return_varlen_token_sums:
+            # Varlen intentionally optimizes a global valid-response-token
+            # mean. It does not preserve the padded path's per-response or
+            # per-episode weighting, so longer responses carry more weight.
+            policy_loss = policy_token_sum / valid_token_count
+            old_new_kl_k3_token_mean = old_new_kl_k3_sum / valid_token_count
+            loss = policy_token_sum + (
+                self.args.old_new_kl_coef * old_new_kl_k3_sum
+            )
+        else:
+            policy_loss = -sample_objective.mean()
+            old_new_kl_k3_token_mean = old_new_kl_k3.mean()
+            loss = policy_loss + (
+                self.args.old_new_kl_coef * old_new_kl_k3_token_mean
+            )
         old_new_kl_k3_loss = (
             self.args.old_new_kl_coef * old_new_kl_k3_token_mean
         )
-        loss = policy_loss + old_new_kl_k3_loss
 
         with torch.no_grad():
             loss_stats = {}
@@ -1027,6 +1197,11 @@ class FSDPTrainWorker:
                     old_new_kl_k3,
                 )
                 loss_stats["policy_loss"] = float(policy_loss.item())
+                loss_stats["policy_token_sum"] = float(policy_token_sum.item())
+                loss_stats["old_new_kl_k3_sum"] = float(
+                    old_new_kl_k3_sum.item()
+                )
+                loss_stats["valid_token_count"] = float(valid_token_count)
                 loss_stats["episode_objective_mean"] = float(
                     sample_objective.mean().item()
                 )
@@ -1034,17 +1209,31 @@ class FSDPTrainWorker:
                     loss_stats["token_reward_mean"] = float(
                         valid_token_rewards.mean().item()
                     )
+                    loss_stats["token_reward_sum"] = float(
+                        valid_token_rewards.sum().item()
+                    )
                 else:
                     loss_stats["token_reward_mean"] = 0.0
+                    loss_stats["token_reward_sum"] = 0.0
                 loss_stats["raw_advantage_mean"] = float(raw_valid_adv.mean().item())
                 loss_stats["raw_advantage_std"] = float(
                     raw_valid_adv.std(unbiased=False).item()
+                )
+                loss_stats["raw_advantage_sum"] = float(raw_valid_adv.sum().item())
+                loss_stats["raw_advantage_sum_sq"] = float(
+                    raw_valid_adv.square().sum().item()
                 )
                 loss_stats["used_advantage_mean"] = float(
                     valid_adv.float().mean().item()
                 )
                 loss_stats["used_advantage_std"] = float(
                     valid_adv.float().std(unbiased=False).item()
+                )
+                loss_stats["used_advantage_sum"] = float(
+                    valid_adv.float().sum().item()
+                )
+                loss_stats["used_advantage_sum_sq"] = float(
+                    valid_adv.float().square().sum().item()
                 )
                 loss_stats["ppo_advantages_normalized"] = float(
                     self.args.rl_algorithm == "ppo"
@@ -1059,6 +1248,9 @@ class FSDPTrainWorker:
                 loss_stats["old_new_kl_k3_sample_sum_mean"] = float(
                     sample_kl_sum.mean().item()
                 )
+                loss_stats["old_new_kl_k3_sample_sum"] = float(
+                    sample_kl_sum.sum().item()
+                )
             if self.args.clip_mode == "ppo" and valid_ratio.numel() > 0:
                 clipped_mask = (
                     (valid_ratio < (1.0 - self.args.clip_eps))
@@ -1067,6 +1259,7 @@ class FSDPTrainWorker:
                 loss_stats["ppo_clip_frac"] = float(
                     clipped_mask.float().mean().item()
                 )
+                loss_stats["ppo_clip_count"] = float(clipped_mask.sum().item())
             return loss, response_token_counts, loss_stats
 
     def _valid_token_log_probs_from_full_logits(
@@ -1170,6 +1363,263 @@ class FSDPTrainWorker:
             / sample_response_counts[valid_sample_mask]
         )
 
+    def _prepare_varlen_optimizer_window(
+        self,
+        trainer_version: float,
+    ) -> List[PreparedVarlenPack]:
+        """Prepare a fixed-size CPU window and synchronize preparation errors."""
+        window = None
+        local_error = None
+        try:
+            window = [
+                self._next_varlen_cpu_pack(trainer_version)
+                for _ in range(self.args.grad_accum_steps)
+            ]
+            if len(window) != self.args.grad_accum_steps:
+                raise RuntimeError(
+                    "Varlen optimizer window has an unexpected pack count: "
+                    f"{len(window)} != {self.args.grad_accum_steps}"
+                )
+        except Exception as exc:
+            local_error = repr(exc)
+            print(
+                f"[rank {self.rank}] Varlen window preparation failed: "
+                f"{local_error}"
+            )
+
+        success = torch.tensor(
+            0 if local_error is not None else 1,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(success, op=dist.ReduceOp.MIN)
+        if int(success.item()) != 1:
+            raise RuntimeError(
+                "At least one FSDP rank failed to prepare its Varlen "
+                "optimizer window; see per-rank logs for the original error."
+            )
+        assert window is not None
+        return window
+
+    def _run_varlen_optimizer_step(
+        self,
+        trainer_version: float,
+    ) -> Dict[str, float]:
+        """Run one globally token-normalized Varlen optimizer step."""
+        window = self._prepare_varlen_optimizer_window(trainer_version)
+        local_valid_token_count = sum(
+            pack.valid_token_count for pack in window
+        )
+        global_valid_token_count_tensor = torch.tensor(
+            local_valid_token_count,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        dist.all_reduce(
+            global_valid_token_count_tensor,
+            op=dist.ReduceOp.SUM,
+        )
+        global_valid_token_count = int(global_valid_token_count_tensor.item())
+        if global_valid_token_count <= 0:
+            raise RuntimeError(
+                "Global Varlen optimizer window contains no valid "
+                "response tokens."
+            )
+
+        local_policy_sum = 0.0
+        local_kl_sum = 0.0
+        local_token_reward_sum = 0.0
+        local_raw_advantage_sum = 0.0
+        local_raw_advantage_sum_sq = 0.0
+        local_used_advantage_sum = 0.0
+        local_used_advantage_sum_sq = 0.0
+        local_clip_count = 0.0
+        local_episode_return_sum = 0.0
+        local_version_lag_sum = 0.0
+        local_sample_count = 0.0
+        local_pack_utilization_sum = 0.0
+        local_pack_sample_count_sum = 0.0
+        local_pack_max_seqlen_sum = 0.0
+        local_pack_cpu_seconds_sum = 0.0
+        last_replay_stats = window[-1].replay_stats
+
+        for prepared_pack in window:
+            batch = move_batch_to_device(prepared_pack.batch, self.device)
+            token_loss_sum, response_token_counts, loss_stats = (
+                self._compute_rl_loss(
+                    batch,
+                    varlen_max_seqlen=prepared_pack.max_seqlen,
+                    return_varlen_token_sums=True,
+                )
+            )
+            backward_loss = token_loss_sum * (
+                float(self.fsdp_world_size)
+                / float(global_valid_token_count)
+            )
+            backward_loss.backward()
+
+            train_stats = prepared_pack.train_stats
+            local_policy_sum += loss_stats["policy_token_sum"]
+            local_kl_sum += loss_stats["old_new_kl_k3_sum"]
+            local_token_reward_sum += loss_stats["token_reward_sum"]
+            local_raw_advantage_sum += loss_stats["raw_advantage_sum"]
+            local_raw_advantage_sum_sq += loss_stats["raw_advantage_sum_sq"]
+            local_used_advantage_sum += loss_stats["used_advantage_sum"]
+            local_used_advantage_sum_sq += loss_stats["used_advantage_sum_sq"]
+            local_clip_count += loss_stats.get("ppo_clip_count", 0.0)
+            local_episode_return_sum += train_stats["episode_return_sum"]
+            local_version_lag_sum += train_stats["trainer_version_lag_sum"]
+            local_sample_count += train_stats["sample_count"]
+            local_pack_utilization_sum += train_stats["pack_token_utilization"]
+            local_pack_sample_count_sum += train_stats["pack_sample_count"]
+            local_pack_max_seqlen_sum += train_stats[
+                "pack_max_sequence_length"
+            ]
+            local_pack_cpu_seconds_sum += train_stats["pack_cpu_seconds"]
+            self.train_micro_step += 1
+            del (
+                batch,
+                token_loss_sum,
+                response_token_counts,
+                backward_loss,
+            )
+
+        global_stats = torch.tensor(
+            [
+                local_policy_sum,
+                local_kl_sum,
+                local_token_reward_sum,
+                local_raw_advantage_sum,
+                local_raw_advantage_sum_sq,
+                local_used_advantage_sum,
+                local_used_advantage_sum_sq,
+                local_clip_count,
+                local_episode_return_sum,
+                local_version_lag_sum,
+                local_sample_count,
+            ],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(global_stats, op=dist.ReduceOp.SUM)
+        (
+            global_policy_sum,
+            global_kl_sum,
+            global_token_reward_sum,
+            global_raw_advantage_sum,
+            global_raw_advantage_sum_sq,
+            global_used_advantage_sum,
+            global_used_advantage_sum_sq,
+            global_clip_count,
+            global_episode_return_sum,
+            global_version_lag_sum,
+            global_sample_count_float,
+        ) = global_stats.tolist()
+        global_sample_count = int(global_sample_count_float)
+        if global_sample_count <= 0:
+            raise RuntimeError(
+                "Global Varlen optimizer window contains no training samples."
+            )
+
+        torch.nn.utils.clip_grad_norm_(
+            self.trainable_parameter_list,
+            max_norm=1.0,
+        )
+        current_lr = self._get_current_lr(
+            self.optimizer_step,
+            self.args.learning_rate,
+            self.args.lr_warmup_steps,
+            self.args.max_steps,
+        )
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = current_lr
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer_step += 1
+
+        token_count = float(global_valid_token_count)
+        sample_count = float(global_sample_count)
+        raw_advantage_mean = global_raw_advantage_sum / token_count
+        used_advantage_mean = global_used_advantage_sum / token_count
+        raw_advantage_variance = max(
+            global_raw_advantage_sum_sq / token_count
+            - raw_advantage_mean**2,
+            0.0,
+        )
+        used_advantage_variance = max(
+            global_used_advantage_sum_sq / token_count
+            - used_advantage_mean**2,
+            0.0,
+        )
+        policy_loss_token_mean = global_policy_sum / token_count
+        kl_token_mean = global_kl_sum / token_count
+        weighted_kl_loss = self.args.old_new_kl_coef * kl_token_mean
+        total_loss_token_mean = policy_loss_token_mean + weighted_kl_loss
+
+        self.last_loss = total_loss_token_mean
+        self.last_reward_mean = global_episode_return_sum / sample_count
+        self.last_advantage_mean = raw_advantage_mean
+        self.last_response_tokens = token_count
+        self.last_global_training_samples = global_sample_count
+        self.last_replay_size = int(last_replay_stats["size"])
+        self.last_total_sampled = int(
+            last_replay_stats["total_samples_sampled"]
+        )
+        self.last_ppo_clip_frac = global_clip_count / token_count
+        self.last_token_reward_mean = global_token_reward_sum / token_count
+        self.last_raw_advantage_mean = raw_advantage_mean
+        self.last_raw_advantage_std = math.sqrt(raw_advantage_variance)
+        self.last_used_advantage_mean = used_advantage_mean
+        self.last_used_advantage_std = math.sqrt(used_advantage_variance)
+        self.last_old_new_kl_k3_token_mean = kl_token_mean
+        self.last_old_new_kl_k3_sample_sum_mean = (
+            global_kl_sum / sample_count
+        )
+        self.last_old_new_kl_k3_loss = weighted_kl_loss
+        pack_count = float(len(window))
+        self.last_pack_token_utilization = (
+            local_pack_utilization_sum / pack_count
+        )
+        self.last_pack_sample_count = (
+            local_pack_sample_count_sum / pack_count
+        )
+        self.last_pack_max_sequence_length = (
+            local_pack_max_seqlen_sum / pack_count
+        )
+        self.last_pack_cpu_seconds = (
+            local_pack_cpu_seconds_sum / pack_count
+        )
+        self.cumulative_global_valid_response_tokens += (
+            global_valid_token_count
+        )
+        self.cumulative_global_training_samples += global_sample_count
+        self.total_training_samples_consumed += int(local_sample_count)
+
+        return {
+            "global_policy_sum": global_policy_sum,
+            "global_kl_sum": global_kl_sum,
+            "global_token_reward_sum": global_token_reward_sum,
+            "global_raw_advantage_sum": global_raw_advantage_sum,
+            "global_raw_advantage_sum_sq": global_raw_advantage_sum_sq,
+            "global_used_advantage_sum": global_used_advantage_sum,
+            "global_used_advantage_sum_sq": global_used_advantage_sum_sq,
+            "global_clip_count": global_clip_count,
+            "global_episode_return_sum": global_episode_return_sum,
+            "global_version_lag_sum": global_version_lag_sum,
+            "global_valid_token_count": token_count,
+            "global_sample_count": sample_count,
+            "loss_token_mean": total_loss_token_mean,
+            "policy_loss_token_mean": policy_loss_token_mean,
+            "kl_token_mean": kl_token_mean,
+            "weighted_kl_loss": weighted_kl_loss,
+            "pack_utilization_sum": local_pack_utilization_sum,
+            "pack_sample_count_sum": local_pack_sample_count_sum,
+            "pack_max_seqlen_sum": local_pack_max_seqlen_sum,
+            "pack_cpu_seconds_sum": local_pack_cpu_seconds_sum,
+            "pack_count": pack_count,
+            "current_lr": current_lr,
+        }
+
     def train_until_next_sync(
         self,
         num_optimizer_steps: int = 100,
@@ -1203,9 +1653,37 @@ class FSDPTrainWorker:
         segment_pack_sample_counts = []
         segment_pack_max_sequence_lengths = []
         segment_pack_cpu_seconds = []
+        segment_varlen_steps = []
 
         while self.optimizer_step < target_optimizer_step:
             trainer_version = self.optimizer_step / self.args.sync_every_optimizer_steps
+            if self.args.train_packing == "varlen":
+                step_stats = self._run_varlen_optimizer_step(trainer_version)
+                segment_varlen_steps.append(step_stats)
+                if self.rank == 0 and self.optimizer_step % self.args.log_every == 0:
+                    print(
+                        "[train] "
+                        f"optimizer_step={self.optimizer_step} "
+                        f"micro_step={self.train_micro_step} "
+                        f"rl_loss={self.last_loss:.6f} "
+                        "policy_loss_token_mean="
+                        f"{step_stats['policy_loss_token_mean']:.6f} "
+                        f"kl_token_mean={step_stats['kl_token_mean']:.6f} "
+                        f"global_valid_tokens={self.last_response_tokens:.0f} "
+                        "global_training_samples="
+                        f"{self.last_global_training_samples} "
+                        "cumulative_valid_tokens="
+                        f"{self.cumulative_global_valid_response_tokens} "
+                        "cumulative_training_samples="
+                        f"{self.cumulative_global_training_samples} "
+                        f"pack_utilization={self.last_pack_token_utilization:.4f} "
+                        f"pack_samples={self.last_pack_sample_count:.2f} "
+                        f"pack_max_seqlen={self.last_pack_max_sequence_length:.0f} "
+                        f"pack_cpu_ms={self.last_pack_cpu_seconds * 1000.0:.3f} "
+                        f"lr={step_stats['current_lr']:.8g}"
+                    )
+                continue
+
             batch, train_stats, replay_stats = self._next_rl_training_batch(
                 trainer_version
             )
@@ -1349,6 +1827,119 @@ class FSDPTrainWorker:
                     f"lr={current_lr:.8g}"
                 )
 
+        varlen_segment = None
+        if segment_varlen_steps:
+            global_valid_tokens = sum(
+                step["global_valid_token_count"]
+                for step in segment_varlen_steps
+            )
+            global_samples = sum(
+                step["global_sample_count"] for step in segment_varlen_steps
+            )
+            global_policy_sum = sum(
+                step["global_policy_sum"] for step in segment_varlen_steps
+            )
+            global_kl_sum = sum(
+                step["global_kl_sum"] for step in segment_varlen_steps
+            )
+            global_token_reward_sum = sum(
+                step["global_token_reward_sum"]
+                for step in segment_varlen_steps
+            )
+            global_raw_advantage_sum = sum(
+                step["global_raw_advantage_sum"]
+                for step in segment_varlen_steps
+            )
+            global_raw_advantage_sum_sq = sum(
+                step["global_raw_advantage_sum_sq"]
+                for step in segment_varlen_steps
+            )
+            global_used_advantage_sum = sum(
+                step["global_used_advantage_sum"]
+                for step in segment_varlen_steps
+            )
+            global_used_advantage_sum_sq = sum(
+                step["global_used_advantage_sum_sq"]
+                for step in segment_varlen_steps
+            )
+            global_episode_return_sum = sum(
+                step["global_episode_return_sum"]
+                for step in segment_varlen_steps
+            )
+            global_version_lag_sum = sum(
+                step["global_version_lag_sum"]
+                for step in segment_varlen_steps
+            )
+            global_clip_count = sum(
+                step["global_clip_count"] for step in segment_varlen_steps
+            )
+            pack_count = sum(
+                step["pack_count"] for step in segment_varlen_steps
+            )
+            raw_advantage_mean = (
+                global_raw_advantage_sum / global_valid_tokens
+            )
+            used_advantage_mean = (
+                global_used_advantage_sum / global_valid_tokens
+            )
+            raw_advantage_std = math.sqrt(
+                max(
+                    global_raw_advantage_sum_sq / global_valid_tokens
+                    - raw_advantage_mean**2,
+                    0.0,
+                )
+            )
+            used_advantage_std = math.sqrt(
+                max(
+                    global_used_advantage_sum_sq / global_valid_tokens
+                    - used_advantage_mean**2,
+                    0.0,
+                )
+            )
+            policy_loss_token_mean = global_policy_sum / global_valid_tokens
+            kl_token_mean = global_kl_sum / global_valid_tokens
+            weighted_kl_loss = self.args.old_new_kl_coef * kl_token_mean
+            varlen_segment = {
+                "loss_mean": policy_loss_token_mean + weighted_kl_loss,
+                "episode_return_mean": (
+                    global_episode_return_sum / global_samples
+                ),
+                "token_reward_mean": (
+                    global_token_reward_sum / global_valid_tokens
+                ),
+                "raw_advantage_mean": raw_advantage_mean,
+                "raw_advantage_std": raw_advantage_std,
+                "used_advantage_mean": used_advantage_mean,
+                "used_advantage_std": used_advantage_std,
+                "kl_token_mean": kl_token_mean,
+                "kl_sample_sum_mean": global_kl_sum / global_samples,
+                "weighted_kl_loss": weighted_kl_loss,
+                "clip_fraction": global_clip_count / global_valid_tokens,
+                "version_lag_mean": global_version_lag_sum / global_samples,
+                "pack_utilization_mean": sum(
+                    step["pack_utilization_sum"]
+                    for step in segment_varlen_steps
+                )
+                / pack_count,
+                "pack_sample_count_mean": sum(
+                    step["pack_sample_count_sum"]
+                    for step in segment_varlen_steps
+                )
+                / pack_count,
+                "pack_max_seqlen_mean": sum(
+                    step["pack_max_seqlen_sum"]
+                    for step in segment_varlen_steps
+                )
+                / pack_count,
+                "pack_cpu_seconds_mean": sum(
+                    step["pack_cpu_seconds_sum"]
+                    for step in segment_varlen_steps
+                )
+                / pack_count,
+                "global_valid_tokens": global_valid_tokens,
+                "global_training_samples": global_samples,
+            }
+
         dist.barrier()
         optimizer_steps_run = self.optimizer_step - start_optimizer_step
         current_lr = self.optimizer.param_groups[0]["lr"]
@@ -1379,68 +1970,136 @@ class FSDPTrainWorker:
             "last_pack_sample_count": self.last_pack_sample_count,
             "last_pack_max_sequence_length": self.last_pack_max_sequence_length,
             "last_pack_cpu_seconds": self.last_pack_cpu_seconds,
+            "last_global_training_samples": self.last_global_training_samples,
+            "cumulative_global_valid_response_tokens": (
+                self.cumulative_global_valid_response_tokens
+            ),
+            "cumulative_global_training_samples": (
+                self.cumulative_global_training_samples
+            ),
+            "total_replay_candidates_fetched": (
+                self.total_replay_candidates_fetched
+            ),
+            "total_valid_samples_prepared": self.total_valid_samples_prepared,
+            "total_training_samples_consumed": (
+                self.total_training_samples_consumed
+            ),
+            "total_invalid_candidates": self.total_invalid_candidates,
+            "segment_global_valid_response_tokens": (
+                varlen_segment["global_valid_tokens"]
+                if varlen_segment is not None
+                else 0.0
+            ),
+            "segment_global_training_samples": (
+                varlen_segment["global_training_samples"]
+                if varlen_segment is not None
+                else 0.0
+            ),
+            "segment_policy_loss_token_mean": (
+                varlen_segment["loss_mean"]
+                - varlen_segment["weighted_kl_loss"]
+                if varlen_segment is not None
+                else 0.0
+            ),
+            "segment_ppo_clip_frac": (
+                varlen_segment["clip_fraction"]
+                if varlen_segment is not None
+                else 0.0
+            ),
             "segment_loss_mean": (
-                sum(segment_losses) / len(segment_losses) if segment_losses else 0.0
+                varlen_segment["loss_mean"]
+                if varlen_segment is not None
+                else sum(segment_losses) / len(segment_losses)
+                if segment_losses
+                else 0.0
             ),
             "segment_episode_return_mean": (
-                sum(segment_episode_return_means) / len(segment_episode_return_means)
+                varlen_segment["episode_return_mean"]
+                if varlen_segment is not None
+                else sum(segment_episode_return_means) / len(segment_episode_return_means)
                 if segment_episode_return_means else 0.0
             ),
             "segment_token_reward_mean": (
-                sum(segment_token_reward_means) / len(segment_token_reward_means)
+                varlen_segment["token_reward_mean"]
+                if varlen_segment is not None
+                else sum(segment_token_reward_means) / len(segment_token_reward_means)
                 if segment_token_reward_means else 0.0
             ),
             "segment_raw_advantage_mean": (
-                sum(segment_raw_advantage_means) / len(segment_raw_advantage_means)
+                varlen_segment["raw_advantage_mean"]
+                if varlen_segment is not None
+                else sum(segment_raw_advantage_means) / len(segment_raw_advantage_means)
                 if segment_raw_advantage_means else 0.0
             ),
             "segment_raw_advantage_std": (
-                sum(segment_raw_advantage_stds) / len(segment_raw_advantage_stds)
+                varlen_segment["raw_advantage_std"]
+                if varlen_segment is not None
+                else sum(segment_raw_advantage_stds) / len(segment_raw_advantage_stds)
                 if segment_raw_advantage_stds else 0.0
             ),
             "segment_used_advantage_mean": (
-                sum(segment_used_advantage_means) / len(segment_used_advantage_means)
+                varlen_segment["used_advantage_mean"]
+                if varlen_segment is not None
+                else sum(segment_used_advantage_means) / len(segment_used_advantage_means)
                 if segment_used_advantage_means else 0.0
             ),
             "segment_used_advantage_std": (
-                sum(segment_used_advantage_stds) / len(segment_used_advantage_stds)
+                varlen_segment["used_advantage_std"]
+                if varlen_segment is not None
+                else sum(segment_used_advantage_stds) / len(segment_used_advantage_stds)
                 if segment_used_advantage_stds else 0.0
             ),
             "segment_old_new_kl_k3_token_mean": (
-                sum(segment_old_new_kl_k3_token_means)
+                varlen_segment["kl_token_mean"]
+                if varlen_segment is not None
+                else sum(segment_old_new_kl_k3_token_means)
                 / len(segment_old_new_kl_k3_token_means)
                 if segment_old_new_kl_k3_token_means else 0.0
             ),
             "segment_old_new_kl_k3_sample_sum_mean": (
-                sum(segment_old_new_kl_k3_sample_sum_means)
+                varlen_segment["kl_sample_sum_mean"]
+                if varlen_segment is not None
+                else sum(segment_old_new_kl_k3_sample_sum_means)
                 / len(segment_old_new_kl_k3_sample_sum_means)
                 if segment_old_new_kl_k3_sample_sum_means else 0.0
             ),
             "segment_old_new_kl_k3_loss": (
-                sum(segment_old_new_kl_k3_losses)
+                varlen_segment["weighted_kl_loss"]
+                if varlen_segment is not None
+                else sum(segment_old_new_kl_k3_losses)
                 / len(segment_old_new_kl_k3_losses)
                 if segment_old_new_kl_k3_losses else 0.0
             ),
             "segment_pack_token_utilization_mean": (
-                sum(segment_pack_token_utilizations)
+                varlen_segment["pack_utilization_mean"]
+                if varlen_segment is not None
+                else sum(segment_pack_token_utilizations)
                 / len(segment_pack_token_utilizations)
                 if segment_pack_token_utilizations else 0.0
             ),
             "segment_pack_sample_count_mean": (
-                sum(segment_pack_sample_counts) / len(segment_pack_sample_counts)
+                varlen_segment["pack_sample_count_mean"]
+                if varlen_segment is not None
+                else sum(segment_pack_sample_counts) / len(segment_pack_sample_counts)
                 if segment_pack_sample_counts else 0.0
             ),
             "segment_pack_max_sequence_length_mean": (
-                sum(segment_pack_max_sequence_lengths)
+                varlen_segment["pack_max_seqlen_mean"]
+                if varlen_segment is not None
+                else sum(segment_pack_max_sequence_lengths)
                 / len(segment_pack_max_sequence_lengths)
                 if segment_pack_max_sequence_lengths else 0.0
             ),
             "segment_pack_cpu_seconds_mean": (
-                sum(segment_pack_cpu_seconds) / len(segment_pack_cpu_seconds)
+                varlen_segment["pack_cpu_seconds_mean"]
+                if varlen_segment is not None
+                else sum(segment_pack_cpu_seconds) / len(segment_pack_cpu_seconds)
                 if segment_pack_cpu_seconds else 0.0
             ),
             "train_sample_trainer_version_lag_mean": (
-                sum(segment_version_lags) / len(segment_version_lags)
+                varlen_segment["version_lag_mean"]
+                if varlen_segment is not None
+                else sum(segment_version_lags) / len(segment_version_lags)
                 if segment_version_lags else 0.0
             ),
             "learning_rate": current_lr,
@@ -1879,9 +2538,11 @@ class ReplayBufferActor:
             "capacity": self.samples.maxlen or 0,
             "total_samples_added": self.total_samples_added,
             "total_samples_sampled": self.total_samples_sampled,
+            "total_candidates_fetched": self.total_samples_sampled,
             "total_samples_evicted": self.total_samples_evicted,
             "total_batches_added": self.total_batches_added,
             "total_batches_sampled": self.total_batches_sampled,
+            "total_candidate_batches_fetched": self.total_batches_sampled,
         }
 
 
@@ -3470,7 +4131,8 @@ async def run_textworld_train(args: argparse.Namespace):
                 f"adv_mean={rank0_summary['last_advantage_mean']:.4f} "
                 f"response_tokens={rank0_summary['last_response_tokens']:.0f} "
                 f"replay_size={rank0_summary['last_replay_size']} "
-                f"total_sampled={rank0_summary['last_total_sampled']} "
+                "replay_candidates_fetched="
+                f"{rank0_summary['last_total_sampled']} "
                 f"ppo_clip_frac={rank0_summary['last_ppo_clip_frac']:.4f} "
                 f"token_reward_mean={rank0_summary['last_token_reward_mean']:.4f} "
                 f"raw_adv_mean={rank0_summary['last_raw_advantage_mean']:.4f} "
@@ -3521,7 +4183,7 @@ async def run_textworld_train(args: argparse.Namespace):
                 for stats in replay_stats
             )
             replay_sampled = ",".join(
-                str(stats["total_samples_sampled"])
+                str(stats["total_candidates_fetched"])
                 for stats in replay_stats
             )
             replay_evicted = ",".join(
@@ -3533,7 +4195,7 @@ async def run_textworld_train(args: argparse.Namespace):
                 f"sync_round={sync_rounds} "
                 f"sizes=[{replay_sizes}] "
                 f"total_received=[{replay_received}] "
-                f"total_sampled=[{replay_sampled}] "
+                f"total_candidates_fetched=[{replay_sampled}] "
                 f"total_evicted=[{replay_evicted}]"
             )
             print(
@@ -3624,6 +4286,13 @@ async def run_textworld_train(args: argparse.Namespace):
             ) / len(summaries)
             optimizer_steps_per_sec = (
                 rank0_summary["optimizer_steps_run"] / max(train_segment_elapsed, 1e-9)
+            )
+            segment_global_valid_response_tokens = float(
+                rank0_summary.get("segment_global_valid_response_tokens", 0.0)
+            )
+            valid_response_tokens_per_sec = (
+                segment_global_valid_response_tokens
+                / max(train_segment_elapsed, 1e-9)
             )
             tb_step = rank0_summary["optimizer_step"]
             writer.add_scalar(
@@ -3744,6 +4413,94 @@ async def run_textworld_train(args: argparse.Namespace):
             )
             if args.train_packing == "varlen":
                 writer.add_scalar(
+                    "Train/PolicyLossTokenMean",
+                    rank0_summary["segment_policy_loss_token_mean"],
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Train/SegmentGlobalValidResponseTokens",
+                    segment_global_valid_response_tokens,
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Train/SegmentGlobalTrainingSamples",
+                    rank0_summary["segment_global_training_samples"],
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Train/GlobalValidResponseTokensPerOptimizerStep",
+                    segment_global_valid_response_tokens
+                    / rank0_summary["optimizer_steps_run"],
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Train/GlobalTrainingSamplesPerOptimizerStep",
+                    rank0_summary["segment_global_training_samples"]
+                    / rank0_summary["optimizer_steps_run"],
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Train/CumulativeGlobalValidResponseTokens",
+                    rank0_summary[
+                        "cumulative_global_valid_response_tokens"
+                    ],
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Train/CumulativeGlobalTrainingSamples",
+                    rank0_summary["cumulative_global_training_samples"],
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "TextWorld/NormalizedScoreByValidResponseToken",
+                    rollout_stats["tw_normalized_score"],
+                    rank0_summary[
+                        "cumulative_global_valid_response_tokens"
+                    ],
+                )
+                writer.add_scalar(
+                    "TextWorld/NormalizedScoreByTrainingSample",
+                    rollout_stats["tw_normalized_score"],
+                    rank0_summary["cumulative_global_training_samples"],
+                )
+                writer.add_scalar(
+                    "Train/ValidResponseTokensPerSec",
+                    valid_response_tokens_per_sec,
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Replay/CandidatesFetched",
+                    sum(
+                        int(summary["total_replay_candidates_fetched"])
+                        for summary in summaries
+                    ),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Replay/ValidSamplesPrepared",
+                    sum(
+                        int(summary["total_valid_samples_prepared"])
+                        for summary in summaries
+                    ),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Replay/TrainingSamplesConsumed",
+                    sum(
+                        int(summary["total_training_samples_consumed"])
+                        for summary in summaries
+                    ),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Replay/InvalidCandidates",
+                    sum(
+                        int(summary["total_invalid_candidates"])
+                        for summary in summaries
+                    ),
+                    tb_step,
+                )
+                writer.add_scalar(
                     "Train/PackTokenUtilization",
                     pack_token_utilization_mean,
                     tb_step,
@@ -3766,7 +4523,11 @@ async def run_textworld_train(args: argparse.Namespace):
             if args.clip_mode == "ppo":
                 writer.add_scalar(
                     "Clip/PPOClipFrac",
-                    rank0_summary["last_ppo_clip_frac"],
+                    (
+                        rank0_summary["segment_ppo_clip_frac"]
+                        if args.train_packing == "varlen"
+                        else rank0_summary["last_ppo_clip_frac"]
+                    ),
                     tb_step,
                 )
             writer.add_scalar("Infer/TokensPerSec", infer_tokens_per_sec, tb_step)
@@ -3999,7 +4760,8 @@ def parse_args() -> argparse.Namespace:
         default="padded",
         help=(
             "Trainer batch layout. 'varlen' flattens independently sampled "
-            "RLSamples and uses FlashAttention 2 sequence boundaries."
+            "RLSamples, uses FlashAttention 2 sequence boundaries, and "
+            "optimizes a global valid-response-token weighted objective."
         ),
     )
     parser.add_argument(
@@ -4037,7 +4799,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--grad-accum-steps", type=int, default=8)
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=8,
+        help=(
+            "Gradient accumulation microsteps. In varlen mode this is the "
+            "fixed number of packs prepared per rank for each optimizer step."
+        ),
+    )
     parser.add_argument(
         "--train-logprob-mode",
         type=str,
@@ -4327,7 +5097,19 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def validate_varlen_training_options(args: argparse.Namespace) -> None:
+    if args.train_packing != "varlen":
+        return
+    if args.ppo_normalize_advantages:
+        raise ValueError(
+            "--ppo-normalize-advantages is not supported with "
+            "--train-packing varlen because the Varlen baseline uses a "
+            "global valid-response-token weighted objective."
+        )
+
+
 def validate_args(args: argparse.Namespace) -> None:
+    validate_varlen_training_options(args)
     if args.tw_game_limit is not None and args.tw_game_limit < 1:
         raise ValueError("--tw-game-limit must be >= 1 when set")
     if args.tw_max_episode_steps < 1:
