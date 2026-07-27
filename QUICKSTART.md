@@ -344,7 +344,6 @@ The TextWorld functions most commonly replaced are:
 - `parse_model_action()`
 - `_compute_step_reward()`
 - `_build_textworld_episode_rl_sample()`
-- `_compute_token_level_advantages()`
 - `_compute_grpo_group_advantages()`
 
 ## 10. Check RLSample Alignment
@@ -355,8 +354,12 @@ This is the most important stability check. Every sample must guarantee:
 - Trainable response-token labels equal the token ids.
 - Trainable response tokens have old-policy logprobs.
 - Aborted or non-trainable outputs may stay in `input_ids`, but their labels must be `-100`.
-- `response_ids` contains exactly all tokens where `labels != -100`.
-- `output_versions` has the same length as `response_ids`.
+- `response_indices` and `output_versions` are token-aligned; ignored tokens
+  use `-1`.
+- PPO rewards and terminal/truncation masks are token-aligned, with exactly
+  one boundary on the final valid response token.
+- Truncated PPO samples contain ignored final-state context and a valid
+  bootstrap prediction position.
 - Rollout samples do not exceed `--tw-history-token-window`, and argument
   validation requires `--max-length >= --tw-history-token-window`.
 
@@ -389,8 +392,10 @@ This is the most important stability check. Every sample must guarantee:
 
 - Lower the learning rate.
 - Reduce `--sync-every-optimizer-steps` or `--replay-capacity` to reduce sample staleness.
-- For padded PPO training only, try `--ppo-normalize-advantages`; varlen
-  training rejects this option.
+- PPO uses padded training, on-the-fly current values, and token TD(λ).
+  Advantage normalization is enabled by default; use
+  `--no-ppo-normalize-advantages` to disable it. PPO varlen is not yet
+  supported, while GRPO varlen remains available.
 - Increase `--old-new-kl-coef`.
 - Confirm that invalid, aborted, or empty outputs are not mistakenly marked as trainable tokens.
 

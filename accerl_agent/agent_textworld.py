@@ -54,6 +54,14 @@ from accerl_agent.ppo_value import (
     load_value_head_checkpoint,
     save_value_head_checkpoint,
 )
+from accerl_agent.rl_data import (
+    GRPOSample,
+    RLSample,
+    RawPPOSample,
+    TerminationReason,
+    compute_token_gae,
+    validate_raw_ppo_sample,
+)
 
 
 def get_local_ip() -> str:
@@ -72,19 +80,6 @@ def find_open_port() -> int:
 
 
 @dataclass
-class RLSample:
-    algorithm: Literal["ppo", "grpo"]
-    input_ids: List[int]
-    attention_mask: List[int]
-    labels: List[int]
-    old_logprobs: List[float]
-    advantage: float
-    token_advantages: List[float]
-    response_indices: List[int]
-    output_versions: List[int]
-
-
-@dataclass
 class PreparedVarlenPack:
     """One CPU-resident pack prepared for a Varlen optimizer window."""
 
@@ -95,10 +90,38 @@ class PreparedVarlenPack:
     sample_count: int
 
 
+@dataclass
+class PreparedPaddedPPOBatch:
+    batch: Dict[str, torch.Tensor]
+    valid_token_count: int
+    version_lag_sum: float
+    sample_count: int
+
+
 VARLEN_TOKEN_STAT_NAMES = (
     "policy_token_sum",
     "old_new_kl_k3_sum",
     "ppo_clip_count",
+)
+
+PPO_TOKEN_STAT_NAMES = (
+    "policy_sum",
+    "value_loss_sum",
+    "kl_sum",
+    "clip_count",
+    "value_sum",
+    "value_sq_sum",
+    "return_sum",
+    "return_sq_sum",
+    "residual_sum",
+    "residual_sq_sum",
+    "delta_sum",
+    "delta_sq_sum",
+    "advantage_sum",
+    "advantage_sq_sum",
+    "terminated_count",
+    "truncated_count",
+    "bootstrap_count",
 )
 
 
@@ -121,18 +144,21 @@ def pick_dtype(dtype_name: str):
     return torch.float32
 
 
-def make_collate_fn(tokenizer):
+def make_ppo_collate_fn(tokenizer):
     pad_token_id = tokenizer.pad_token_id
 
-    def collate(examples: List[RLSample]) -> Dict[str, torch.Tensor]:
+    def collate(examples: List[RawPPOSample]) -> Dict[str, torch.Tensor]:
         max_len = max(len(example.input_ids) for example in examples)
         input_ids = []
         attention_mask = []
         labels = []
         old_logprobs = []
-        sample_advantages = []
-        token_advantages = []
+        token_rewards = []
+        token_terminated = []
+        token_truncated = []
         response_indices = []
+        output_versions = []
+        bootstrap_prediction_positions = []
 
         for example in examples:
             pad_len = max_len - len(example.input_ids)
@@ -140,24 +166,78 @@ def make_collate_fn(tokenizer):
             attention_mask.append(example.attention_mask + [0] * pad_len)
             labels.append(example.labels + [-100] * pad_len)
             old_logprobs.append(example.old_logprobs + [0.0] * pad_len)
-            sample_advantages.append(example.advantage)
-            token_advantages.append(example.token_advantages + [0.0] * pad_len)
+            token_rewards.append(example.token_rewards + [0.0] * pad_len)
+            token_terminated.append(
+                example.token_terminated + [False] * pad_len
+            )
+            token_truncated.append(
+                example.token_truncated + [False] * pad_len
+            )
             response_indices.append(example.response_indices + [-1] * pad_len)
+            output_versions.append(example.output_versions + [-1] * pad_len)
+            bootstrap_prediction_positions.append(
+                example.bootstrap_prediction_position
+                if example.bootstrap_prediction_position is not None
+                else -1
+            )
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "old_logprobs": torch.tensor(old_logprobs, dtype=torch.float32),
-            "sample_advantages": torch.tensor(sample_advantages, dtype=torch.float32),
-            "token_advantages": torch.tensor(token_advantages, dtype=torch.float32),
+            "token_rewards": torch.tensor(token_rewards, dtype=torch.float32),
+            "token_terminated": torch.tensor(token_terminated, dtype=torch.bool),
+            "token_truncated": torch.tensor(token_truncated, dtype=torch.bool),
             "response_indices": torch.tensor(response_indices, dtype=torch.long),
+            "output_versions": torch.tensor(output_versions, dtype=torch.long),
+            "bootstrap_prediction_positions": torch.tensor(
+                bootstrap_prediction_positions,
+                dtype=torch.long,
+            ),
         }
 
     return collate
 
 
-def make_varlen_batch(examples: List[RLSample]) -> Dict[str, torch.Tensor]:
+def make_grpo_collate_fn(tokenizer):
+    pad_token_id = tokenizer.pad_token_id
+
+    def collate(examples: List[GRPOSample]) -> Dict[str, torch.Tensor]:
+        max_len = max(len(example.input_ids) for example in examples)
+        input_ids = []
+        attention_mask = []
+        labels = []
+        old_logprobs = []
+        response_indices = []
+        output_versions = []
+        sample_advantages = []
+        for example in examples:
+            pad_len = max_len - len(example.input_ids)
+            input_ids.append(example.input_ids + [pad_token_id] * pad_len)
+            attention_mask.append(example.attention_mask + [0] * pad_len)
+            labels.append(example.labels + [-100] * pad_len)
+            old_logprobs.append(example.old_logprobs + [0.0] * pad_len)
+            response_indices.append(example.response_indices + [-1] * pad_len)
+            output_versions.append(example.output_versions + [-1] * pad_len)
+            sample_advantages.append(example.advantage)
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "old_logprobs": torch.tensor(old_logprobs, dtype=torch.float32),
+            "response_indices": torch.tensor(response_indices, dtype=torch.long),
+            "output_versions": torch.tensor(output_versions, dtype=torch.long),
+            "sample_advantages": torch.tensor(
+                sample_advantages,
+                dtype=torch.float32,
+            ),
+        }
+
+    return collate
+
+
+def make_varlen_batch(examples: List[GRPOSample]) -> Dict[str, torch.Tensor]:
     """Flatten examples while retaining their causal and RL sample boundaries."""
     if not examples:
         raise ValueError("At least one example is required for varlen packing.")
@@ -165,8 +245,8 @@ def make_varlen_batch(examples: List[RLSample]) -> Dict[str, torch.Tensor]:
     input_ids = []
     labels = []
     old_logprobs = []
-    token_advantages = []
     response_indices = []
+    output_versions = []
     position_ids = []
     sequence_ids = []
     cu_seqlens = [0]
@@ -181,8 +261,8 @@ def make_varlen_batch(examples: List[RLSample]) -> Dict[str, torch.Tensor]:
         input_ids.extend(example.input_ids)
         labels.extend(example.labels)
         old_logprobs.extend(example.old_logprobs)
-        token_advantages.extend(example.token_advantages)
         response_indices.extend(example.response_indices)
+        output_versions.extend(example.output_versions)
         position_ids.extend(range(length))
         sequence_ids.extend([sequence_id] * length)
         cu_seqlens.append(cu_seqlens[-1] + length)
@@ -213,8 +293,8 @@ def make_varlen_batch(examples: List[RLSample]) -> Dict[str, torch.Tensor]:
         "sample_advantages": torch.tensor(
             [example.advantage for example in examples], dtype=torch.float32
         ),
-        "token_advantages": torch.tensor(token_advantages, dtype=torch.float32),
         "response_indices": torch.tensor(response_indices, dtype=torch.long),
+        "output_versions": torch.tensor(output_versions, dtype=torch.long),
         "sequence_ids": torch.tensor(sequence_ids, dtype=torch.long),
         "target_indices": torch.tensor(target_indices, dtype=torch.long),
         "prediction_indices": torch.tensor(prediction_indices, dtype=torch.long),
@@ -222,10 +302,10 @@ def make_varlen_batch(examples: List[RLSample]) -> Dict[str, torch.Tensor]:
 
 
 def select_varlen_pack(
-    prepared_samples: List[RLSample],
+    prepared_samples: List[GRPOSample],
     token_budget: int,
     max_sequences: int,
-) -> Tuple[List[RLSample], List[RLSample]]:
+) -> Tuple[List[GRPOSample], List[GRPOSample]]:
     """First-fit a random replay candidate pool after a local length sort."""
     ordered = sorted(
         enumerate(prepared_samples),
@@ -476,7 +556,8 @@ class FSDPTrainWorker:
         set_seed(args.seed + rank)
 
         self.tokenizer = build_tokenizer(args, log=rank == 0)
-        self.collate_fn = make_collate_fn(self.tokenizer)
+        self.ppo_collate_fn = make_ppo_collate_fn(self.tokenizer)
+        self.grpo_collate_fn = make_grpo_collate_fn(self.tokenizer)
         torch_dtype = pick_dtype(args.dtype)
         model = build_model(args, self.device, torch_dtype, log=rank == 0)
         configure_trainable_parameters(model, args.train_mode)
@@ -606,7 +687,7 @@ class FSDPTrainWorker:
 
         self.train_micro_step = 0
         self.optimizer_step = 0
-        self.pending_prepared_samples: List[RLSample] = []
+        self.pending_prepared_samples: List[GRPOSample] = []
 
         self.transfer_port = None
         self.transfer_master_address = None
@@ -650,62 +731,145 @@ class FSDPTrainWorker:
     def _prepare_rl_sample(self, sample: RLSample) -> RLSample | None:
         if sample.algorithm != self.args.rl_algorithm:
             return None
+        if isinstance(sample, RawPPOSample):
+            return self._prepare_ppo_sample(sample)
+        if isinstance(sample, GRPOSample):
+            return self._prepare_grpo_sample(sample)
+        return None
+
+    def _prepare_ppo_sample(
+        self,
+        sample: RawPPOSample,
+    ) -> RawPPOSample | None:
         input_ids = list(sample.input_ids)
         labels = list(sample.labels)
         attention_mask = list(sample.attention_mask)
-        if (
-            not input_ids
-            or len(input_ids) != len(labels)
-            or len(input_ids) != len(attention_mask)
-        ):
-            return None
         old_logprobs = list(sample.old_logprobs)
-        token_advantages = list(sample.token_advantages)
+        token_rewards = list(sample.token_rewards)
+        token_terminated = list(sample.token_terminated)
+        token_truncated = list(sample.token_truncated)
         response_indices = list(sample.response_indices)
-        if (
-            len(old_logprobs) != len(input_ids)
-            or len(token_advantages) != len(input_ids)
-            or len(response_indices) != len(input_ids)
+        output_versions = list(sample.output_versions)
+        bootstrap_position = sample.bootstrap_prediction_position
+        original_length = len(input_ids)
+        token_fields = (
+            attention_mask,
+            labels,
+            old_logprobs,
+            token_rewards,
+            token_terminated,
+            token_truncated,
+            response_indices,
+            output_versions,
+        )
+        if not input_ids or any(
+            len(field) != original_length for field in token_fields
         ):
             return None
         max_length = self.args.max_length
-        if len(input_ids) > max_length:
+        if original_length > max_length:
+            truncate_offset = original_length - max_length
             input_ids = input_ids[-max_length:]
             attention_mask = attention_mask[-max_length:]
             labels = labels[-max_length:]
             old_logprobs = old_logprobs[-max_length:]
-            token_advantages = token_advantages[-max_length:]
+            token_rewards = token_rewards[-max_length:]
+            token_terminated = token_terminated[-max_length:]
+            token_truncated = token_truncated[-max_length:]
             response_indices = response_indices[-max_length:]
-
-        # A left-truncated first token has no in-window predecessor, so it
-        # cannot be a causal LM target. The padded path already ignored it via
-        # labels[:, 1:]; make that boundary explicit for flattened batches.
-        labels[0] = -100
-        old_logprobs[0] = 0.0
-        token_advantages[0] = 0.0
-        response_indices[0] = -1
+            output_versions = output_versions[-max_length:]
+            if bootstrap_position is not None:
+                bootstrap_position -= truncate_offset
+                if not 0 <= bootstrap_position < max_length:
+                    return None
 
         if len(input_ids) < 2:
             return None
+        labels[0] = -100
+        old_logprobs[0] = 0.0
+        token_rewards[0] = 0.0
+        token_terminated[0] = False
+        token_truncated[0] = False
+        response_indices[0] = -1
+        output_versions[0] = -1
+
+        prepared = RawPPOSample(
+            algorithm="ppo",
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            old_logprobs=old_logprobs,
+            token_rewards=token_rewards,
+            token_terminated=token_terminated,
+            token_truncated=token_truncated,
+            response_indices=response_indices,
+            output_versions=output_versions,
+            bootstrap_prediction_position=bootstrap_position,
+            termination_reason=sample.termination_reason,
+        )
+        try:
+            validate_raw_ppo_sample(prepared)
+        except ValueError:
+            return None
+        return prepared
+
+    def _prepare_grpo_sample(
+        self,
+        sample: GRPOSample,
+    ) -> GRPOSample | None:
+        input_ids = list(sample.input_ids)
+        labels = list(sample.labels)
+        attention_mask = list(sample.attention_mask)
+        old_logprobs = list(sample.old_logprobs)
+        response_indices = list(sample.response_indices)
+        output_versions = list(sample.output_versions)
+        original_length = len(input_ids)
+        if not input_ids or any(
+            len(field) != original_length
+            for field in (
+                attention_mask,
+                labels,
+                old_logprobs,
+                response_indices,
+                output_versions,
+            )
+        ):
+            return None
+        max_length = self.args.max_length
+        if original_length > max_length:
+            input_ids = input_ids[-max_length:]
+            attention_mask = attention_mask[-max_length:]
+            labels = labels[-max_length:]
+            old_logprobs = old_logprobs[-max_length:]
+            response_indices = response_indices[-max_length:]
+            output_versions = output_versions[-max_length:]
+        if len(input_ids) < 2:
+            return None
+        labels[0] = -100
+        old_logprobs[0] = 0.0
+        response_indices[0] = -1
+        output_versions[0] = -1
         if all(label == -100 for label in labels[1:]):
             return None
         if any(
-            response_index < 0
-            for response_index, label in zip(response_indices[1:], labels[1:])
+            response_index < 0 or output_version < 0
+            for response_index, output_version, label in zip(
+                response_indices[1:],
+                output_versions[1:],
+                labels[1:],
+            )
             if label != -100
         ):
             return None
-
-        return RLSample(
-            algorithm=sample.algorithm,
+        return GRPOSample(
+            algorithm="grpo",
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
             old_logprobs=old_logprobs,
             advantage=sample.advantage,
-            token_advantages=token_advantages,
             response_indices=response_indices,
-            output_versions=list(sample.output_versions),
+            output_versions=output_versions,
         )
 
     def _collate_prepared_rl_samples(
@@ -718,9 +882,26 @@ class FSDPTrainWorker:
             raise RuntimeError("No valid RL samples were available for training.")
 
         if self.args.train_packing == "varlen":
+            if not all(
+                isinstance(sample, GRPOSample)
+                for sample in prepared_samples
+            ):
+                raise TypeError("Varlen training only accepts GRPO samples.")
             batch = make_varlen_batch(prepared_samples)
+        elif self.args.rl_algorithm == "ppo":
+            if not all(
+                isinstance(sample, RawPPOSample)
+                for sample in prepared_samples
+            ):
+                raise TypeError("PPO collate requires RawPPOSample inputs.")
+            batch = self.ppo_collate_fn(prepared_samples)
         else:
-            batch = self.collate_fn(prepared_samples)
+            if not all(
+                isinstance(sample, GRPOSample)
+                for sample in prepared_samples
+            ):
+                raise TypeError("GRPO collate requires GRPOSample inputs.")
+            batch = self.grpo_collate_fn(prepared_samples)
         if move_to_device:
             batch = move_batch_to_device(batch, self.device)
         return batch
@@ -733,7 +914,14 @@ class FSDPTrainWorker:
         lag_sum = sum(
             max(
                 trainer_version
-                - (max(sample.output_versions) if sample.output_versions else 0),
+                - max(
+                    (
+                        version
+                        for version in sample.output_versions
+                        if version >= 0
+                    ),
+                    default=0,
+                ),
                 0.0,
             )
             for sample in samples
@@ -769,6 +957,8 @@ class FSDPTrainWorker:
     def _next_rl_training_batch(
         self,
         trainer_version: float,
+        *,
+        move_to_device: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], float]:
         collected = []
         replay_stats = self.get_replay_stats()
@@ -817,7 +1007,10 @@ class FSDPTrainWorker:
         samples = collected[: self.args.batch_size]
         lag_sum, sample_count = self._version_lag_stats(samples, trainer_version)
         return (
-            self._collate_prepared_rl_samples(samples),
+            self._collate_prepared_rl_samples(
+                samples,
+                move_to_device=move_to_device,
+            ),
             lag_sum / sample_count,
         )
 
@@ -896,6 +1089,11 @@ class FSDPTrainWorker:
         torch.Tensor | None,
         Dict[str, float | torch.Tensor],
     ]:
+        if self.args.rl_algorithm != "grpo":
+            raise RuntimeError(
+                "_compute_rl_loss is the GRPO-only training path; padded "
+                "PPO must use _compute_padded_ppo_token_sums."
+            )
         is_varlen = self.args.train_packing == "varlen"
         use_token_sum_loss = is_varlen and return_varlen_token_sums
         batch_size = int(batch["sample_advantages"].shape[0])
@@ -909,9 +1107,7 @@ class FSDPTrainWorker:
             prediction_indices = batch["prediction_indices"]
             if target_indices.numel() == 0:
                 raise RuntimeError("No valid response tokens found for RL loss.")
-            valid_sample_indices = None
-            if self.args.rl_algorithm == "grpo" or not use_token_sum_loss:
-                valid_sample_indices = batch["sequence_ids"][target_indices]
+            valid_sample_indices = batch["sequence_ids"][target_indices]
             response_token_counts = None
             if not use_token_sum_loss:
                 assert valid_sample_indices is not None
@@ -991,47 +1187,10 @@ class FSDPTrainWorker:
         valid_log_ratio = valid_token_log_probs - valid_old_token_log_probs
         valid_ratio = torch.exp(valid_log_ratio)
 
-        valid_response_indices = None
-        if self.args.rl_algorithm == "ppo":
-            if is_varlen:
-                raw_valid_adv = batch["token_advantages"][target_indices].to(
-                    torch.float32
-                )
-                if not use_token_sum_loss:
-                    valid_response_indices = batch["response_indices"][
-                        target_indices
-                    ]
-            else:
-                response_indices = batch["response_indices"][:, 1:]
-                valid_response_indices = response_indices[response_mask]
-                raw_valid_adv = batch["token_advantages"][:, 1:][response_mask].to(
-                    torch.float32
-                )
-            if (
-                valid_response_indices is not None
-                and valid_response_indices.lt(0).any()
-            ):
-                raise RuntimeError(
-                    "Valid response tokens must have non-negative response indices."
-                )
-            if self.args.ppo_normalize_advantages:
-                adv_mean = raw_valid_adv.mean()
-                adv_std = raw_valid_adv.std(unbiased=False)
-                normalized_valid_adv = (
-                    (raw_valid_adv - adv_mean)
-                    / (adv_std + self.args.ppo_adv_norm_eps)
-                )
-                valid_adv = normalized_valid_adv
-            else:
-                valid_adv = raw_valid_adv
-        elif self.args.rl_algorithm == "grpo":
-            assert valid_sample_indices is not None
-            raw_valid_adv = batch["sample_advantages"][valid_sample_indices].to(
-                torch.float32
-            )
-            valid_adv = raw_valid_adv
-        else:
-            raise ValueError(f"Unsupported rl_algorithm: {self.args.rl_algorithm}")
+        raw_valid_adv = batch["sample_advantages"][valid_sample_indices].to(
+            torch.float32
+        )
+        valid_adv = raw_valid_adv
 
         if self.args.clip_mode == "ppo":
             surr1 = valid_ratio * valid_adv
@@ -1061,21 +1220,12 @@ class FSDPTrainWorker:
         if not use_token_sum_loss:
             assert valid_sample_indices is not None
             assert response_token_counts is not None
-            if self.args.rl_algorithm == "ppo":
-                assert valid_response_indices is not None
-                sample_objective = self._aggregate_valid_objective_by_response(
-                    valid_objective,
-                    valid_sample_indices,
-                    valid_response_indices,
-                    batch_size=batch_size,
-                )
-            else:
-                sample_objective = self._aggregate_valid_objective(
-                    valid_objective,
-                    valid_sample_indices,
-                    response_token_counts,
-                    batch_size=batch_size,
-                )
+            sample_objective = self._aggregate_valid_objective(
+                valid_objective,
+                valid_sample_indices,
+                response_token_counts,
+                batch_size=batch_size,
+            )
         old_new_kl_k3 = valid_ratio - 1.0 - valid_log_ratio
         policy_token_sum = -valid_objective.float().sum()
         old_new_kl_k3_sum = old_new_kl_k3.float().sum()
@@ -1152,6 +1302,224 @@ class FSDPTrainWorker:
             valid_labels,
             reduction="none",
         )
+
+    def _compute_padded_ppo_token_sums(
+        self,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        labels = batch["labels"][:, 1:]
+        response_mask = labels.ne(-100)
+        valid_positions = response_mask.nonzero(as_tuple=False)
+        if valid_positions.numel() == 0:
+            raise RuntimeError("No valid response tokens found for PPO loss.")
+        valid_batch_indices = valid_positions[:, 0]
+        valid_prediction_positions = valid_positions[:, 1]
+
+        outputs = self.model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        logits = outputs.logits[:, :-1, :]
+        valid_token_log_probs = self._valid_token_log_probs_from_full_logits(
+            logits,
+            labels,
+            response_mask,
+        ).float()
+        valid_old_logprobs = batch["old_logprobs"][:, 1:][
+            response_mask
+        ].float()
+
+        final_hidden = outputs.hidden_states[-1]
+        response_hidden = final_hidden[
+            valid_batch_indices,
+            valid_prediction_positions,
+        ]
+        bootstrap_positions = batch["bootstrap_prediction_positions"]
+        bootstrap_mask = bootstrap_positions.ge(0)
+        bootstrap_batch_indices = bootstrap_mask.nonzero(
+            as_tuple=False
+        ).squeeze(-1)
+        if bootstrap_batch_indices.numel() > 0:
+            selected_bootstrap_positions = bootstrap_positions[bootstrap_mask]
+            sequence_lengths = batch["attention_mask"].sum(dim=-1)
+            if (
+                selected_bootstrap_positions
+                >= sequence_lengths[bootstrap_batch_indices]
+            ).any():
+                raise RuntimeError("PPO bootstrap position exceeds sequence length.")
+            bootstrap_hidden = final_hidden[
+                bootstrap_batch_indices,
+                selected_bootstrap_positions,
+            ]
+        else:
+            bootstrap_hidden = response_hidden.new_empty(
+                (0, response_hidden.shape[-1])
+            )
+
+        num_response_values = int(response_hidden.shape[0])
+        all_value_hidden = torch.cat(
+            (response_hidden, bootstrap_hidden),
+            dim=0,
+        )
+        all_values = self.value_head(all_value_hidden)
+        current_values = all_values[:num_response_values]
+        bootstrap_values = torch.zeros(
+            batch["input_ids"].shape[0],
+            device=all_values.device,
+            dtype=torch.float32,
+        )
+        if bootstrap_batch_indices.numel() > 0:
+            bootstrap_values[bootstrap_batch_indices] = all_values[
+                num_response_values:
+            ]
+
+        raw_advantage_parts = []
+        return_parts = []
+        delta_parts = []
+        value_offset = 0
+        shifted_rewards = batch["token_rewards"][:, 1:]
+        shifted_terminated = batch["token_terminated"][:, 1:]
+        shifted_truncated = batch["token_truncated"][:, 1:]
+        for sample_index in range(response_mask.shape[0]):
+            sample_mask = response_mask[sample_index]
+            sample_token_count = int(sample_mask.sum().item())
+            sample_values = current_values[
+                value_offset:value_offset + sample_token_count
+            ]
+            value_offset += sample_token_count
+            sample_advantages, sample_returns, sample_deltas = (
+                compute_token_gae(
+                    rewards=shifted_rewards[sample_index][sample_mask],
+                    baseline_values=sample_values.detach(),
+                    terminated=shifted_terminated[sample_index][sample_mask],
+                    truncated=shifted_truncated[sample_index][sample_mask],
+                    bootstrap_value=bootstrap_values[sample_index].detach(),
+                    gamma=self.args.tw_gamma,
+                    gae_lambda=self.args.gae_lambda,
+                )
+            )
+            raw_advantage_parts.append(sample_advantages)
+            return_parts.append(sample_returns)
+            delta_parts.append(sample_deltas)
+        if value_offset != num_response_values:
+            raise RuntimeError("PPO value/token alignment mismatch.")
+
+        raw_advantages = torch.cat(raw_advantage_parts).detach()
+        returns = torch.cat(return_parts).detach()
+        deltas = torch.cat(delta_parts).detach()
+        if (
+            raw_advantages.requires_grad
+            or returns.requires_grad
+            or deltas.requires_grad
+        ):
+            raise RuntimeError("PPO GAE targets must be detached.")
+
+        if self.args.ppo_normalize_advantages:
+            advantage_stats = torch.stack(
+                (
+                    raw_advantages.double().sum(),
+                    raw_advantages.double().square().sum(),
+                    raw_advantages.new_tensor(
+                        raw_advantages.numel(),
+                        dtype=torch.float64,
+                    ),
+                )
+            )
+            dist.all_reduce(advantage_stats, op=dist.ReduceOp.SUM)
+            global_sum, global_sq_sum, global_count = advantage_stats
+            if global_count.item() <= 0:
+                raise RuntimeError("Global PPO advantage count must be positive.")
+            advantage_mean = global_sum / global_count
+            advantage_variance = (
+                global_sq_sum / global_count - advantage_mean.square()
+            ).clamp_min(0.0)
+            actor_advantages = (
+                raw_advantages - advantage_mean.to(raw_advantages.dtype)
+            ) / (
+                advantage_variance.sqrt().to(raw_advantages.dtype)
+                + self.args.ppo_adv_norm_eps
+            )
+        else:
+            actor_advantages = raw_advantages
+        actor_advantages = actor_advantages.detach()
+
+        valid_log_ratio = valid_token_log_probs - valid_old_logprobs
+        valid_ratio = torch.exp(valid_log_ratio)
+        if self.args.clip_mode == "ppo":
+            surrogate_1 = valid_ratio * actor_advantages
+            surrogate_2 = torch.clamp(
+                valid_ratio,
+                1.0 - self.args.clip_eps,
+                1.0 + self.args.clip_eps,
+            ) * actor_advantages
+            valid_objective = torch.minimum(surrogate_1, surrogate_2)
+            clipped_mask = (
+                (valid_ratio < 1.0 - self.args.clip_eps)
+                | (valid_ratio > 1.0 + self.args.clip_eps)
+            )
+        elif self.args.clip_mode == "gipo":
+            ratio_detached = valid_ratio.clamp_min(1e-9).detach()
+            coefficient = torch.exp(
+                -0.5
+                * (torch.log(ratio_detached) / self.args.gipo_sigma) ** 2
+            )
+            valid_objective = (
+                valid_ratio * actor_advantages * coefficient
+            )
+            clipped_mask = torch.zeros_like(valid_ratio, dtype=torch.bool)
+        elif self.args.clip_mode == "sapo":
+            ratio = valid_ratio.clamp(1e-6, 1e6)
+            tau = torch.where(
+                actor_advantages > 0,
+                torch.full_like(actor_advantages, self.args.sapo_tau_pos),
+                torch.full_like(actor_advantages, self.args.sapo_tau_neg),
+            )
+            gate = torch.sigmoid(tau * (ratio - 1.0)) * (4.0 / tau)
+            valid_objective = gate * actor_advantages
+            clipped_mask = torch.zeros_like(valid_ratio, dtype=torch.bool)
+        else:
+            raise ValueError(f"Unsupported clip_mode: {self.args.clip_mode}")
+
+        policy_sum = -valid_objective.float().sum()
+        residuals = returns - current_values
+        value_loss_sum = 0.5 * residuals.float().square().sum()
+        old_new_kl = valid_ratio - 1.0 - valid_log_ratio
+        kl_sum = old_new_kl.float().sum()
+        token_loss_sum = (
+            policy_sum
+            + self.args.value_loss_coef * value_loss_sum
+            + self.args.old_new_kl_coef * kl_sum
+        )
+
+        with torch.no_grad():
+            values_detached = current_values.detach().float()
+            returns_float = returns.float()
+            residuals_detached = returns_float - values_detached
+            stats = torch.stack(
+                (
+                    policy_sum.detach().double(),
+                    value_loss_sum.detach().double(),
+                    kl_sum.detach().double(),
+                    clipped_mask.sum().double(),
+                    values_detached.double().sum(),
+                    values_detached.double().square().sum(),
+                    returns_float.double().sum(),
+                    returns_float.double().square().sum(),
+                    residuals_detached.double().sum(),
+                    residuals_detached.double().square().sum(),
+                    deltas.double().sum(),
+                    deltas.double().square().sum(),
+                    raw_advantages.double().sum(),
+                    raw_advantages.double().square().sum(),
+                    shifted_terminated[response_mask].sum().double(),
+                    shifted_truncated[response_mask].sum().double(),
+                    bootstrap_mask.sum().double(),
+                )
+            )
+        return token_loss_sum, stats
 
     def _aggregate_valid_objective(
         self,
@@ -1276,6 +1644,171 @@ class FSDPTrainWorker:
         assert window is not None
         return window
 
+    def _prepare_padded_ppo_optimizer_window(
+        self,
+        trainer_version: float,
+    ) -> List[PreparedPaddedPPOBatch]:
+        """Prepare the full CPU accumulation window on every FSDP rank."""
+        window = None
+        local_error = None
+        try:
+            window = []
+            for _ in range(self.args.grad_accum_steps):
+                batch, version_lag_mean = self._next_rl_training_batch(
+                    trainer_version,
+                    move_to_device=False,
+                )
+                valid_token_count = int(
+                    batch["labels"][:, 1:].ne(-100).sum().item()
+                )
+                sample_count = int(batch["input_ids"].shape[0])
+                if valid_token_count <= 0 or sample_count <= 0:
+                    raise RuntimeError(
+                        "A padded PPO microbatch must contain samples and "
+                        "valid response tokens."
+                    )
+                window.append(
+                    PreparedPaddedPPOBatch(
+                        batch=batch,
+                        valid_token_count=valid_token_count,
+                        version_lag_sum=version_lag_mean * sample_count,
+                        sample_count=sample_count,
+                    )
+                )
+        except Exception as exc:
+            local_error = repr(exc)
+            print(
+                f"[rank {self.rank}] Padded PPO window preparation failed: "
+                f"{local_error}"
+            )
+
+        success = torch.tensor(
+            0 if local_error is not None else 1,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(success, op=dist.ReduceOp.MIN)
+        if int(success.item()) != 1:
+            raise RuntimeError(
+                "At least one FSDP rank failed to prepare its padded PPO "
+                "optimizer window; see per-rank logs for the original error."
+            )
+        assert window is not None
+        if len(window) != self.args.grad_accum_steps:
+            raise RuntimeError(
+                "Padded PPO optimizer window has an unexpected microbatch "
+                f"count: {len(window)} != {self.args.grad_accum_steps}"
+            )
+        return window
+
+    def _run_padded_ppo_optimizer_step(
+        self,
+        trainer_version: float,
+    ) -> Dict[str, object]:
+        """Run one globally token-normalized padded PPO optimizer step."""
+        window = self._prepare_padded_ppo_optimizer_window(trainer_version)
+        local_valid_token_count = sum(
+            prepared.valid_token_count for prepared in window
+        )
+        global_valid_token_count_tensor = torch.tensor(
+            local_valid_token_count,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        dist.all_reduce(
+            global_valid_token_count_tensor,
+            op=dist.ReduceOp.SUM,
+        )
+        global_valid_token_count = int(global_valid_token_count_tensor.item())
+        if global_valid_token_count <= 0:
+            raise RuntimeError(
+                "Global padded PPO optimizer window contains no valid "
+                "response tokens."
+            )
+
+        local_token_stats = torch.zeros(
+            len(PPO_TOKEN_STAT_NAMES),
+            device=self.device,
+            dtype=torch.float64,
+        )
+        local_version_stats = torch.zeros(
+            2,
+            device=self.device,
+            dtype=torch.float64,
+        )
+        for prepared in window:
+            batch = move_batch_to_device(prepared.batch, self.device)
+            token_loss_sum, token_stats = (
+                self._compute_padded_ppo_token_sums(batch)
+            )
+            backward_loss = token_loss_sum * (
+                float(self.fsdp_world_size)
+                / float(global_valid_token_count)
+            )
+            backward_loss.backward()
+            if token_stats.shape != local_token_stats.shape:
+                raise RuntimeError(
+                    "Unexpected padded PPO statistics shape: "
+                    f"{tuple(token_stats.shape)} != "
+                    f"{tuple(local_token_stats.shape)}"
+                )
+            local_token_stats.add_(token_stats)
+            local_version_stats[0] += prepared.version_lag_sum
+            local_version_stats[1] += prepared.sample_count
+            self.train_micro_step += 1
+            del batch, token_loss_sum, token_stats, backward_loss
+
+        dist.all_reduce(local_token_stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_version_stats, op=dist.ReduceOp.SUM)
+
+        torch.nn.utils.clip_grad_norm_(
+            self.trainable_parameter_list,
+            max_norm=1.0,
+        )
+        current_lr = self._get_current_lr(
+            self.optimizer_step,
+            self.args.learning_rate,
+            self.args.lr_warmup_steps,
+            self.args.max_steps,
+        )
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = current_lr
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer_step += 1
+
+        stats = {
+            name: float(value)
+            for name, value in zip(
+                PPO_TOKEN_STAT_NAMES,
+                local_token_stats.tolist(),
+            )
+        }
+        token_count = float(global_valid_token_count)
+        policy_loss_mean = stats["policy_sum"] / token_count
+        value_loss_mean = stats["value_loss_sum"] / token_count
+        kl_mean = stats["kl_sum"] / token_count
+        total_loss_mean = (
+            policy_loss_mean
+            + self.args.value_loss_coef * value_loss_mean
+            + self.args.old_new_kl_coef * kl_mean
+        )
+        global_version_lag_sum, global_sample_count = (
+            local_version_stats.tolist()
+        )
+        return {
+            "global_ppo_stats": stats,
+            "global_valid_token_count": token_count,
+            "global_version_lag_sum": global_version_lag_sum,
+            "global_sample_count": global_sample_count,
+            "policy_loss_mean": policy_loss_mean,
+            "value_loss_mean": value_loss_mean,
+            "loss_mean": total_loss_mean,
+            "kl_token_mean": kl_mean,
+            "clip_fraction": stats["clip_count"] / token_count,
+            "current_lr": current_lr,
+        }
+
     def _run_varlen_optimizer_step(
         self,
         trainer_version: float,
@@ -1384,7 +1917,7 @@ class FSDPTrainWorker:
             "current_lr": current_lr,
         }
 
-    def train_until_next_sync(
+    def _train_padded_grpo_until_next_sync(
         self,
         num_optimizer_steps: int = 100,
     ) -> Dict[str, float]:
@@ -1529,6 +2062,197 @@ class FSDPTrainWorker:
             ),
             "learning_rate": current_lr,
         }
+
+    def train_until_next_sync(
+        self,
+        num_optimizer_steps: int = 100,
+    ) -> Dict[str, float]:
+        """Train through one sync segment using the algorithm-specific path."""
+        if num_optimizer_steps < 1:
+            raise ValueError("num_optimizer_steps must be >= 1")
+        start_optimizer_step = self.optimizer_step
+        target_optimizer_step = min(
+            self.optimizer_step + num_optimizer_steps,
+            self.args.max_steps,
+        )
+
+        if (
+            self.args.rl_algorithm == "grpo"
+            and self.args.train_packing == "padded"
+        ):
+            result = self._train_padded_grpo_until_next_sync(
+                num_optimizer_steps
+            )
+            result.setdefault(
+                "segment_policy_loss_mean",
+                result["segment_loss_mean"],
+            )
+            result.setdefault("segment_value_loss_mean", 0.0)
+            return result
+
+        global_steps = []
+        aggregate_ppo_stats = {
+            name: 0.0 for name in PPO_TOKEN_STAT_NAMES
+        }
+        while self.optimizer_step < target_optimizer_step:
+            trainer_version = (
+                self.optimizer_step / self.args.sync_every_optimizer_steps
+            )
+            if self.args.rl_algorithm == "ppo":
+                step_stats = self._run_padded_ppo_optimizer_step(
+                    trainer_version
+                )
+                for name, value in step_stats["global_ppo_stats"].items():
+                    aggregate_ppo_stats[name] += value
+            else:
+                step_stats = self._run_varlen_optimizer_step(trainer_version)
+            global_steps.append(step_stats)
+            if (
+                self.rank == 0
+                and self.optimizer_step % self.args.log_every == 0
+            ):
+                value_text = (
+                    f" value={step_stats['value_loss_mean']:.6f}"
+                    if self.args.rl_algorithm == "ppo"
+                    else ""
+                )
+                print(
+                    "[train] "
+                    f"optimizer_step={self.optimizer_step} "
+                    f"loss={step_stats['loss_mean']:.6f}"
+                    f"{value_text} "
+                    f"kl_token_mean={step_stats['kl_token_mean']:.6f} "
+                    f"clip_frac={step_stats['clip_fraction']:.4f} "
+                    f"tokens={step_stats['global_valid_token_count']:.0f} "
+                    f"lr={step_stats['current_lr']:.8g}"
+                )
+
+        valid_tokens = sum(
+            float(step["global_valid_token_count"])
+            for step in global_steps
+        )
+        version_lag_sum = sum(
+            float(step["global_version_lag_sum"])
+            for step in global_steps
+        )
+        sample_count = sum(
+            float(step["global_sample_count"])
+            for step in global_steps
+        )
+        result = {
+            "rank": self.rank,
+            "optimizer_steps_run": self.optimizer_step - start_optimizer_step,
+            "optimizer_step": self.optimizer_step,
+            "micro_step": self.train_micro_step,
+            "reached_max_steps": self.optimizer_step >= self.args.max_steps,
+            "segment_valid_tokens": valid_tokens,
+            "segment_version_lag_mean": (
+                version_lag_sum / sample_count if sample_count else 0.0
+            ),
+            "learning_rate": self.optimizer.param_groups[0]["lr"],
+        }
+
+        if self.args.rl_algorithm == "grpo":
+            policy_sum = sum(
+                float(step["global_policy_sum"]) for step in global_steps
+            )
+            kl_sum = sum(
+                float(step["global_kl_sum"]) for step in global_steps
+            )
+            clip_count = sum(
+                float(step["global_clip_count"]) for step in global_steps
+            )
+            denominator = max(valid_tokens, 1.0)
+            policy_mean = policy_sum / denominator
+            kl_mean = kl_sum / denominator
+            result.update(
+                {
+                    "segment_loss_mean": (
+                        policy_mean
+                        + self.args.old_new_kl_coef * kl_mean
+                    ),
+                    "segment_policy_loss_mean": policy_mean,
+                    "segment_value_loss_mean": 0.0,
+                    "segment_kl_mean": kl_mean,
+                    "segment_clip_frac": clip_count / denominator,
+                }
+            )
+            dist.barrier()
+            return result
+
+        denominator = max(valid_tokens, 1.0)
+        policy_mean = aggregate_ppo_stats["policy_sum"] / denominator
+        value_loss_mean = (
+            aggregate_ppo_stats["value_loss_sum"] / denominator
+        )
+        kl_mean = aggregate_ppo_stats["kl_sum"] / denominator
+
+        def moments(prefix):
+            mean = aggregate_ppo_stats[f"{prefix}_sum"] / denominator
+            variance = max(
+                aggregate_ppo_stats[f"{prefix}_sq_sum"] / denominator
+                - mean * mean,
+                0.0,
+            )
+            return mean, math.sqrt(variance)
+
+        value_mean, value_std = moments("value")
+        return_mean, return_std = moments("return")
+        residual_mean, residual_std = moments("residual")
+        delta_mean, delta_std = moments("delta")
+        advantage_mean, advantage_std = moments("advantage")
+        return_variance = return_std * return_std
+        explained_variance = (
+            1.0 - residual_std * residual_std / return_variance
+            if return_variance > 1e-12
+            else 0.0
+        )
+        boundary_count = (
+            aggregate_ppo_stats["terminated_count"]
+            + aggregate_ppo_stats["truncated_count"]
+        )
+        result.update(
+            {
+                "segment_loss_mean": (
+                    policy_mean
+                    + self.args.value_loss_coef * value_loss_mean
+                    + self.args.old_new_kl_coef * kl_mean
+                ),
+                "segment_policy_loss_mean": policy_mean,
+                "segment_value_loss_mean": value_loss_mean,
+                "segment_kl_mean": kl_mean,
+                "segment_clip_frac": (
+                    aggregate_ppo_stats["clip_count"] / denominator
+                ),
+                "segment_value_prediction_mean": value_mean,
+                "segment_value_prediction_std": value_std,
+                "segment_return_mean": return_mean,
+                "segment_return_std": return_std,
+                "segment_value_residual_mean": residual_mean,
+                "segment_value_mse": (
+                    2.0
+                    * aggregate_ppo_stats["value_loss_sum"]
+                    / denominator
+                ),
+                "segment_explained_variance": explained_variance,
+                "segment_td_delta_mean": delta_mean,
+                "segment_td_delta_std": delta_std,
+                "segment_raw_advantage_mean": advantage_mean,
+                "segment_raw_advantage_std": advantage_std,
+                "segment_terminated_token_count": (
+                    aggregate_ppo_stats["terminated_count"]
+                ),
+                "segment_truncated_token_count": (
+                    aggregate_ppo_stats["truncated_count"]
+                ),
+                "segment_bootstrap_fraction": (
+                    aggregate_ppo_stats["bootstrap_count"]
+                    / max(boundary_count, 1.0)
+                ),
+            }
+        )
+        dist.barrier()
+        return result
 
     # ---- weight-transfer setup (rank 0 only) ----
 
@@ -2203,6 +2927,7 @@ class TextWorldTrajectoryState:
     done: bool = False
     won: bool = False
     lost: bool = False
+    termination_reason: TerminationReason | None = None
 
 
 @dataclass
@@ -2495,6 +3220,11 @@ class TextWorldRolloutWorkerActor:
             skip_special_tokens=True,
         )
         parsed_action = parse_model_action(raw_text, admissible_commands)
+        if result.stop_reason == "abort":
+            parsed_action = ParsedAction(
+                normalized=parsed_action.normalized,
+                action=None,
+            )
         state.transcript_ids.extend(result.output_tokens)
         if parsed_action.action is not None:
             selected_action = parsed_action.action
@@ -2505,7 +3235,15 @@ class TextWorldRolloutWorkerActor:
             state.done = bool(done)
             state.won = bool(infos.get("won", False))
             state.lost = bool(infos.get("lost", False))
-            if not state.done:
+            if state.won:
+                state.termination_reason = "won"
+            elif state.lost:
+                state.termination_reason = "lost"
+            elif state.done:
+                state.termination_reason = (
+                    "environment_done_without_terminal_signal"
+                )
+            if not state.done or state.termination_reason not in {"won", "lost"}:
                 self._append_next_observation_to_transcript(
                     state.transcript_ids,
                     state.obs,
@@ -2575,6 +3313,7 @@ class TextWorldRolloutWorkerActor:
             input_ids = list(state.transcript_ids)
             if len(input_ids) >= self.args.tw_history_token_window:
                 state.done = True
+                state.termination_reason = "history_limit"
                 continue
             infer_max_tokens = min(
                 self.args.infer_max_tokens,
@@ -2611,7 +3350,7 @@ class TextWorldRolloutWorkerActor:
 
     def _build_textworld_episode_rl_sample(
         self,
-        step_records: List[TextWorldStepRecord],
+        state: TextWorldTrajectoryState,
         algorithm: Literal["ppo", "grpo"] | None = None,
         sample_advantage: float | None = None,
     ) -> RLSample | None:
@@ -2620,11 +3359,13 @@ class TextWorldRolloutWorkerActor:
         labels: List[int] = []
         old_logprobs: List[float] = []
         token_rewards: List[float] = []
+        token_terminated: List[bool] = []
+        token_truncated: List[bool] = []
         response_indices: List[int] = []
         output_versions: List[int] = []
         next_response_index = 0
 
-        for record in step_records:
+        for record in state.step_records:
             prompt_ids = list(record.prompt_ids)
             if len(input_ids) > len(prompt_ids):
                 return None
@@ -2636,7 +3377,10 @@ class TextWorldRolloutWorkerActor:
                 labels.extend([-100] * len(prompt_delta))
                 old_logprobs.extend([0.0] * len(prompt_delta))
                 token_rewards.extend([0.0] * len(prompt_delta))
+                token_terminated.extend([False] * len(prompt_delta))
+                token_truncated.extend([False] * len(prompt_delta))
                 response_indices.extend([-1] * len(prompt_delta))
+                output_versions.extend([-1] * len(prompt_delta))
 
             result = record.training_result
             if not result.output_tokens:
@@ -2647,7 +3391,10 @@ class TextWorldRolloutWorkerActor:
                 labels.extend([-100] * len(output_tokens))
                 old_logprobs.extend([0.0] * len(output_tokens))
                 token_rewards.extend([0.0] * len(output_tokens))
+                token_terminated.extend([False] * len(output_tokens))
+                token_truncated.extend([False] * len(output_tokens))
                 response_indices.extend([-1] * len(output_tokens))
+                output_versions.extend([-1] * len(output_tokens))
                 continue
             result_logprobs = list(result.output_logprobs)
             if len(result_logprobs) != len(result.output_tokens):
@@ -2666,9 +3413,31 @@ class TextWorldRolloutWorkerActor:
             else:
                 raise ValueError(f"Unsupported rl_algorithm: {algorithm}")
             token_rewards.extend(response_token_rewards)
+            token_terminated.extend([False] * len(output_tokens))
+            token_truncated.extend([False] * len(output_tokens))
             response_indices.extend([next_response_index] * len(output_tokens))
             output_versions.extend(result.output_versions)
             next_response_index += 1
+
+        bootstrap_prediction_position = None
+        if algorithm == "ppo":
+            if state.termination_reason is None:
+                return None
+            final_transcript_ids = list(state.transcript_ids)
+            if len(input_ids) > len(final_transcript_ids):
+                return None
+            if final_transcript_ids[: len(input_ids)] != input_ids:
+                return None
+            final_delta = final_transcript_ids[len(input_ids):]
+            if final_delta:
+                input_ids.extend(final_delta)
+                labels.extend([-100] * len(final_delta))
+                old_logprobs.extend([0.0] * len(final_delta))
+                token_rewards.extend([0.0] * len(final_delta))
+                token_terminated.extend([False] * len(final_delta))
+                token_truncated.extend([False] * len(final_delta))
+                response_indices.extend([-1] * len(final_delta))
+                output_versions.extend([-1] * len(final_delta))
 
         if all(label == -100 for label in labels):
             return None
@@ -2677,58 +3446,63 @@ class TextWorldRolloutWorkerActor:
             or len(input_ids) != len(labels)
             or len(input_ids) != len(old_logprobs)
             or len(input_ids) != len(token_rewards)
+            or len(input_ids) != len(token_terminated)
+            or len(input_ids) != len(token_truncated)
             or len(input_ids) != len(response_indices)
+            or len(input_ids) != len(output_versions)
         ):
             return None
         if len(input_ids) > self.args.tw_history_token_window:
             return None
 
         if algorithm == "ppo":
-            token_advantages = self._compute_token_level_advantages(
-                labels,
-                token_rewards,
+            valid_target_indices = [
+                index for index, label in enumerate(labels) if label != -100
+            ]
+            if not valid_target_indices:
+                return None
+            boundary_index = valid_target_indices[-1]
+            if state.termination_reason in {"won", "lost"}:
+                token_terminated[boundary_index] = True
+            else:
+                token_truncated[boundary_index] = True
+                if not final_delta:
+                    return None
+                bootstrap_prediction_position = len(input_ids) - 1
+            sample = RawPPOSample(
+                algorithm="ppo",
+                input_ids=input_ids,
+                attention_mask=[1] * len(input_ids),
+                labels=labels,
+                old_logprobs=old_logprobs,
+                token_rewards=token_rewards,
+                token_terminated=token_terminated,
+                token_truncated=token_truncated,
+                response_indices=response_indices,
+                output_versions=output_versions,
+                bootstrap_prediction_position=bootstrap_prediction_position,
+                termination_reason=state.termination_reason,
             )
-            sample_advantage = 0.0
+            try:
+                validate_raw_ppo_sample(sample)
+            except ValueError:
+                return None
+            return sample
         elif algorithm == "grpo":
             if sample_advantage is None:
                 raise ValueError("GRPO samples require a sample advantage.")
-            token_advantages = [
-                float(sample_advantage) if label != -100 else 0.0
-                for label in labels
-            ]
+            return GRPOSample(
+                algorithm="grpo",
+                input_ids=input_ids,
+                attention_mask=[1] * len(input_ids),
+                labels=labels,
+                old_logprobs=old_logprobs,
+                response_indices=response_indices,
+                output_versions=output_versions,
+                advantage=float(sample_advantage),
+            )
         else:
             raise ValueError(f"Unsupported rl_algorithm: {algorithm}")
-
-        return RLSample(
-            algorithm=algorithm,
-            input_ids=input_ids,
-            attention_mask=[1] * len(input_ids),
-            labels=labels,
-            old_logprobs=old_logprobs,
-            advantage=float(sample_advantage),
-            token_advantages=token_advantages,
-            response_indices=response_indices,
-            output_versions=output_versions,
-        )
-
-    def _compute_token_level_advantages(
-        self,
-        labels: List[int],
-        token_rewards: List[float],
-    ) -> List[float]:
-        if len(labels) != len(token_rewards):
-            raise ValueError("labels and token_rewards must have the same length.")
-        advantages = [0.0] * len(labels)
-        running_return = 0.0
-        for index in range(len(labels) - 1, -1, -1):
-            if labels[index] == -100:
-                continue
-            running_return = (
-                float(token_rewards[index])
-                + self.args.tw_gamma * running_return
-            )
-            advantages[index] = running_return
-        return advantages
 
     def _compute_grpo_group_advantages(
         self,
@@ -2803,7 +3577,7 @@ class TextWorldRolloutWorkerActor:
                 advantages,
             ):
                 sample = self._build_textworld_episode_rl_sample(
-                    step_records=state.step_records,
+                    state=state,
                     algorithm="grpo",
                     sample_advantage=advantage,
                 )
@@ -2866,10 +3640,15 @@ class TextWorldRolloutWorkerActor:
                 if active_count == 0:
                     break
 
+            for state in states:
+                if state.termination_reason is None and state.step_records:
+                    state.done = True
+                    state.termination_reason = "step_limit"
+
             samples = []
             for state in states:
                 sample = self._build_textworld_episode_rl_sample(
-                    step_records=state.step_records,
+                    state=state,
                 )
                 if sample is not None:
                     samples.append(sample)
@@ -3089,6 +3868,8 @@ async def run_textworld_train(args: argparse.Namespace):
         f"rl_algorithm={args.rl_algorithm} "
         f"grpo_group_size={args.grpo_group_size} "
         f"tw_gamma={args.tw_gamma} "
+        f"gae_lambda={args.gae_lambda} "
+        f"value_loss_coef={args.value_loss_coef} "
         f"ppo_normalize_advantages={args.ppo_normalize_advantages} "
         f"tw_invalid_action_penalty={args.tw_invalid_action_penalty} "
         f"tw_lost_penalty={args.tw_lost_penalty}"
@@ -3220,6 +4001,8 @@ async def run_textworld_train(args: argparse.Namespace):
             f"rl_algorithm={args.rl_algorithm} "
             f"grpo_group_size={args.grpo_group_size} "
             f"tw_gamma={args.tw_gamma} "
+            f"gae_lambda={args.gae_lambda} "
+            f"value_loss_coef={args.value_loss_coef} "
             f"ppo_normalize_advantages={args.ppo_normalize_advantages} "
             f"infer_tp_size={args.infer_tp_size} "
             f"infer_size={args.infer_size} "
@@ -3284,6 +4067,20 @@ async def run_textworld_train(args: argparse.Namespace):
                 sum(float(summary["segment_loss_mean"]) for summary in summaries)
                 / len(summaries)
             )
+            policy_loss_mean = (
+                sum(
+                    float(summary["segment_policy_loss_mean"])
+                    for summary in summaries
+                )
+                / len(summaries)
+            )
+            value_loss_mean = (
+                sum(
+                    float(summary["segment_value_loss_mean"])
+                    for summary in summaries
+                )
+                / len(summaries)
+            )
             kl_token_mean = (
                 sum(
                     float(summary["segment_kl_mean"])
@@ -3307,7 +4104,10 @@ async def run_textworld_train(args: argparse.Namespace):
             )
             segment_valid_tokens = (
                 float(rank0_summary["segment_valid_tokens"])
-                if args.train_packing == "varlen"
+                if (
+                    args.rl_algorithm == "ppo"
+                    or args.train_packing == "varlen"
+                )
                 else sum(
                     float(summary["segment_valid_tokens"])
                     for summary in summaries
@@ -3350,6 +4150,21 @@ async def run_textworld_train(args: argparse.Namespace):
             )
             writer.add_scalar("Train/Loss", train_loss_mean, tb_step)
             writer.add_scalar(
+                "Train/TotalLoss",
+                train_loss_mean,
+                tb_step,
+            )
+            writer.add_scalar(
+                "Train/PolicyLoss",
+                policy_loss_mean,
+                tb_step,
+            )
+            writer.add_scalar(
+                "Train/ValueLoss",
+                value_loss_mean,
+                tb_step,
+            )
+            writer.add_scalar(
                 "KL/OldNewK3TokenMean",
                 kl_token_mean,
                 tb_step,
@@ -3371,6 +4186,33 @@ async def run_textworld_train(args: argparse.Namespace):
                     clip_fraction,
                     tb_step,
                 )
+            if args.rl_algorithm == "ppo":
+                ppo_metric_tags = {
+                    "Value/PredictionMean": "segment_value_prediction_mean",
+                    "Value/PredictionStd": "segment_value_prediction_std",
+                    "Value/ReturnMean": "segment_return_mean",
+                    "Value/ReturnStd": "segment_return_std",
+                    "Value/ResidualMean": "segment_value_residual_mean",
+                    "Value/MSE": "segment_value_mse",
+                    "Value/ExplainedVariance": "segment_explained_variance",
+                    "Value/TDDeltaMean": "segment_td_delta_mean",
+                    "Value/TDDeltaStd": "segment_td_delta_std",
+                    "Advantage/RawMean": "segment_raw_advantage_mean",
+                    "Advantage/RawStd": "segment_raw_advantage_std",
+                    "PPO/TerminatedTokenCount": (
+                        "segment_terminated_token_count"
+                    ),
+                    "PPO/TruncatedTokenCount": (
+                        "segment_truncated_token_count"
+                    ),
+                    "PPO/BootstrapFraction": "segment_bootstrap_fraction",
+                }
+                for tag, summary_key in ppo_metric_tags.items():
+                    writer.add_scalar(
+                        tag,
+                        float(rank0_summary[summary_key]),
+                        tb_step,
+                    )
             writer.add_scalar("Infer/TokensPerSec", infer_tokens_per_sec, tb_step)
             print(
                 "[metrics] "
@@ -3548,15 +4390,16 @@ def parse_args() -> argparse.Namespace:
         default="grpo",
         choices=("ppo", "grpo"),
         help=(
-            "RL rollout/advantage algorithm. 'ppo' uses token-level Monte Carlo "
-            "advantages; 'grpo' uses group-normalized trajectory advantages."
+            "RL algorithm. 'ppo' computes token TD(lambda) targets from the "
+            "current Value Head when replay is sampled; 'grpo' uses "
+            "group-normalized trajectory advantages."
         ),
     )
     parser.add_argument(
         "--tw-gamma",
         type=float,
         default=1.0,
-        help="Discount factor for token-level Monte Carlo reward-to-go.",
+        help="Discount factor applied once per valid response token.",
     )
     parser.add_argument(
         "--tw-step-penalty",
@@ -3679,11 +4522,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ppo-normalize-advantages",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Normalize token advantages over valid response tokens in each "
-            "training micro-batch before computing the policy loss."
+            "Normalize detached raw PPO token advantages across all FSDP "
+            "ranks in each microbatch."
         ),
+    )
+    parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=0.95,
+        help="Trace parameter for on-the-fly token TD(lambda) targets.",
+    )
+    parser.add_argument(
+        "--value-loss-coef",
+        type=float,
+        default=0.5,
+        help="Coefficient for the unclipped token Value MSE loss.",
     )
     parser.add_argument(
         "--ppo-adv-norm-eps",
@@ -3949,11 +4805,11 @@ def parse_args() -> argparse.Namespace:
 def validate_varlen_training_options(args: argparse.Namespace) -> None:
     if args.train_packing != "varlen":
         return
-    if args.ppo_normalize_advantages:
+    if args.rl_algorithm == "ppo":
         raise ValueError(
-            "--ppo-normalize-advantages is not supported with "
-            "--train-packing varlen because the Varlen baseline uses a "
-            "global valid-response-token weighted objective."
+            "--rl-algorithm ppo does not support --train-packing varlen in "
+            "this implementation; use --train-packing padded. GRPO varlen "
+            "remains supported."
         )
 
 
@@ -3967,6 +4823,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--tw-history-token-window must be >= 1")
     if args.tw_gamma < 0:
         raise ValueError("--tw-gamma must be >= 0")
+    if not 0.0 <= args.gae_lambda <= 1.0:
+        raise ValueError("--gae-lambda must be in [0, 1]")
+    if args.value_loss_coef < 0:
+        raise ValueError("--value-loss-coef must be >= 0")
     if args.max_length < args.tw_history_token_window:
         raise ValueError(
             "--max-length must be >= --tw-history-token-window when "

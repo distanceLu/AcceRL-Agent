@@ -27,7 +27,7 @@ If you only want to run the smallest working flow first, see [QUICKSTART.md](QUI
 - Trainer-side token-budget packing with FlashAttention 2 varlen attention.
 - Response-only LM-head projection through the model-native `logits_to_keep` API.
 - NCCL weight transfer from FSDP to vLLM.
-- PPO/GRPO-style rollout advantage construction.
+- Raw token PPO replay with trainer-side current-value TD(λ), plus GRPO.
 
 ## Repository Layout
 
@@ -35,6 +35,7 @@ If you only want to run the smallest working flow first, see [QUICKSTART.md](QUI
 | --- | --- |
 | `accerl_agent/run_agent_textworld.py` | Canonical launcher for Ray-safe TextWorld training startup. |
 | `accerl_agent/agent_textworld.py` | Full Ray + vLLM + FSDP online RL training implementation. |
+| `accerl_agent/ppo_data.py` | Canonical replay schemas, strict PPO validation, and detached token GAE. |
 | `accerl_agent/ppo_value.py` | Shared-backbone FP32 Value Head and Critic checkpoint helpers. |
 | `accerl_agent/textworld_local_infer.py` | Checks vLLM inference and TextWorld environment interaction without training. |
 | `accerl_agent/local_trainer.py` | Local dummy SFT smoke test for tokenizer/model/FSDP training paths. |
@@ -169,7 +170,7 @@ python -m accerl_agent.run_agent_textworld \
 ```
 
 The command above is the full GRPO + varlen configuration and is intended for
-long-running training. For a much smaller 2-GPU varlen validation run, use:
+long-running training. For a much smaller 2-GPU padded PPO validation run, use:
 
 ```bash
 python -m accerl_agent.run_agent_textworld \
@@ -195,20 +196,18 @@ python -m accerl_agent.run_agent_textworld \
   --train-mode lm_head \
   --rl-algorithm ppo \
   --clip-mode ppo \
-  --train-packing varlen \
-  --train-token-budget 2048 \
-  --train-pack-candidate-pool-size 8 \
-  --train-logprob-mode response_only_lm_head \
+  --train-packing padded \
+  --gae-lambda 0.95 \
+  --value-loss-coef 0.5 \
   --dtype bfloat16 \
   --trust-remote-code
 ```
 
-Replay continues to store independent `RLSample` objects. Each trainer rank
-selects at most `--batch-size` samples and packs no more than
-`--train-token-budget` real tokens into one micro-batch. The token budget must
-be at least `--max-length`. Position IDs restart at zero for every sample, and
-the trainer passes cumulative sequence lengths and per-pack maximum lengths to
-FlashAttention 2 so attention cannot cross sample boundaries.
+GRPO varlen selects at most `--batch-size` samples and packs no more than
+`--train-token-budget` real tokens into one microbatch. Padded PPO instead
+prepares `--grad-accum-steps` CPU microbatches before each optimizer step and
+normalizes every policy, Value, and KL sum by the global response-token count
+of that complete window.
 
 GPU requirement for full training:
 
@@ -257,7 +256,7 @@ flowchart LR
     Trainer -->|"NCCL trainable weights"| Infer
 ```
 
-`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, selects trainable parameters according to `--train-mode`, and samples independent `RLSample` objects from replay. It also owns a separately sharded FP32 Value Head, which is checkpointed but is not yet connected to a value loss. With `--train-packing varlen`, the trainer dynamically packs samples locally under the token budget. It computes the RL loss over response tokens and sends policy-only FSDP weights to vLLM during synchronization.
+`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, selects trainable parameters according to `--train-mode`, and samples independent replay objects. It also owns a separately sharded FP32 Value Head. Padded PPO consumes the policy's final hidden states, computes current token values and detached TD(λ) targets when replay is sampled, and optimizes policy and Value losses over the same global response-token denominator. GRPO retains its padded and varlen paths. Weight synchronization to vLLM remains policy-only.
 
 `VLLMInferenceActor` handles rollout inference. It starts vLLM with dummy weights, waits for the initial full weight sync, pauses generation during later syncs, aborts requests when needed, updates weights, and then resumes generation.
 
@@ -292,7 +291,13 @@ if lost:
     reward -= tw_lost_penalty
 ```
 
-PPO mode is enabled with `--rl-algorithm ppo`. Each trajectory creates one episode-level `RLSample`; step rewards are assigned to response tokens, and token-level Monte Carlo returns are computed backward from the end of the episode.
+PPO mode is enabled with `--rl-algorithm ppo` and currently requires
+`--train-packing padded`. Rollout stores token-aligned rewards, behavior
+logprobs, terminal/truncation boundaries, and optional final-state bootstrap
+context, but no values, returns, or advantages. The trainer recomputes current
+values and detached token TD(λ) targets on every replay sample. `--tw-gamma`
+discounts once per valid response token; configure the trace and Critic weight
+with `--gae-lambda` and `--value-loss-coef`.
 
 GRPO mode is enabled with `--rl-algorithm grpo`. A group of full trajectories is sampled from the same game, then rewards are normalized within the group:
 
@@ -306,22 +311,26 @@ The training-side policy objective is controlled by `--clip-mode`:
 - `gipo`: log-ratio Gaussian soft clipping using `--gipo-sigma`.
 - `sapo`: separate gate temperatures for positive and negative advantages using `--sapo-tau-pos` and `--sapo-tau-neg`.
 
-## RLSample Contract
+## Replay Sample Contract
 
-`RLSample` is the core protocol between the replay buffer and the trainer. Each sample must satisfy:
+Replay stores `RawPPOSample | GRPOSample`. Every token field is aligned to
+`input_ids`:
 
 ```text
 len(input_ids) == len(attention_mask)
 len(input_ids) == len(labels)
 len(input_ids) == len(old_logprobs)
-len(input_ids) == len(token_rewards)
-len(input_ids) == len(token_advantages)
 len(input_ids) == len(response_indices)
-len(response_ids) == count(labels != -100)
-len(output_versions) == len(response_ids)
+len(input_ids) == len(output_versions)
 ```
 
-The trainer computes loss only at positions where `labels != -100`. Prompt tokens, aborted outputs, and tokens that should not participate in training must keep label `-100` and must not be included in `response_ids` or `output_versions`.
+`RawPPOSample` additionally aligns `token_rewards`, `token_terminated`, and
+`token_truncated`. Ignored tokens use `label=-100`, zero reward/logprob,
+`False` boundaries, and `response_index=output_version=-1`. Exactly one
+terminal or truncation boundary appears on the final response token.
+Truncations include ignored final-state prompt context and a valid bootstrap
+prediction position. PPO rollout never stores values, returns, or advantages.
+`GRPOSample` instead stores one trajectory-level advantage.
 
 ## Important Arguments
 
@@ -340,6 +349,9 @@ The trainer computes loss only at positions where `labels != -100`. Prompt token
 | `--rollout-batch-size` | Episode batch size per rollout worker in PPO mode; also the default GRPO group size. |
 | `--batch-size` | Samples per padded micro-batch, or the maximum number of `RLSample` objects in one varlen pack, per FSDP rank. |
 | `--train-packing` | `padded` (default) or `varlen`; varlen removes trainer-side attention padding with FlashAttention 2. |
+| `--gae-lambda` | PPO token TD(λ) trace parameter; defaults to `0.95`. |
+| `--value-loss-coef` | Coefficient for the unclipped token Value MSE; defaults to `0.5`. |
+| `--ppo-normalize-advantages` | Normalize detached raw PPO advantages per microbatch across FSDP ranks; enabled by default. |
 | `--train-token-budget` | Maximum real tokens in a varlen pack; required for varlen and must be at least `--max-length`. |
 | `--train-pack-candidate-pool-size` | Replay candidate pool used for length-aware packing; defaults to four times `--batch-size`. |
 | `--train-logprob-mode` | `full_logits_ce` baseline, or `response_only_lm_head` to project only response prediction positions through native `logits_to_keep`; the latter requires varlen. |
@@ -402,9 +414,10 @@ If vLLM weight sync fails, check GPU counts, vLLM weight-transfer API support, t
 
 If loss or KL is unstable, lower the learning rate, reduce replay staleness,
 increase the KL penalty, and confirm that invalid, aborted, or empty outputs
-are not mistakenly labeled as trainable tokens. For padded PPO training only,
-you can also try `--ppo-normalize-advantages`; the current varlen path rejects
-that option.
+are not mistakenly labeled as trainable tokens. PPO advantage normalization
+is enabled by default and can be disabled with
+`--no-ppo-normalize-advantages`. PPO varlen is intentionally unsupported;
+GRPO varlen remains available.
 
 If varlen model loading fails, verify that `flash_attn` imports in the trainer
 environment, the model supports `flash_attention_2`, and the dtype is
