@@ -57,28 +57,35 @@ def find_open_port() -> int:
         return sock.getsockname()[1]
 
 
-class EncodedExample:
-    def __init__(
-        self,
-        input_ids: List[int],
-        attention_mask: List[int],
-        labels: List[int],
-        old_logprobs: List[float],
-        sample_reward: float,
-        sample_advantage: float,
-        token_rewards: List[float],
-        token_advantages: List[float],
-        response_indices: List[int],
-    ):
-        self.input_ids = input_ids
-        self.attention_mask = attention_mask
-        self.labels = labels
-        self.old_logprobs = old_logprobs
-        self.sample_reward = float(sample_reward)
-        self.sample_advantage = float(sample_advantage)
-        self.token_rewards = token_rewards
-        self.token_advantages = token_advantages
-        self.response_indices = response_indices
+@dataclass
+class RLSample:
+    algorithm: Literal["ppo", "grpo"]
+    input_ids: List[int]
+    attention_mask: List[int]
+    labels: List[int]
+    old_logprobs: List[float]
+    advantage: float
+    token_advantages: List[float]
+    response_indices: List[int]
+    output_versions: List[int]
+
+
+@dataclass
+class PreparedVarlenPack:
+    """One CPU-resident pack prepared for a Varlen optimizer window."""
+
+    batch: Dict[str, torch.Tensor]
+    valid_token_count: int
+    max_seqlen: int
+    version_lag_sum: float
+    sample_count: int
+
+
+VARLEN_TOKEN_STAT_NAMES = (
+    "policy_token_sum",
+    "old_new_kl_k3_sum",
+    "ppo_clip_count",
+)
 
 
 def set_seed(seed: int) -> None:
@@ -103,15 +110,13 @@ def pick_dtype(dtype_name: str):
 def make_collate_fn(tokenizer):
     pad_token_id = tokenizer.pad_token_id
 
-    def collate(examples: List[EncodedExample]) -> Dict[str, torch.Tensor]:
+    def collate(examples: List[RLSample]) -> Dict[str, torch.Tensor]:
         max_len = max(len(example.input_ids) for example in examples)
         input_ids = []
         attention_mask = []
         labels = []
         old_logprobs = []
-        sample_rewards = []
         sample_advantages = []
-        token_rewards = []
         token_advantages = []
         response_indices = []
 
@@ -121,9 +126,7 @@ def make_collate_fn(tokenizer):
             attention_mask.append(example.attention_mask + [0] * pad_len)
             labels.append(example.labels + [-100] * pad_len)
             old_logprobs.append(example.old_logprobs + [0.0] * pad_len)
-            sample_rewards.append(example.sample_reward)
-            sample_advantages.append(example.sample_advantage)
-            token_rewards.append(example.token_rewards + [0.0] * pad_len)
+            sample_advantages.append(example.advantage)
             token_advantages.append(example.token_advantages + [0.0] * pad_len)
             response_indices.append(example.response_indices + [-1] * pad_len)
 
@@ -132,14 +135,109 @@ def make_collate_fn(tokenizer):
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "old_logprobs": torch.tensor(old_logprobs, dtype=torch.float32),
-            "sample_rewards": torch.tensor(sample_rewards, dtype=torch.float32),
             "sample_advantages": torch.tensor(sample_advantages, dtype=torch.float32),
-            "token_rewards": torch.tensor(token_rewards, dtype=torch.float32),
             "token_advantages": torch.tensor(token_advantages, dtype=torch.float32),
             "response_indices": torch.tensor(response_indices, dtype=torch.long),
         }
 
     return collate
+
+
+def make_varlen_batch(examples: List[RLSample]) -> Dict[str, torch.Tensor]:
+    """Flatten examples while retaining their causal and RL sample boundaries."""
+    if not examples:
+        raise ValueError("At least one example is required for varlen packing.")
+
+    input_ids = []
+    labels = []
+    old_logprobs = []
+    token_advantages = []
+    response_indices = []
+    position_ids = []
+    sequence_ids = []
+    cu_seqlens = [0]
+
+    for sequence_id, example in enumerate(examples):
+        length = len(example.input_ids)
+        if length < 2:
+            raise ValueError("Each packed sequence must contain at least two tokens.")
+        if example.labels[0] != -100:
+            raise ValueError("The first token in a packed sequence cannot be an RL target.")
+
+        input_ids.extend(example.input_ids)
+        labels.extend(example.labels)
+        old_logprobs.extend(example.old_logprobs)
+        token_advantages.extend(example.token_advantages)
+        response_indices.extend(example.response_indices)
+        position_ids.extend(range(length))
+        sequence_ids.extend([sequence_id] * length)
+        cu_seqlens.append(cu_seqlens[-1] + length)
+
+    target_indices = [
+        index for index, label in enumerate(labels) if label != -100
+    ]
+    if not target_indices:
+        raise ValueError("A varlen batch must contain at least one RL target.")
+    prediction_indices = [index - 1 for index in target_indices]
+    for target_index, prediction_index in zip(
+        target_indices,
+        prediction_indices,
+    ):
+        if sequence_ids[target_index] != sequence_ids[prediction_index]:
+            raise ValueError("A packed target cannot cross a sequence boundary.")
+        if position_ids[target_index] != position_ids[prediction_index] + 1:
+            raise ValueError(
+                "A packed target must immediately follow its prediction position."
+            )
+
+    return {
+        "input_ids": torch.tensor([input_ids], dtype=torch.long),
+        "position_ids": torch.tensor([position_ids], dtype=torch.long),
+        "cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32),
+        "labels": torch.tensor(labels, dtype=torch.long),
+        "old_logprobs": torch.tensor(old_logprobs, dtype=torch.float32),
+        "sample_advantages": torch.tensor(
+            [example.advantage for example in examples], dtype=torch.float32
+        ),
+        "token_advantages": torch.tensor(token_advantages, dtype=torch.float32),
+        "response_indices": torch.tensor(response_indices, dtype=torch.long),
+        "sequence_ids": torch.tensor(sequence_ids, dtype=torch.long),
+        "target_indices": torch.tensor(target_indices, dtype=torch.long),
+        "prediction_indices": torch.tensor(prediction_indices, dtype=torch.long),
+    }
+
+
+def select_varlen_pack(
+    prepared_samples: List[RLSample],
+    token_budget: int,
+    max_sequences: int,
+) -> Tuple[List[RLSample], List[RLSample]]:
+    """First-fit a random replay candidate pool after a local length sort."""
+    ordered = sorted(
+        enumerate(prepared_samples),
+        key=lambda item: len(item[1].input_ids),
+        reverse=True,
+    )
+    selected_indices = []
+    selected = []
+    total_tokens = 0
+    for original_index, prepared in ordered:
+        length = len(prepared.input_ids)
+        if len(selected) >= max_sequences:
+            break
+        if total_tokens + length > token_budget:
+            continue
+        selected_indices.append(original_index)
+        selected.append(prepared)
+        total_tokens += length
+
+    selected_index_set = set(selected_indices)
+    remaining = [
+        prepared
+        for index, prepared in enumerate(prepared_samples)
+        if index not in selected_index_set
+    ]
+    return selected, remaining
 
 
 def configure_trainable_parameters(model, train_mode: str) -> None:
@@ -219,12 +317,26 @@ def build_model(args: argparse.Namespace, device, torch_dtype, log: bool = True)
             f"[init] Loading model from {args.model_path} "
             f"(device={device}, dtype={torch_dtype})"
         )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch_dtype,
-        local_files_only=True,
-        trust_remote_code=args.trust_remote_code,
-    )
+    model_kwargs = {
+        "torch_dtype": torch_dtype,
+        "local_files_only": True,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if args.train_packing == "varlen":
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
+    if args.train_packing == "varlen":
+        attention_implementation = getattr(
+            model.config,
+            "_attn_implementation",
+            None,
+        )
+        if attention_implementation != "flash_attention_2":
+            raise RuntimeError(
+                "Varlen training requires the loaded model to use "
+                "flash_attention_2; got "
+                f"{attention_implementation!r}."
+            )
     model.to(device)
     model.train()
     model.config.use_cache = False
@@ -364,6 +476,24 @@ class FSDPTrainWorker:
         fully_shard(model)
 
         self.model = model
+        fsdp_modules = [
+            module
+            for module in self.model.modules()
+            if hasattr(module, "set_gradient_divide_factor")
+        ]
+        if not fsdp_modules:
+            raise RuntimeError(
+                "The pinned FSDP2 runtime must expose "
+                "set_gradient_divide_factor()."
+            )
+        for module in fsdp_modules:
+            module.set_gradient_divide_factor(float(self.fsdp_world_size))
+        if self.rank == 0:
+            print(
+                "[train] FSDP gradient divide factor fixed at "
+                f"{self.fsdp_world_size}; Varlen loss pre-scale uses "
+                "world_size / global_valid_token_count."
+            )
         sharded_params_by_name = dict(self.model.named_parameters())
         self.params_by_scope = {
             "all": [
@@ -388,21 +518,7 @@ class FSDPTrainWorker:
 
         self.train_micro_step = 0
         self.optimizer_step = 0
-        self.last_loss = 0.0
-        self.last_reward_mean = 0.0
-        self.last_advantage_mean = 0.0
-        self.last_response_tokens = 0.0
-        self.last_replay_size = 0
-        self.last_total_sampled = 0
-        self.last_ppo_clip_frac = 0.0
-        self.last_token_reward_mean = 0.0
-        self.last_raw_advantage_mean = 0.0
-        self.last_raw_advantage_std = 0.0
-        self.last_used_advantage_mean = 0.0
-        self.last_used_advantage_std = 0.0
-        self.last_old_new_kl_k3_token_mean = 0.0
-        self.last_old_new_kl_k3_sample_sum_mean = 0.0
-        self.last_old_new_kl_k3_loss = 0.0
+        self.pending_prepared_samples: List[RLSample] = []
 
         self.transfer_port = None
         self.transfer_master_address = None
@@ -443,7 +559,7 @@ class FSDPTrainWorker:
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def _prepare_rl_sample(self, sample: "RLSample") -> EncodedExample | None:
+    def _prepare_rl_sample(self, sample: RLSample) -> RLSample | None:
         if sample.algorithm != self.args.rl_algorithm:
             return None
         input_ids = list(sample.input_ids)
@@ -456,33 +572,30 @@ class FSDPTrainWorker:
         ):
             return None
         old_logprobs = list(sample.old_logprobs)
-        token_rewards = list(sample.token_rewards)
         token_advantages = list(sample.token_advantages)
         response_indices = list(sample.response_indices)
         if (
             len(old_logprobs) != len(input_ids)
-            or len(token_rewards) != len(input_ids)
             or len(token_advantages) != len(input_ids)
             or len(response_indices) != len(input_ids)
         ):
             return None
-        response_old_logprobs = [
-            old_logprob
-            for old_logprob, label in zip(old_logprobs, labels)
-            if label != -100
-        ]
-        if len(response_old_logprobs) != len(sample.response_ids):
-            return None
-
         max_length = self.args.max_length
         if len(input_ids) > max_length:
             input_ids = input_ids[-max_length:]
             attention_mask = attention_mask[-max_length:]
             labels = labels[-max_length:]
             old_logprobs = old_logprobs[-max_length:]
-            token_rewards = token_rewards[-max_length:]
             token_advantages = token_advantages[-max_length:]
             response_indices = response_indices[-max_length:]
+
+        # A left-truncated first token has no in-window predecessor, so it
+        # cannot be a causal LM target. The padded path already ignored it via
+        # labels[:, 1:]; make that boundary explicit for flattened batches.
+        labels[0] = -100
+        old_logprobs[0] = 0.0
+        token_advantages[0] = 0.0
+        response_indices[0] = -1
 
         if len(input_ids) < 2:
             return None
@@ -495,129 +608,80 @@ class FSDPTrainWorker:
         ):
             return None
 
-        return EncodedExample(
+        return RLSample(
+            algorithm=sample.algorithm,
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
             old_logprobs=old_logprobs,
-            sample_reward=sample.reward,
-            sample_advantage=sample.advantage,
-            token_rewards=token_rewards,
+            advantage=sample.advantage,
             token_advantages=token_advantages,
             response_indices=response_indices,
+            output_versions=list(sample.output_versions),
         )
 
     def _collate_prepared_rl_samples(
         self,
-        prepared_samples: List[Tuple["RLSample", EncodedExample]],
-        trainer_version: float,
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
-        kept_samples = [sample for sample, _ in prepared_samples]
-        examples = [example for _, example in prepared_samples]
-
-        if not examples:
+        prepared_samples: List[RLSample],
+        *,
+        move_to_device: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        if not prepared_samples:
             raise RuntimeError("No valid RL samples were available for training.")
 
-        batch = self.collate_fn(examples)
-        batch = move_batch_to_device(batch, self.device)
-        response_token_counts = [
-            sum(1 for label in example.labels[1:] if label != -100)
-            for example in examples
-        ]
-        version_lags = []
-        for sample in kept_samples:
-            sample_version = max(sample.output_versions) if sample.output_versions else 0
-            version_lags.append(max(float(trainer_version) - float(sample_version), 0.0))
-
-        sample_rewards = [float(sample.reward) for sample in kept_samples]
-        sample_advantages = [float(sample.advantage) for sample in kept_samples]
-        sample_advantage_mean = (
-            sum(sample_advantages) / len(sample_advantages)
-            if sample_advantages else 0.0
-        )
-        sample_advantage_std = (
-            math.sqrt(
-                sum(
-                    (advantage - sample_advantage_mean) ** 2
-                    for advantage in sample_advantages
-                )
-                / len(sample_advantages)
-            )
-            if sample_advantages else 0.0
-        )
-
-        stats = {
-            "sample_count": float(len(kept_samples)),
-            "reward_mean": (
-                sum(sample_rewards) / len(sample_rewards)
-                if sample_rewards else 0.0
-            ),
-            "episode_return_mean": (
-                sum(sample.episode_return for sample in kept_samples)
-                / len(kept_samples)
-            ),
-            "advantage_mean": sample_advantage_mean,
-            "advantage_std": sample_advantage_std,
-            "response_tokens": float(sum(response_token_counts)),
-            "trainer_version_lag_mean": (
-                sum(version_lags) / len(version_lags) if version_lags else 0.0
-            ),
-        }
-        if self.args.rl_algorithm == "ppo":
-            valid_token_rewards = []
-            valid_token_advantages = []
-            for example in examples:
-                for label, reward, advantage in zip(
-                    example.labels[1:],
-                    example.token_rewards[1:],
-                    example.token_advantages[1:],
-                ):
-                    if label != -100:
-                        valid_token_rewards.append(float(reward))
-                        valid_token_advantages.append(float(advantage))
-
-            token_reward_mean = (
-                sum(valid_token_rewards) / len(valid_token_rewards)
-                if valid_token_rewards else 0.0
-            )
-            token_advantage_mean = (
-                sum(valid_token_advantages) / len(valid_token_advantages)
-                if valid_token_advantages else 0.0
-            )
-            token_advantage_std = (
-                math.sqrt(
-                    sum(
-                        (advantage - token_advantage_mean) ** 2
-                        for advantage in valid_token_advantages
-                    )
-                    / len(valid_token_advantages)
-                )
-                if valid_token_advantages else 0.0
-            )
-            stats.update(
-                {
-                    "reward_mean": stats["episode_return_mean"],
-                    "token_reward_mean": token_reward_mean,
-                    "advantage_mean": token_advantage_mean,
-                    "advantage_std": token_advantage_std,
-                    "raw_advantage_mean": token_advantage_mean,
-                    "raw_advantage_std": token_advantage_std,
-                }
-            )
+        if self.args.train_packing == "varlen":
+            batch = make_varlen_batch(prepared_samples)
         else:
-            stats.update(
-                {
-                    "token_reward_mean": 0.0,
-                    "raw_advantage_mean": sample_advantage_mean,
-                    "raw_advantage_std": sample_advantage_std,
-                }
+            batch = self.collate_fn(prepared_samples)
+        if move_to_device:
+            batch = move_batch_to_device(batch, self.device)
+        return batch
+
+    @staticmethod
+    def _version_lag_stats(
+        samples: List[RLSample],
+        trainer_version: float,
+    ) -> Tuple[float, int]:
+        lag_sum = sum(
+            max(
+                trainer_version
+                - (max(sample.output_versions) if sample.output_versions else 0),
+                0.0,
             )
-        return batch, stats
+            for sample in samples
+        )
+        return float(lag_sum), len(samples)
+
+    def _select_varlen_pack(
+        self,
+    ) -> List[RLSample]:
+        """Select a length-aware pack and retain non-selected candidates."""
+        if not self.pending_prepared_samples:
+            return []
+
+        selected, remaining = select_varlen_pack(
+            self.pending_prepared_samples,
+            token_budget=self.args.train_token_budget,
+            max_sequences=self.args.batch_size,
+        )
+
+        if not selected:
+            longest = max(
+                len(sample.input_ids)
+                for sample in self.pending_prepared_samples
+            )
+            raise RuntimeError(
+                "No replay sample fits in --train-token-budget: "
+                f"longest_pending={longest} budget={self.args.train_token_budget}"
+            )
+
+        self.pending_prepared_samples = remaining
+        return selected
 
     def _next_rl_training_batch(
         self,
         trainer_version: float,
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, float], Dict[str, int]]:
+    ) -> Tuple[Dict[str, torch.Tensor], float]:
         collected = []
         replay_stats = self.get_replay_stats()
         warmup_deadline = None
@@ -656,73 +720,212 @@ class FSDPTrainWorker:
                 time.sleep(self.args.replay_wait_sleep_seconds)
 
             for sample in sampled:
-                example = self._prepare_rl_sample(sample)
-                if example is not None:
-                    collected.append((sample, example))
+                prepared_sample = self._prepare_rl_sample(sample)
+                if prepared_sample is not None:
+                    collected.append(prepared_sample)
                     if len(collected) >= self.args.batch_size:
                         break
 
-        batch, train_stats = self._collate_prepared_rl_samples(
-            collected[: self.args.batch_size],
+        samples = collected[: self.args.batch_size]
+        lag_sum, sample_count = self._version_lag_stats(samples, trainer_version)
+        return (
+            self._collate_prepared_rl_samples(samples),
+            lag_sum / sample_count,
+        )
+
+    def _next_varlen_cpu_pack(
+        self,
+        trainer_version: float,
+    ) -> PreparedVarlenPack:
+        """Prepare one Varlen pack without moving any tensor to the GPU."""
+        replay_stats = self.get_replay_stats()
+        warmup_deadline = None
+        if self.args.replay_sample_timeout_seconds > 0:
+            warmup_deadline = time.monotonic() + self.args.replay_sample_timeout_seconds
+        while replay_stats["size"] < self.args.min_replay_size_per_rank:
+            if warmup_deadline is not None and time.monotonic() >= warmup_deadline:
+                raise TimeoutError(
+                    "Timed out waiting for replay warmup: "
+                    f"rank={self.rank} size={replay_stats['size']} "
+                    f"min_replay_size_per_rank={self.args.min_replay_size_per_rank} "
+                    f"stats={replay_stats}"
+                )
+            time.sleep(self.args.replay_wait_sleep_seconds)
+            replay_stats = self.get_replay_stats()
+
+        candidate_target = self.args.train_pack_candidate_pool_size
+        deadline = None
+        if self.args.replay_sample_timeout_seconds > 0:
+            deadline = time.monotonic() + self.args.replay_sample_timeout_seconds
+
+        while not self.pending_prepared_samples:
+            sampled = ray.get(self.replay_buffer.sample.remote(candidate_target))
+            replay_stats = self.get_replay_stats()
+            for sample in sampled:
+                prepared_sample = self._prepare_rl_sample(sample)
+                if prepared_sample is None:
+                    continue
+                self.pending_prepared_samples.append(prepared_sample)
+            if self.pending_prepared_samples:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for valid replay candidates: "
+                    f"rank={self.rank} target={candidate_target} "
+                    f"stats={replay_stats}"
+                )
+            time.sleep(self.args.replay_wait_sleep_seconds)
+
+        collected = self._select_varlen_pack()
+        batch = self._collate_prepared_rl_samples(
+            collected,
+            move_to_device=False,
+        )
+        valid_token_count = int(batch["target_indices"].numel())
+        if valid_token_count <= 0:
+            raise RuntimeError("A Varlen pack must contain at least one target.")
+        max_seqlen = max(len(sample.input_ids) for sample in collected)
+        version_lag_sum, sample_count = self._version_lag_stats(
+            collected,
             trainer_version,
         )
-        return batch, train_stats, replay_stats
+        return PreparedVarlenPack(
+            batch=batch,
+            valid_token_count=valid_token_count,
+            max_seqlen=max_seqlen,
+            version_lag_sum=version_lag_sum,
+            sample_count=sample_count,
+        )
 
     def _compute_rl_loss(
         self,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
-        labels = batch["labels"][:, 1:] # labels 对齐 logits 的时间步，去掉第一个 token 的标签（通常是 -100），因为它不对应任何预测
-        response_mask = labels.ne(-100) # response_mask 标记哪些位置是有效的响应 token（标签不为 -100），这些位置对应的 log_probs 会被用来计算 loss
-        response_token_counts = response_mask.sum(dim=-1).clamp_min(1) # 计算每个样本的响应 token 数量，形状为 [batch_size]，最小值为 1 以避免除零
-        valid_positions = response_mask.nonzero(as_tuple=False)
-        if valid_positions.numel() == 0:
-            raise RuntimeError("No valid response tokens found for RL loss.")
+        *,
+        varlen_max_seqlen: int | None = None,
+        return_varlen_token_sums: bool = False,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        Dict[str, float | torch.Tensor],
+    ]:
+        is_varlen = self.args.train_packing == "varlen"
+        use_token_sum_loss = is_varlen and return_varlen_token_sums
+        batch_size = int(batch["sample_advantages"].shape[0])
+        if is_varlen:
+            if return_varlen_token_sums and varlen_max_seqlen is None:
+                raise ValueError(
+                    "Varlen token-sum training requires an explicit "
+                    "max sequence length and cumulative sequence boundaries."
+                )
+            target_indices = batch["target_indices"]
+            prediction_indices = batch["prediction_indices"]
+            if target_indices.numel() == 0:
+                raise RuntimeError("No valid response tokens found for RL loss.")
+            valid_sample_indices = None
+            if self.args.rl_algorithm == "grpo" or not use_token_sum_loss:
+                valid_sample_indices = batch["sequence_ids"][target_indices]
+            response_token_counts = None
+            if not use_token_sum_loss:
+                assert valid_sample_indices is not None
+                response_token_counts = torch.bincount(
+                    valid_sample_indices,
+                    minlength=batch_size,
+                ).clamp_min(1)
+            valid_labels = batch["labels"][target_indices]
+            model_kwargs = {
+                "input_ids": batch["input_ids"],
+                "position_ids": batch["position_ids"],
+                "attention_mask": None,
+                "use_cache": False,
+            }
+            if varlen_max_seqlen is not None:
+                model_kwargs.update(
+                    {
+                        "cu_seq_lens_q": batch["cu_seqlens"],
+                        "cu_seq_lens_k": batch["cu_seqlens"],
+                        "max_length_q": int(varlen_max_seqlen),
+                        "max_length_k": int(varlen_max_seqlen),
+                    }
+                )
+            model_type = str(getattr(self.model.config, "model_type", ""))
+            if "moe" in model_type or hasattr(self.model.config, "num_experts"):
+                model_kwargs["output_router_logits"] = False
 
-        valid_sample_indices = valid_positions[:, 0]
-        if self.args.train_logprob_mode == "full_logits_ce":
+            if self.args.train_logprob_mode == "full_logits_ce":
+                outputs = self.model(**model_kwargs)
+                valid_logits = outputs.logits[0, prediction_indices, :]
+            elif self.args.train_logprob_mode == "response_only_lm_head":
+                outputs = self.model(
+                    **model_kwargs,
+                    logits_to_keep=prediction_indices,
+                )
+                valid_logits = outputs.logits.squeeze(0)
+            else:
+                raise ValueError(
+                    f"Unsupported train_logprob_mode: {self.args.train_logprob_mode}"
+                )
+            valid_token_log_probs = -F.cross_entropy(
+                valid_logits,
+                valid_labels,
+                reduction="none",
+            )
+            valid_old_token_log_probs = batch["old_logprobs"][target_indices].to(
+                torch.float32
+            )
+        else:
+            labels = batch["labels"][:, 1:]
+            response_mask = labels.ne(-100)
+            response_token_counts = response_mask.sum(dim=-1).clamp_min(1)
+            valid_positions = response_mask.nonzero(as_tuple=False)
+            if valid_positions.numel() == 0:
+                raise RuntimeError("No valid response tokens found for RL loss.")
+            valid_sample_indices = valid_positions[:, 0]
             outputs = self.model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
             )
-            logits = outputs.logits[:, :-1, :] # logits 对应 input_ids 的每个 token 预测下一个 token，所以去掉最后一个时间步
+            logits = outputs.logits[:, :-1, :]
             valid_token_log_probs = self._valid_token_log_probs_from_full_logits(
                 logits,
                 labels,
                 response_mask,
             )
-        elif self.args.train_logprob_mode == "response_only_lm_head":
-            valid_token_log_probs = self._valid_token_log_probs_from_response_only_lm_head(
-                batch,
-                labels,
-                response_mask,
+            old_token_log_probs = batch["old_logprobs"][:, 1:].to(
+                torch.float32
             )
-        else:
-            raise ValueError(
-                f"Unsupported train_logprob_mode: {self.args.train_logprob_mode}"
-            )
+            valid_old_token_log_probs = old_token_log_probs[response_mask]
 
-        old_token_log_probs = batch["old_logprobs"][:, 1:].to(valid_token_log_probs.dtype)
-        valid_old_token_log_probs = old_token_log_probs[response_mask]
+        # Ratio-based RL objectives are numerically sensitive. Keep the
+        # subtraction, exponentiation, clipping/gating, and KL construction in
+        # FP32 even when the model forward and logits use BF16/FP16.
+        valid_token_log_probs = valid_token_log_probs.float()
+        valid_old_token_log_probs = valid_old_token_log_probs.float()
         valid_log_ratio = valid_token_log_probs - valid_old_token_log_probs
         valid_ratio = torch.exp(valid_log_ratio)
 
         valid_response_indices = None
-        valid_token_rewards = None
         if self.args.rl_algorithm == "ppo":
-            response_indices = batch["response_indices"][:, 1:]
-            valid_response_indices = response_indices[response_mask]
-            if valid_response_indices.lt(0).any():
+            if is_varlen:
+                raw_valid_adv = batch["token_advantages"][target_indices].to(
+                    torch.float32
+                )
+                if not use_token_sum_loss:
+                    valid_response_indices = batch["response_indices"][
+                        target_indices
+                    ]
+            else:
+                response_indices = batch["response_indices"][:, 1:]
+                valid_response_indices = response_indices[response_mask]
+                raw_valid_adv = batch["token_advantages"][:, 1:][response_mask].to(
+                    torch.float32
+                )
+            if (
+                valid_response_indices is not None
+                and valid_response_indices.lt(0).any()
+            ):
                 raise RuntimeError(
                     "Valid response tokens must have non-negative response indices."
                 )
-
-            raw_valid_adv = batch["token_advantages"][:, 1:][response_mask].to(
-                torch.float32
-            )
-            valid_token_rewards = batch["token_rewards"][:, 1:][response_mask].to(
-                torch.float32
-            )
             if self.args.ppo_normalize_advantages:
                 adv_mean = raw_valid_adv.mean()
                 adv_std = raw_valid_adv.std(unbiased=False)
@@ -730,14 +933,15 @@ class FSDPTrainWorker:
                     (raw_valid_adv - adv_mean)
                     / (adv_std + self.args.ppo_adv_norm_eps)
                 )
-                valid_adv = normalized_valid_adv.to(valid_token_log_probs.dtype)
+                valid_adv = normalized_valid_adv
             else:
-                valid_adv = raw_valid_adv.to(valid_token_log_probs.dtype)
+                valid_adv = raw_valid_adv
         elif self.args.rl_algorithm == "grpo":
+            assert valid_sample_indices is not None
             raw_valid_adv = batch["sample_advantages"][valid_sample_indices].to(
                 torch.float32
             )
-            valid_adv = raw_valid_adv.to(valid_token_log_probs.dtype)
+            valid_adv = raw_valid_adv
         else:
             raise ValueError(f"Unsupported rl_algorithm: {self.args.rl_algorithm}")
 
@@ -765,74 +969,75 @@ class FSDPTrainWorker:
         else:
             raise ValueError(f"Unsupported clip_mode: {self.args.clip_mode}")
 
-        if self.args.rl_algorithm == "ppo":
-            assert valid_response_indices is not None
-            sample_objective = self._aggregate_valid_objective_by_response(
-                valid_objective,
-                valid_sample_indices,
-                valid_response_indices,
-                batch_size=labels.shape[0],
+        sample_objective = None
+        if not use_token_sum_loss:
+            assert valid_sample_indices is not None
+            assert response_token_counts is not None
+            if self.args.rl_algorithm == "ppo":
+                assert valid_response_indices is not None
+                sample_objective = self._aggregate_valid_objective_by_response(
+                    valid_objective,
+                    valid_sample_indices,
+                    valid_response_indices,
+                    batch_size=batch_size,
+                )
+            else:
+                sample_objective = self._aggregate_valid_objective(
+                    valid_objective,
+                    valid_sample_indices,
+                    response_token_counts,
+                    batch_size=batch_size,
+                )
+        old_new_kl_k3 = valid_ratio - 1.0 - valid_log_ratio
+        policy_token_sum = -valid_objective.float().sum()
+        old_new_kl_k3_sum = old_new_kl_k3.float().sum()
+        valid_token_count = int(valid_objective.numel())
+        if is_varlen and return_varlen_token_sums:
+            # Varlen intentionally optimizes a global valid-response-token
+            # mean. It does not preserve the padded path's per-response or
+            # per-episode weighting, so longer responses carry more weight.
+            old_new_kl_k3_token_mean = old_new_kl_k3_sum / valid_token_count
+            loss = policy_token_sum + (
+                self.args.old_new_kl_coef * old_new_kl_k3_sum
             )
         else:
-            sample_objective = self._aggregate_valid_objective(
-                valid_objective,
-                valid_sample_indices,
-                response_token_counts,
-                batch_size=labels.shape[0],
+            assert sample_objective is not None
+            policy_loss = -sample_objective.mean()
+            old_new_kl_k3_token_mean = old_new_kl_k3.mean()
+            loss = policy_loss + (
+                self.args.old_new_kl_coef * old_new_kl_k3_token_mean
             )
-        policy_loss = -sample_objective.mean()
-        old_new_kl_k3 = valid_ratio - 1.0 - valid_log_ratio
-        old_new_kl_k3_token_mean = old_new_kl_k3.mean()
-        old_new_kl_k3_loss = (
-            self.args.old_new_kl_coef * old_new_kl_k3_token_mean
-        )
-        loss = policy_loss + old_new_kl_k3_loss
-
         with torch.no_grad():
+            if is_varlen and return_varlen_token_sums:
+                if self.args.clip_mode == "ppo":
+                    clipped_mask = (
+                        (valid_ratio < (1.0 - self.args.clip_eps))
+                        | (valid_ratio > (1.0 + self.args.clip_eps))
+                    )
+                    ppo_clip_count = clipped_mask.sum().float()
+                else:
+                    ppo_clip_count = policy_token_sum.new_zeros(())
+
+                # Keep per-pack statistics on the accelerator. The optimizer
+                # window accumulates this detached vector and transfers it to
+                # Python only once after the cross-rank all-reduce.
+                varlen_token_stats = torch.stack(
+                    [
+                        policy_token_sum,
+                        old_new_kl_k3_sum,
+                        ppo_clip_count,
+                    ]
+                ).detach().to(dtype=torch.float64)
+                return (
+                    loss,
+                    None,
+                    {"varlen_token_stats": varlen_token_stats},
+                )
+
             loss_stats = {}
             if valid_ratio.numel() > 0:
-                sample_kl_sum = torch.zeros(
-                    labels.shape[0],
-                    device=old_new_kl_k3.device,
-                    dtype=old_new_kl_k3.dtype,
-                )
-                sample_kl_sum.index_add_(
-                    0,
-                    valid_sample_indices,
-                    old_new_kl_k3,
-                )
-                loss_stats["policy_loss"] = float(policy_loss.item())
-                loss_stats["episode_objective_mean"] = float(
-                    sample_objective.mean().item()
-                )
-                if valid_token_rewards is not None:
-                    loss_stats["token_reward_mean"] = float(
-                        valid_token_rewards.mean().item()
-                    )
-                else:
-                    loss_stats["token_reward_mean"] = 0.0
-                loss_stats["raw_advantage_mean"] = float(raw_valid_adv.mean().item())
-                loss_stats["raw_advantage_std"] = float(
-                    raw_valid_adv.std(unbiased=False).item()
-                )
-                loss_stats["used_advantage_mean"] = float(
-                    valid_adv.float().mean().item()
-                )
-                loss_stats["used_advantage_std"] = float(
-                    valid_adv.float().std(unbiased=False).item()
-                )
-                loss_stats["ppo_advantages_normalized"] = float(
-                    self.args.rl_algorithm == "ppo"
-                    and bool(self.args.ppo_normalize_advantages)
-                )
-                loss_stats["old_new_kl_k3_loss"] = float(
-                    old_new_kl_k3_loss.item()
-                )
                 loss_stats["old_new_kl_k3_token_mean"] = float(
                     old_new_kl_k3_token_mean.item()
-                )
-                loss_stats["old_new_kl_k3_sample_sum_mean"] = float(
-                    sample_kl_sum.mean().item()
                 )
             if self.args.clip_mode == "ppo" and valid_ratio.numel() > 0:
                 clipped_mask = (
@@ -854,38 +1059,6 @@ class FSDPTrainWorker:
         valid_labels = labels[response_mask]
         if valid_logits.numel() == 0:
             raise RuntimeError("No valid response logits found for RL loss.")
-        return -F.cross_entropy(
-            valid_logits,
-            valid_labels,
-            reduction="none",
-        )
-
-    def _valid_token_log_probs_from_response_only_lm_head(
-        self,
-        batch: Dict[str, torch.Tensor],
-        labels: torch.Tensor,
-        response_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        backbone_outputs = self.model.model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            use_cache=False,
-        )
-        if hasattr(backbone_outputs, "last_hidden_state"):
-            hidden_states = backbone_outputs.last_hidden_state
-        else:
-            hidden_states = backbone_outputs[0]
-
-        valid_hidden_states = hidden_states[:, :-1, :][response_mask]
-        valid_labels = labels[response_mask]
-        if valid_hidden_states.numel() == 0:
-            raise RuntimeError("No valid response hidden states found for RL loss.")
-
-        output_embeddings = self.model.get_output_embeddings()
-        if output_embeddings is None:
-            raise RuntimeError("Model does not define output embeddings for LM logits.")
-        valid_logits = output_embeddings(valid_hidden_states)
-        # 算rl的log_probs, 不是监督学习的交叉熵，之所以用这个是因为算子优化得好，且结果正好为log_probs
         return -F.cross_entropy(
             valid_logits,
             valid_labels,
@@ -977,6 +1150,152 @@ class FSDPTrainWorker:
             / sample_response_counts[valid_sample_mask]
         )
 
+    def _prepare_varlen_optimizer_window(
+        self,
+        trainer_version: float,
+    ) -> List[PreparedVarlenPack]:
+        """Prepare a fixed-size CPU window and synchronize preparation errors."""
+        window = None
+        local_error = None
+        try:
+            window = [
+                self._next_varlen_cpu_pack(trainer_version)
+                for _ in range(self.args.grad_accum_steps)
+            ]
+            if len(window) != self.args.grad_accum_steps:
+                raise RuntimeError(
+                    "Varlen optimizer window has an unexpected pack count: "
+                    f"{len(window)} != {self.args.grad_accum_steps}"
+                )
+        except Exception as exc:
+            local_error = repr(exc)
+            print(
+                f"[rank {self.rank}] Varlen window preparation failed: "
+                f"{local_error}"
+            )
+
+        success = torch.tensor(
+            0 if local_error is not None else 1,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(success, op=dist.ReduceOp.MIN)
+        if int(success.item()) != 1:
+            raise RuntimeError(
+                "At least one FSDP rank failed to prepare its Varlen "
+                "optimizer window; see per-rank logs for the original error."
+            )
+        assert window is not None
+        return window
+
+    def _run_varlen_optimizer_step(
+        self,
+        trainer_version: float,
+    ) -> Dict[str, float]:
+        """Run one globally token-normalized Varlen optimizer step."""
+        window = self._prepare_varlen_optimizer_window(trainer_version)
+        local_valid_token_count = sum(
+            pack.valid_token_count for pack in window
+        )
+        global_valid_token_count_tensor = torch.tensor(
+            local_valid_token_count,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        dist.all_reduce(
+            global_valid_token_count_tensor,
+            op=dist.ReduceOp.SUM,
+        )
+        global_valid_token_count = int(global_valid_token_count_tensor.item())
+        if global_valid_token_count <= 0:
+            raise RuntimeError(
+                "Global Varlen optimizer window contains no valid "
+                "response tokens."
+            )
+
+        local_token_stats = torch.zeros(
+            len(VARLEN_TOKEN_STAT_NAMES),
+            device=self.device,
+            dtype=torch.float64,
+        )
+        local_version_stats = torch.zeros(
+            2,
+            device=self.device,
+            dtype=torch.float64,
+        )
+        for prepared_pack in window:
+            batch = move_batch_to_device(prepared_pack.batch, self.device)
+            token_loss_sum, _, loss_stats = self._compute_rl_loss(
+                batch,
+                varlen_max_seqlen=prepared_pack.max_seqlen,
+                return_varlen_token_sums=True,
+            )
+            backward_loss = token_loss_sum * (
+                float(self.fsdp_world_size)
+                / float(global_valid_token_count)
+            )
+            backward_loss.backward()
+
+            varlen_token_stats = loss_stats["varlen_token_stats"]
+            if not isinstance(varlen_token_stats, torch.Tensor):
+                raise TypeError(
+                    "Varlen loss statistics must remain an accelerator tensor."
+                )
+            if varlen_token_stats.shape != local_token_stats.shape:
+                raise RuntimeError(
+                    "Unexpected Varlen loss statistics shape: "
+                    f"{tuple(varlen_token_stats.shape)} != "
+                    f"{tuple(local_token_stats.shape)}"
+                )
+            local_token_stats.add_(varlen_token_stats)
+            local_version_stats[0] += prepared_pack.version_lag_sum
+            local_version_stats[1] += prepared_pack.sample_count
+            self.train_micro_step += 1
+            del batch, token_loss_sum, backward_loss, varlen_token_stats
+
+        dist.all_reduce(local_token_stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_version_stats, op=dist.ReduceOp.SUM)
+        global_policy_sum, global_kl_sum, global_clip_count = (
+            local_token_stats.tolist()
+        )
+        global_version_lag_sum, global_sample_count = local_version_stats.tolist()
+
+        torch.nn.utils.clip_grad_norm_(
+            self.trainable_parameter_list,
+            max_norm=1.0,
+        )
+        current_lr = self._get_current_lr(
+            self.optimizer_step,
+            self.args.learning_rate,
+            self.args.lr_warmup_steps,
+            self.args.max_steps,
+        )
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = current_lr
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer_step += 1
+
+        token_count = float(global_valid_token_count)
+        policy_loss_token_mean = global_policy_sum / token_count
+        kl_token_mean = global_kl_sum / token_count
+
+        return {
+            "global_policy_sum": global_policy_sum,
+            "global_kl_sum": global_kl_sum,
+            "global_clip_count": global_clip_count,
+            "global_valid_token_count": token_count,
+            "global_version_lag_sum": global_version_lag_sum,
+            "global_sample_count": global_sample_count,
+            "loss_mean": (
+                policy_loss_token_mean
+                + self.args.old_new_kl_coef * kl_token_mean
+            ),
+            "kl_token_mean": kl_token_mean,
+            "clip_fraction": global_clip_count / token_count,
+            "current_lr": current_lr,
+        }
+
     def train_until_next_sync(
         self,
         num_optimizer_steps: int = 100,
@@ -996,22 +1315,32 @@ class FSDPTrainWorker:
             self.args.max_steps,
         )
         segment_losses = []
+        segment_kls = []
+        segment_clips = []
         segment_version_lags = []
-        segment_episode_return_means = []
-        segment_token_reward_means = []
-        segment_raw_advantage_means = []
-        segment_raw_advantage_stds = []
-        segment_used_advantage_means = []
-        segment_used_advantage_stds = []
-        segment_old_new_kl_k3_token_means = []
-        segment_old_new_kl_k3_sample_sum_means = []
-        segment_old_new_kl_k3_losses = []
+        segment_valid_tokens = 0.0
+        segment_varlen_steps = []
 
         while self.optimizer_step < target_optimizer_step:
-            trainer_version = self.optimizer_step / self.args.sync_every_optimizer_steps
-            batch, train_stats, replay_stats = self._next_rl_training_batch(
-                trainer_version
+            trainer_version = (
+                self.optimizer_step / self.args.sync_every_optimizer_steps
             )
+            if self.args.train_packing == "varlen":
+                step_stats = self._run_varlen_optimizer_step(trainer_version)
+                segment_varlen_steps.append(step_stats)
+                if self.rank == 0 and self.optimizer_step % self.args.log_every == 0:
+                    print(
+                        "[train] "
+                        f"optimizer_step={self.optimizer_step} "
+                        f"loss={step_stats['loss_mean']:.6f} "
+                        f"kl_token_mean={step_stats['kl_token_mean']:.6f} "
+                        f"clip_frac={step_stats['clip_fraction']:.4f} "
+                        f"tokens={step_stats['global_valid_token_count']:.0f} "
+                        f"lr={step_stats['current_lr']:.8g}"
+                    )
+                continue
+
+            batch, version_lag = self._next_rl_training_batch(trainer_version)
             raw_loss, response_token_counts, loss_stats = self._compute_rl_loss(
                 batch,
             )
@@ -1019,67 +1348,15 @@ class FSDPTrainWorker:
             loss = raw_loss / self.args.grad_accum_steps
             loss.backward()
             segment_losses.append(float(raw_loss.item()))
-            segment_version_lags.append(float(train_stats["trainer_version_lag_mean"]))
-            segment_episode_return_means.append(
-                float(train_stats.get("episode_return_mean", 0.0))
-            )
-            segment_token_reward_means.append(
-                float(loss_stats.get("token_reward_mean", 0.0))
-            )
-            segment_raw_advantage_means.append(
-                float(loss_stats.get("raw_advantage_mean", 0.0))
-            )
-            segment_raw_advantage_stds.append(
-                float(loss_stats.get("raw_advantage_std", 0.0))
-            )
-            segment_used_advantage_means.append(
-                float(loss_stats.get("used_advantage_mean", 0.0))
-            )
-            segment_used_advantage_stds.append(
-                float(loss_stats.get("used_advantage_std", 0.0))
-            )
-            segment_old_new_kl_k3_token_means.append(
+            segment_kls.append(
                 float(loss_stats.get("old_new_kl_k3_token_mean", 0.0))
             )
-            segment_old_new_kl_k3_sample_sum_means.append(
-                float(loss_stats.get("old_new_kl_k3_sample_sum_mean", 0.0))
+            segment_clips.append(
+                float(loss_stats.get("ppo_clip_frac", 0.0))
             )
-            segment_old_new_kl_k3_losses.append(
-                float(loss_stats.get("old_new_kl_k3_loss", 0.0))
-            )
-
+            segment_version_lags.append(version_lag)
+            segment_valid_tokens += float(response_token_counts.sum().item())
             self.train_micro_step += 1
-            self.last_loss = float(raw_loss.item())
-            self.last_reward_mean = float(train_stats["reward_mean"])
-            self.last_advantage_mean = float(train_stats["advantage_mean"])
-            self.last_response_tokens = float(response_token_counts.sum().item())
-            self.last_replay_size = int(replay_stats["size"])
-            self.last_total_sampled = int(replay_stats["total_samples_sampled"])
-            self.last_ppo_clip_frac = float(loss_stats.get("ppo_clip_frac", 0.0))
-            self.last_token_reward_mean = float(
-                loss_stats.get("token_reward_mean", 0.0)
-            )
-            self.last_raw_advantage_mean = float(
-                loss_stats.get("raw_advantage_mean", 0.0)
-            )
-            self.last_raw_advantage_std = float(
-                loss_stats.get("raw_advantage_std", 0.0)
-            )
-            self.last_used_advantage_mean = float(
-                loss_stats.get("used_advantage_mean", 0.0)
-            )
-            self.last_used_advantage_std = float(
-                loss_stats.get("used_advantage_std", 0.0)
-            )
-            self.last_old_new_kl_k3_token_mean = float(
-                loss_stats.get("old_new_kl_k3_token_mean", 0.0)
-            )
-            self.last_old_new_kl_k3_sample_sum_mean = float(
-                loss_stats.get("old_new_kl_k3_sample_sum_mean", 0.0)
-            )
-            self.last_old_new_kl_k3_loss = float(
-                loss_stats.get("old_new_kl_k3_loss", 0.0)
-            )
             should_step = self.train_micro_step % self.args.grad_accum_steps == 0
             if not should_step:
                 continue
@@ -1103,26 +1380,38 @@ class FSDPTrainWorker:
                 print(
                     "[train] "
                     f"optimizer_step={self.optimizer_step} "
-                    f"micro_step={self.train_micro_step} "
-                    f"rl_loss={self.last_loss:.6f} "
-                    f"reward_mean={self.last_reward_mean:.4f} "
-                    f"adv_mean={self.last_advantage_mean:.4f} "
-                    f"response_tokens={self.last_response_tokens:.0f} "
-                    f"replay_size={self.last_replay_size} "
-                    f"total_sampled={self.last_total_sampled} "
-                    f"ppo_clip_frac={self.last_ppo_clip_frac:.4f} "
-                    f"token_reward_mean={self.last_token_reward_mean:.4f} "
-                    f"raw_adv_mean={self.last_raw_advantage_mean:.4f} "
-                    f"raw_adv_std={self.last_raw_advantage_std:.4f} "
-                    f"used_adv_mean={self.last_used_advantage_mean:.4f} "
-                    f"used_adv_std={self.last_used_advantage_std:.4f} "
-                    "old_new_kl_k3_token_mean="
-                    f"{self.last_old_new_kl_k3_token_mean:.6f} "
-                    "old_new_kl_k3_sample_sum_mean="
-                    f"{self.last_old_new_kl_k3_sample_sum_mean:.6f} "
-                    f"old_new_kl_k3_loss={self.last_old_new_kl_k3_loss:.6f} "
+                    f"loss={raw_loss.item():.6f} "
+                    "kl_token_mean="
+                    f"{loss_stats.get('old_new_kl_k3_token_mean', 0.0):.6f} "
+                    f"clip_frac={loss_stats.get('ppo_clip_frac', 0.0):.4f} "
                     f"lr={current_lr:.8g}"
                 )
+
+        if segment_varlen_steps:
+            segment_valid_tokens = sum(
+                step["global_valid_token_count"]
+                for step in segment_varlen_steps
+            )
+            policy_sum = sum(
+                step["global_policy_sum"] for step in segment_varlen_steps
+            )
+            kl_sum = sum(step["global_kl_sum"] for step in segment_varlen_steps)
+            clip_count = sum(
+                step["global_clip_count"] for step in segment_varlen_steps
+            )
+            segment_kls = [kl_sum / segment_valid_tokens]
+            segment_losses = [
+                (policy_sum + self.args.old_new_kl_coef * kl_sum)
+                / segment_valid_tokens
+            ]
+            segment_clips = [clip_count / segment_valid_tokens]
+            version_lag_sum = sum(
+                step["global_version_lag_sum"] for step in segment_varlen_steps
+            )
+            sample_count = sum(
+                step["global_sample_count"] for step in segment_varlen_steps
+            )
+            segment_version_lags = [version_lag_sum / sample_count]
 
         dist.barrier()
         optimizer_steps_run = self.optimizer_step - start_optimizer_step
@@ -1133,66 +1422,20 @@ class FSDPTrainWorker:
             "optimizer_step": self.optimizer_step,
             "micro_step": self.train_micro_step,
             "reached_max_steps": self.optimizer_step >= self.args.max_steps,
-            "last_loss": self.last_loss,
-            "last_reward_mean": self.last_reward_mean,
-            "last_advantage_mean": self.last_advantage_mean,
-            "last_response_tokens": self.last_response_tokens,
-            "last_replay_size": self.last_replay_size,
-            "last_total_sampled": self.last_total_sampled,
-            "last_ppo_clip_frac": self.last_ppo_clip_frac,
-            "last_token_reward_mean": self.last_token_reward_mean,
-            "last_raw_advantage_mean": self.last_raw_advantage_mean,
-            "last_raw_advantage_std": self.last_raw_advantage_std,
-            "last_used_advantage_mean": self.last_used_advantage_mean,
-            "last_used_advantage_std": self.last_used_advantage_std,
-            "last_old_new_kl_k3_token_mean": self.last_old_new_kl_k3_token_mean,
-            "last_old_new_kl_k3_sample_sum_mean": (
-                self.last_old_new_kl_k3_sample_sum_mean
-            ),
-            "last_old_new_kl_k3_loss": self.last_old_new_kl_k3_loss,
             "segment_loss_mean": (
-                sum(segment_losses) / len(segment_losses) if segment_losses else 0.0
+                sum(segment_losses) / len(segment_losses)
+                if segment_losses
+                else 0.0
             ),
-            "segment_episode_return_mean": (
-                sum(segment_episode_return_means) / len(segment_episode_return_means)
-                if segment_episode_return_means else 0.0
+            "segment_kl_mean": (
+                sum(segment_kls) / len(segment_kls) if segment_kls else 0.0
             ),
-            "segment_token_reward_mean": (
-                sum(segment_token_reward_means) / len(segment_token_reward_means)
-                if segment_token_reward_means else 0.0
+            "segment_clip_frac": (
+                sum(segment_clips) / len(segment_clips)
+                if segment_clips else 0.0
             ),
-            "segment_raw_advantage_mean": (
-                sum(segment_raw_advantage_means) / len(segment_raw_advantage_means)
-                if segment_raw_advantage_means else 0.0
-            ),
-            "segment_raw_advantage_std": (
-                sum(segment_raw_advantage_stds) / len(segment_raw_advantage_stds)
-                if segment_raw_advantage_stds else 0.0
-            ),
-            "segment_used_advantage_mean": (
-                sum(segment_used_advantage_means) / len(segment_used_advantage_means)
-                if segment_used_advantage_means else 0.0
-            ),
-            "segment_used_advantage_std": (
-                sum(segment_used_advantage_stds) / len(segment_used_advantage_stds)
-                if segment_used_advantage_stds else 0.0
-            ),
-            "segment_old_new_kl_k3_token_mean": (
-                sum(segment_old_new_kl_k3_token_means)
-                / len(segment_old_new_kl_k3_token_means)
-                if segment_old_new_kl_k3_token_means else 0.0
-            ),
-            "segment_old_new_kl_k3_sample_sum_mean": (
-                sum(segment_old_new_kl_k3_sample_sum_means)
-                / len(segment_old_new_kl_k3_sample_sum_means)
-                if segment_old_new_kl_k3_sample_sum_means else 0.0
-            ),
-            "segment_old_new_kl_k3_loss": (
-                sum(segment_old_new_kl_k3_losses)
-                / len(segment_old_new_kl_k3_losses)
-                if segment_old_new_kl_k3_losses else 0.0
-            ),
-            "train_sample_trainer_version_lag_mean": (
+            "segment_valid_tokens": segment_valid_tokens,
+            "segment_version_lag_mean": (
                 sum(segment_version_lags) / len(segment_version_lags)
                 if segment_version_lags else 0.0
             ),
@@ -1370,7 +1613,6 @@ class OnlineGenerationState:
     output_logprobs: List[float] = field(default_factory=list)
     output_versions: List[int] = field(default_factory=list)
     stop_reason: Literal["length", "stop", "tool_calls", "abort"] | None = None
-    attempts: int = 0
 
     @property
     def remaining_max_tokens(self) -> int:
@@ -1382,53 +1624,11 @@ class OnlineGenerationState:
 
 
 @dataclass
-class RepeatingInferenceStats:
-    total_requests: int = 0
-    total_tokens: int = 0
-
-
-@dataclass
-class InferenceRequestItem:
-    request_index: int
-    rollout_worker_id: int
-    batch_id: int
-    input_ids: List[int]
-    requested_max_tokens: int
-
-
-@dataclass
 class InferenceResult:
-    request_index: int
-    rollout_worker_id: int
-    batch_id: int
     output_tokens: List[int]
     output_logprobs: List[float]
     output_versions: List[int]
     stop_reason: Literal["length", "stop", "tool_calls", "abort"] | None
-    attempts: int
-
-    @property
-    def version_range(self) -> str:
-        if not self.output_versions:
-            return "none"
-        return f"{min(self.output_versions)}-{max(self.output_versions)}"
-
-
-@dataclass
-class RLSample:
-    algorithm: Literal["ppo", "grpo"]
-    response_ids: List[int]
-    input_ids: List[int]
-    attention_mask: List[int]
-    labels: List[int]
-    old_logprobs: List[float]
-    reward: float
-    advantage: float
-    token_rewards: List[float]
-    token_advantages: List[float]
-    response_indices: List[int]
-    episode_return: float
-    output_versions: List[int]
 
 
 @ray.remote
@@ -1436,110 +1636,44 @@ class StatsActor:
     """Aggregates rollout metrics from async rollout workers."""
 
     def __init__(self, window_size: int, active_timeout_seconds: float):
-        self.reward_sums = deque(maxlen=window_size)
         self.worker_last_active = {}
         self.active_timeout_seconds = active_timeout_seconds
-        self.total_episodes = 0
         self.tw_scores = deque(maxlen=window_size)
         self.tw_max_scores = deque(maxlen=window_size)
         self.tw_wins = deque(maxlen=window_size)
         self.tw_steps = deque(maxlen=window_size)
-        self.tw_env_steps = deque(maxlen=window_size)
         self.tw_invalid_actions = deque(maxlen=window_size)
-        self.tw_selected_response_lengths = deque(maxlen=window_size)
-        self.ppo_token_reward_means = deque(maxlen=window_size)
-        self.ppo_raw_advantage_means = deque(maxlen=window_size)
-        self.ppo_raw_advantage_stds = deque(maxlen=window_size)
-        self.ppo_invalid_actions = deque(maxlen=window_size)
-        self.grpo_group_reward_means = deque(maxlen=window_size)
-        self.grpo_group_reward_stds = deque(maxlen=window_size)
-        self.grpo_advantage_stds = deque(maxlen=window_size)
-        self.grpo_invalid_actions = deque(maxlen=window_size)
 
     def add_textworld_episode(
         self,
         worker_id: int,
-        trajectory_return: float,
         score: float,
         max_score: float,
         won: bool,
         steps: int,
-        env_steps: int,
         invalid_actions: int,
-        selected_response_lengths: List[int] | None = None,
-        ppo_token_reward_mean: float | None = None,
-        ppo_raw_advantage_mean: float | None = None,
-        ppo_raw_advantage_std: float | None = None,
-        ppo_invalid_actions_mean: float | None = None,
-        grpo_group_reward_mean: float | None = None,
-        grpo_group_reward_std: float | None = None,
-        grpo_advantage_std: float | None = None,
-        grpo_invalid_actions_mean: float | None = None,
     ) -> None:
-        selected_response_lengths = selected_response_lengths or []
-        self.reward_sums.append(float(trajectory_return))
         self.tw_scores.append(float(score))
         self.tw_max_scores.append(float(max_score))
         self.tw_wins.append(bool(won))
         self.tw_steps.append(int(steps))
-        self.tw_env_steps.append(int(env_steps))
         self.tw_invalid_actions.append(int(invalid_actions))
-        self.tw_selected_response_lengths.extend(
-            int(value) for value in selected_response_lengths
-        )
-        if ppo_token_reward_mean is not None:
-            self.ppo_token_reward_means.append(float(ppo_token_reward_mean))
-        if ppo_raw_advantage_mean is not None:
-            self.ppo_raw_advantage_means.append(float(ppo_raw_advantage_mean))
-        if ppo_raw_advantage_std is not None:
-            self.ppo_raw_advantage_stds.append(float(ppo_raw_advantage_std))
-        if ppo_invalid_actions_mean is not None:
-            self.ppo_invalid_actions.append(float(ppo_invalid_actions_mean))
-        if grpo_group_reward_mean is not None:
-            self.grpo_group_reward_means.append(float(grpo_group_reward_mean))
-        if grpo_group_reward_std is not None:
-            self.grpo_group_reward_stds.append(float(grpo_group_reward_std))
-        if grpo_advantage_std is not None:
-            self.grpo_advantage_stds.append(float(grpo_advantage_std))
-        if grpo_invalid_actions_mean is not None:
-            self.grpo_invalid_actions.append(float(grpo_invalid_actions_mean))
-        self.total_episodes += 1
         self.worker_last_active[int(worker_id)] = time.time()
 
     def get_stats(self) -> Dict[str, float]:
-        now = time.time()
-        active_cutoff = now - self.active_timeout_seconds
+        active_cutoff = time.time() - self.active_timeout_seconds
         active_workers = sum(
-            1 for last_active in self.worker_last_active.values()
-            if last_active >= active_cutoff
+            last_active >= active_cutoff
+            for last_active in self.worker_last_active.values()
         )
-        reward_count = len(self.reward_sums)
-        tw_selected_response_count = len(self.tw_selected_response_lengths)
-        ppo_token_reward_mean_count = len(self.ppo_token_reward_means)
-        ppo_raw_advantage_mean_count = len(self.ppo_raw_advantage_means)
-        ppo_raw_advantage_std_count = len(self.ppo_raw_advantage_stds)
-        ppo_invalid_action_count = len(self.ppo_invalid_actions)
-        grpo_group_reward_mean_count = len(self.grpo_group_reward_means)
-        grpo_group_reward_std_count = len(self.grpo_group_reward_stds)
-        grpo_advantage_std_count = len(self.grpo_advantage_stds)
-        grpo_invalid_action_count = len(self.grpo_invalid_actions)
         tw_episode_count = len(self.tw_scores)
         tw_total_steps = sum(self.tw_steps)
-        tw_total_env_steps = sum(self.tw_env_steps)
         tw_total_max_score = sum(self.tw_max_scores)
         return {
-            "global_reward_sum_mean": (
-                sum(self.reward_sums) / reward_count if reward_count else 0.0
-            ),
             "active_workers": active_workers,
-            "total_episodes": self.total_episodes,
-            "tw_episode_count": tw_episode_count,
             "tw_win_rate": (
                 sum(1 for won in self.tw_wins if won) / tw_episode_count
                 if tw_episode_count else 0.0
-            ),
-            "tw_mean_score": (
-                sum(self.tw_scores) / tw_episode_count if tw_episode_count else 0.0
             ),
             "tw_normalized_score": (
                 sum(self.tw_scores) / tw_total_max_score
@@ -1548,45 +1682,6 @@ class StatsActor:
             "tw_invalid_action_rate": (
                 sum(self.tw_invalid_actions) / tw_total_steps
                 if tw_total_steps else 0.0
-            ),
-            "tw_env_steps_mean": (
-                tw_total_env_steps / tw_episode_count if tw_episode_count else 0.0
-            ),
-            "tw_selected_response_length_mean": (
-                sum(self.tw_selected_response_lengths) / tw_selected_response_count
-                if tw_selected_response_count else 0.0
-            ),
-            "ppo_token_reward_mean": (
-                sum(self.ppo_token_reward_means) / ppo_token_reward_mean_count
-                if ppo_token_reward_mean_count else 0.0
-            ),
-            "ppo_raw_advantage_mean": (
-                sum(self.ppo_raw_advantage_means) / ppo_raw_advantage_mean_count
-                if ppo_raw_advantage_mean_count else 0.0
-            ),
-            "ppo_raw_advantage_std": (
-                sum(self.ppo_raw_advantage_stds) / ppo_raw_advantage_std_count
-                if ppo_raw_advantage_std_count else 0.0
-            ),
-            "ppo_invalid_actions_mean": (
-                sum(self.ppo_invalid_actions) / ppo_invalid_action_count
-                if ppo_invalid_action_count else 0.0
-            ),
-            "grpo_group_reward_mean": (
-                sum(self.grpo_group_reward_means) / grpo_group_reward_mean_count
-                if grpo_group_reward_mean_count else 0.0
-            ),
-            "grpo_group_reward_std": (
-                sum(self.grpo_group_reward_stds) / grpo_group_reward_std_count
-                if grpo_group_reward_std_count else 0.0
-            ),
-            "grpo_advantage_std": (
-                sum(self.grpo_advantage_stds) / grpo_advantage_std_count
-                if grpo_advantage_std_count else 0.0
-            ),
-            "grpo_invalid_actions_mean": (
-                sum(self.grpo_invalid_actions) / grpo_invalid_action_count
-                if grpo_invalid_action_count else 0.0
             ),
         }
 
@@ -1600,8 +1695,6 @@ class ReplayBufferActor:
         self.total_samples_added = 0
         self.total_samples_sampled = 0
         self.total_samples_evicted = 0
-        self.total_batches_added = 0
-        self.total_batches_sampled = 0
 
     def add_samples(self, samples: List[RLSample]) -> Dict[str, int]:
         capacity = self.samples.maxlen or 0
@@ -1612,7 +1705,6 @@ class ReplayBufferActor:
             )
         self.samples.extend(samples)
         self.total_samples_added += len(samples)
-        self.total_batches_added += 1
         return self.get_stats()
 
     def sample(self, batch_size: int) -> List[RLSample]:
@@ -1623,7 +1715,6 @@ class ReplayBufferActor:
             return []
         samples = random.sample(list(self.samples), sample_count)
         self.total_samples_sampled += len(samples)
-        self.total_batches_sampled += 1
         return samples
 
     def get_stats(self) -> Dict[str, int]:
@@ -1633,8 +1724,6 @@ class ReplayBufferActor:
             "total_samples_added": self.total_samples_added,
             "total_samples_sampled": self.total_samples_sampled,
             "total_samples_evicted": self.total_samples_evicted,
-            "total_batches_added": self.total_batches_added,
-            "total_batches_sampled": self.total_batches_sampled,
         }
 
 
@@ -1711,10 +1800,6 @@ class InterruptibleGenerationRunner:
     def resume(self) -> None:
         self.resume_event.set()
 
-    @property
-    def is_resumed(self) -> bool:
-        return self.resume_event.is_set()
-
     # 新的engine.generate() attempt开始 +1
     async def _increment_active_attempts(self) -> None:
         async with self._active_changed:
@@ -1742,7 +1827,6 @@ class InterruptibleGenerationRunner:
                 state.stop_reason = "length"
                 return state
 
-            state.attempts = attempt
             attempt_version = self.version
             sampling_kwargs = {
                 "temperature": self.temperature,
@@ -1833,7 +1917,6 @@ class VLLMInferenceActor:
     """GPU Ray actor that owns vLLM and consumes tokenized rollout requests."""
 
     def __init__(self, args: argparse.Namespace):
-        self.args = args
         engine_kwargs = dict(
             model=args.model_path,
             trust_remote_code=args.trust_remote_code,
@@ -1861,19 +1944,12 @@ class VLLMInferenceActor:
             collect_logprobs=True,
         )
         self.active_generation_tasks = set()
-        self.stats = RepeatingInferenceStats()
+        self.total_tokens = 0
         self.next_request_index = 0
-        self.pending_futures = set()
         self.stopped = False
-
-    async def start(self):
-        self.stopped = False
-        return {"continuous_submit": True, "inference_loop_task": 0}
 
     async def request_batch(
         self,
-        rollout_worker_id: int,
-        batch_id: int,
         input_ids: List[int],
         infer_max_tokens: int,
     ) -> InferenceResult:
@@ -1881,62 +1957,36 @@ class VLLMInferenceActor:
             raise RuntimeError("VLLMInferenceActor is stopped.")
         request_index = self.next_request_index
         self.next_request_index += 1
-        item = InferenceRequestItem(
-            request_index=request_index,
-            rollout_worker_id=int(rollout_worker_id),
-            batch_id=int(batch_id),
+        state = OnlineGenerationState(
+            index=request_index,
             input_ids=list(input_ids),
             requested_max_tokens=int(infer_max_tokens),
         )
-        return await self._run_generation_item(item)
+        return await self._run_generation(state)
 
-    async def _run_generation_item(
+    async def _run_generation(
         self,
-        item: InferenceRequestItem,
+        state: OnlineGenerationState,
     ) -> InferenceResult:
-        current_call = asyncio.current_task()
-        if current_call is not None:
-            self.pending_futures.add(current_call)
-
+        generation_task = asyncio.create_task(self.runner.generate(state))
+        self.active_generation_tasks.add(generation_task)
+        generation_task.add_done_callback(self.active_generation_tasks.discard)
         try:
-            state = OnlineGenerationState(
-                index=item.request_index,
-                input_ids=item.input_ids,
-                requested_max_tokens=item.requested_max_tokens,
-            )
-            generation_task = asyncio.create_task(self.runner.generate(state))
-            self.active_generation_tasks.add(generation_task)
-            generation_task.add_done_callback(self.active_generation_tasks.discard)
-            try:
-                completed_state = await generation_task
-            except asyncio.CancelledError:
-                if not generation_task.done():
-                    generation_task.cancel()
-                await asyncio.gather(generation_task, return_exceptions=True)
-                raise
+            completed_state = await generation_task
+        except asyncio.CancelledError:
+            if not generation_task.done():
+                generation_task.cancel()
+            await asyncio.gather(generation_task, return_exceptions=True)
+            raise
 
-            result = InferenceResult(
-                request_index=item.request_index,
-                rollout_worker_id=item.rollout_worker_id,
-                batch_id=item.batch_id,
-                output_tokens=list(completed_state.output_tokens),
-                output_logprobs=list(completed_state.output_logprobs),
-                output_versions=list(completed_state.output_versions),
-                stop_reason=completed_state.stop_reason,
-                attempts=completed_state.attempts,
-            )
-            await self._record_completed_state(result)
-            return result
-        finally:
-            if current_call is not None:
-                self.pending_futures.discard(current_call)
-
-    async def _record_completed_state(
-        self,
-        result: InferenceResult,
-    ) -> None:
-        self.stats.total_requests += 1
-        self.stats.total_tokens += len(result.output_tokens)
+        result = InferenceResult(
+            output_tokens=list(completed_state.output_tokens),
+            output_logprobs=list(completed_state.output_logprobs),
+            output_versions=list(completed_state.output_versions),
+            stop_reason=completed_state.stop_reason,
+        )
+        self.total_tokens += len(result.output_tokens)
+        return result
 
     async def pause_and_wait_idle(self):
         self.runner.pause()
@@ -1996,18 +2046,7 @@ class VLLMInferenceActor:
         await self.engine.finish_weight_update()
 
     def get_stats(self):
-        return {
-            "pending_futures": len(self.pending_futures),
-            "total_requests": self.stats.total_requests,
-            "total_tokens": self.stats.total_tokens,
-            "active_attempts": self.runner._active_attempts,
-            "active_generation_tasks": len(self.active_generation_tasks),
-            "vllm_max_num_seqs": self.args.vllm_max_num_seqs,
-            "vllm_max_num_batched_tokens": self.args.vllm_max_num_batched_tokens,
-            "vllm_max_model_len": self.args.vllm_max_model_len,
-            "weight_version": self.runner.version,
-            "resumed": self.runner.is_resumed,
-        }
+        return {"total_tokens": self.total_tokens}
 
     async def shutdown(self):
         self.stopped = True
@@ -2023,14 +2062,13 @@ class VLLMInferenceActor:
 
 @dataclass
 class TextWorldStepRecord:
-    training_result: InferenceResult | None
+    training_result: InferenceResult
     prompt_ids: List[int]
     reward: float
 
 
 @dataclass
 class TextWorldTrajectoryState:
-    group_index: int
     env: Any
     obs: str
     infos: Dict
@@ -2038,11 +2076,9 @@ class TextWorldTrajectoryState:
     step_records: List[TextWorldStepRecord] = field(default_factory=list)
     transcript_ids: List[int] = field(default_factory=list)
     invalid_actions: int = 0
-    env_steps: int = 0
     done: bool = False
     won: bool = False
     lost: bool = False
-    selected_response_lengths: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -2092,9 +2128,7 @@ TEXTWORLD_SYSTEM_PROMPT = (
 
 @dataclass
 class ParsedAction:
-    raw_text: str
     normalized: str
-    valid: bool
     action: str | None
 
 
@@ -2135,9 +2169,7 @@ def parse_model_action(raw_text: str, admissible_commands: List[str]) -> ParsedA
     }
     action = command_by_normalized.get(normalized)
     return ParsedAction(
-        raw_text=raw_text,
         normalized=normalized,
-        valid=action is not None,
         action=action,
     )
 
@@ -2257,7 +2289,6 @@ class TextWorldRolloutWorkerActor:
         self.stats_actor = stats_actor
         self.tokenizer = build_tokenizer(args, log=False)
         self.game_files = load_textworld_game_files(args)
-        self.batch_id = 0
         self.stopped = False
         if self._log_detail:
             print(
@@ -2340,15 +2371,10 @@ class TextWorldRolloutWorkerActor:
             skip_special_tokens=True,
         )
         parsed_action = parse_model_action(raw_text, admissible_commands)
-        model_action_valid = parsed_action.valid and parsed_action.action is not None
-
-        state.selected_response_lengths.append(len(result.output_tokens))
         state.transcript_ids.extend(result.output_tokens)
-        if model_action_valid:
+        if parsed_action.action is not None:
             selected_action = parsed_action.action
-            assert selected_action is not None
             obs, step_score, done, infos = state.env.step(selected_action)
-            state.env_steps += 1
             state.obs = obs
             state.infos = dict(infos)
             state.latest_score = _textworld_score(step_score, infos)
@@ -2430,12 +2456,8 @@ class TextWorldRolloutWorkerActor:
                 self.args.infer_max_tokens,
                 self.args.tw_history_token_window - len(input_ids),
             )
-            current_batch_id = self.batch_id
-            self.batch_id += 1
             request_refs.append(
                 self.infer_actor.request_batch.remote(
-                    self.worker_id,
-                    current_batch_id,
                     list(input_ids),
                     infer_max_tokens,
                 )
@@ -2467,8 +2489,6 @@ class TextWorldRolloutWorkerActor:
         self,
         step_records: List[TextWorldStepRecord],
         algorithm: Literal["ppo", "grpo"] | None = None,
-        trajectory_return: float | None = None,
-        sample_reward: float | None = None,
         sample_advantage: float | None = None,
     ) -> RLSample | None:
         algorithm = self.args.rl_algorithm if algorithm is None else algorithm
@@ -2477,7 +2497,6 @@ class TextWorldRolloutWorkerActor:
         old_logprobs: List[float] = []
         token_rewards: List[float] = []
         response_indices: List[int] = []
-        response_ids: List[int] = []
         output_versions: List[int] = []
         next_response_index = 0
 
@@ -2496,8 +2515,6 @@ class TextWorldRolloutWorkerActor:
                 response_indices.extend([-1] * len(prompt_delta))
 
             result = record.training_result
-            if result is None:
-                continue
             if not result.output_tokens:
                 continue
             output_tokens = list(result.output_tokens)
@@ -2526,11 +2543,10 @@ class TextWorldRolloutWorkerActor:
                 raise ValueError(f"Unsupported rl_algorithm: {algorithm}")
             token_rewards.extend(response_token_rewards)
             response_indices.extend([next_response_index] * len(output_tokens))
-            response_ids.extend(output_tokens)
             output_versions.extend(result.output_versions)
             next_response_index += 1
 
-        if not response_ids:
+        if all(label == -100 for label in labels):
             return None
         if (
             not input_ids
@@ -2543,35 +2559,15 @@ class TextWorldRolloutWorkerActor:
         if len(input_ids) > self.args.tw_history_token_window:
             return None
 
-        episode_return = (
-            sum(float(record.reward) for record in step_records)
-            if trajectory_return is None
-            else float(trajectory_return)
-        )
         if algorithm == "ppo":
             token_advantages = self._compute_token_level_advantages(
                 labels,
                 token_rewards,
             )
-            valid_token_advantages = [
-                advantage
-                for advantage, label in zip(token_advantages, labels)
-                if label != -100
-            ]
-            sample_reward = float(episode_return)
-            sample_advantage = (
-                sum(valid_token_advantages) / len(valid_token_advantages)
-                if valid_token_advantages else 0.0
-            )
+            sample_advantage = 0.0
         elif algorithm == "grpo":
-            sample_reward = (
-                float(episode_return) if sample_reward is None else float(sample_reward)
-            )
-            sample_advantage = (
-                float(sample_reward)
-                if sample_advantage is None
-                else float(sample_advantage)
-            )
+            if sample_advantage is None:
+                raise ValueError("GRPO samples require a sample advantage.")
             token_advantages = [
                 float(sample_advantage) if label != -100 else 0.0
                 for label in labels
@@ -2581,17 +2577,13 @@ class TextWorldRolloutWorkerActor:
 
         return RLSample(
             algorithm=algorithm,
-            response_ids=response_ids,
             input_ids=input_ids,
             attention_mask=[1] * len(input_ids),
             labels=labels,
             old_logprobs=old_logprobs,
-            reward=float(sample_reward),
             advantage=float(sample_advantage),
-            token_rewards=token_rewards,
             token_advantages=token_advantages,
             response_indices=response_indices,
-            episode_return=float(episode_return),
             output_versions=output_versions,
         )
 
@@ -2644,13 +2636,12 @@ class TextWorldRolloutWorkerActor:
         states: List[TextWorldTrajectoryState] = []
 
         try:
-            for group_index in range(group_size):
+            for _ in range(group_size):
                 env = textworld.gym.make(env_id)
                 obs, infos = env.reset()
                 transcript_ids = self._initial_transcript_ids(obs, infos)
                 states.append(
                     TextWorldTrajectoryState(
-                        group_index=group_index,
                         env=env,
                         obs=obs,
                         infos=dict(infos),
@@ -2678,23 +2669,18 @@ class TextWorldRolloutWorkerActor:
                 - self.args.tw_invalid_action_penalty * state.invalid_actions
                 for raw_return, state in zip(raw_returns, states)
             ]
-            group_reward_mean, group_reward_std, advantages = (
+            _, _, advantages = (
                 self._compute_grpo_group_advantages(grpo_rewards)
             )
-            _, advantage_std, _ = self._compute_grpo_group_advantages(advantages)
 
             samples = []
-            for state, raw_return, grpo_reward, advantage in zip(
+            for state, advantage in zip(
                 states,
-                raw_returns,
-                grpo_rewards,
                 advantages,
             ):
                 sample = self._build_textworld_episode_rl_sample(
                     step_records=state.step_records,
                     algorithm="grpo",
-                    trajectory_return=raw_return,
-                    sample_reward=grpo_reward,
                     sample_advantage=advantage,
                 )
                 if sample is not None:
@@ -2703,26 +2689,15 @@ class TextWorldRolloutWorkerActor:
             if samples:
                 self.replay_buffer.add_samples.remote(samples)
 
-            invalid_actions_mean = (
-                sum(state.invalid_actions for state in states) / len(states)
-                if states else 0.0
-            )
             max_score = _textworld_max_score(states[0].infos) if states else 0.0
-            for state, grpo_reward in zip(states, grpo_rewards):
+            for state in states:
                 self.stats_actor.add_textworld_episode.remote(
                     self.worker_id,
-                    grpo_reward,
                     state.latest_score,
                     max_score,
                     bool(state.won),
                     len(state.step_records),
-                    state.env_steps,
                     state.invalid_actions,
-                    list(state.selected_response_lengths),
-                    grpo_group_reward_mean=group_reward_mean,
-                    grpo_group_reward_std=group_reward_std,
-                    grpo_advantage_std=advantage_std,
-                    grpo_invalid_actions_mean=invalid_actions_mean,
                 )
 
         finally:
@@ -2743,13 +2718,12 @@ class TextWorldRolloutWorkerActor:
         states: List[TextWorldTrajectoryState] = []
 
         try:
-            for batch_index in range(batch_size):
+            for _ in range(batch_size):
                 env = textworld.gym.make(env_id)
                 obs, infos = env.reset()
                 transcript_ids = self._initial_transcript_ids(obs, infos)
                 states.append(
                     TextWorldTrajectoryState(
-                        group_index=batch_index,
                         env=env,
                         obs=obs,
                         infos=dict(infos),
@@ -2769,77 +2743,25 @@ class TextWorldRolloutWorkerActor:
                     break
 
             samples = []
-            sample_by_episode_index = {}
             for state in states:
                 sample = self._build_textworld_episode_rl_sample(
                     step_records=state.step_records,
                 )
                 if sample is not None:
                     samples.append(sample)
-                    sample_by_episode_index[state.group_index] = sample
 
             if samples:
                 self.replay_buffer.add_samples.remote(samples)
 
-            invalid_actions_mean = (
-                sum(state.invalid_actions for state in states) / len(states)
-                if states else 0.0
-            )
             max_score = _textworld_max_score(states[0].infos) if states else 0.0
-            episode_returns = [
-                sum(record.reward for record in state.step_records)
-                for state in states
-            ]
-            for state, episode_return in zip(states, episode_returns):
-                sample = sample_by_episode_index.get(state.group_index)
-                valid_token_rewards = []
-                valid_token_advantages = []
-                if sample is not None:
-                    valid_token_rewards = [
-                        reward
-                        for reward, label in zip(sample.token_rewards[1:], sample.labels[1:])
-                        if label != -100
-                    ]
-                    valid_token_advantages = [
-                        advantage
-                        for advantage, label in zip(
-                            sample.token_advantages[1:],
-                            sample.labels[1:],
-                        )
-                        if label != -100
-                    ]
-                token_reward_mean = (
-                    sum(valid_token_rewards) / len(valid_token_rewards)
-                    if valid_token_rewards else None
-                )
-                raw_advantage_mean = (
-                    sum(valid_token_advantages) / len(valid_token_advantages)
-                    if valid_token_advantages else None
-                )
-                raw_advantage_std = None
-                if valid_token_advantages:
-                    assert raw_advantage_mean is not None
-                    raw_advantage_std = math.sqrt(
-                        sum(
-                            (advantage - raw_advantage_mean) ** 2
-                            for advantage in valid_token_advantages
-                        )
-                        / len(valid_token_advantages)
-                    )
+            for state in states:
                 self.stats_actor.add_textworld_episode.remote(
                     self.worker_id,
-                    episode_return,
                     state.latest_score,
                     max_score,
                     bool(state.won),
                     len(state.step_records),
-                    state.env_steps,
                     state.invalid_actions,
-                    list(state.selected_response_lengths),
-                    ppo_token_reward_mean=token_reward_mean,
-                    ppo_raw_advantage_mean=raw_advantage_mean,
-                    ppo_raw_advantage_std=raw_advantage_std,
-                    ppo_invalid_actions_mean=invalid_actions_mean,
                 )
 
         finally:
@@ -3024,6 +2946,10 @@ async def run_textworld_train(args: argparse.Namespace):
         f"tw_max_episode_steps={args.tw_max_episode_steps} "
         f"tw_history_token_window={args.tw_history_token_window} "
         f"max_length={args.max_length} "
+        f"train_packing={args.train_packing} "
+        f"train_token_budget={args.train_token_budget} "
+        f"train_pack_candidate_pool_size={args.train_pack_candidate_pool_size} "
+        f"train_logprob_mode={args.train_logprob_mode} "
         f"infer_tp_size={args.infer_tp_size} "
         f"infer_size={args.infer_size} "
         f"infer_max_tokens={args.infer_max_tokens} "
@@ -3143,7 +3069,6 @@ async def run_textworld_train(args: argparse.Namespace):
         ray.get(infer_actor.resume_generation.remote(increment_version=False))
         print("[sync] Initial full sync complete; generation can start.")
 
-        ray.get(infer_actor.start.remote())
         rollout_workers = [
             remote_rollout_worker.remote(
                 args,
@@ -3176,7 +3101,6 @@ async def run_textworld_train(args: argparse.Namespace):
         )
 
         sync_rounds = 0
-        last_sync_elapsed_seconds = None
         latest_optimizer_step = 0
         last_checkpoint_step = None
         training_reached_max = False
@@ -3210,104 +3134,15 @@ async def run_textworld_train(args: argparse.Namespace):
                 print("[train] No optimizer steps left; stopping sync loop.")
                 break
 
-            print(
-                "[train] Trainer segment complete: "
-                f"optimizer_step={rank0_summary['optimizer_step']} "
-                f"steps_run={rank0_summary['optimizer_steps_run']} "
-                f"last_loss={rank0_summary['last_loss']:.6f} "
-                f"reward_mean={rank0_summary['last_reward_mean']:.4f} "
-                f"adv_mean={rank0_summary['last_advantage_mean']:.4f} "
-                f"response_tokens={rank0_summary['last_response_tokens']:.0f} "
-                f"replay_size={rank0_summary['last_replay_size']} "
-                f"total_sampled={rank0_summary['last_total_sampled']} "
-                f"ppo_clip_frac={rank0_summary['last_ppo_clip_frac']:.4f} "
-                f"token_reward_mean={rank0_summary['last_token_reward_mean']:.4f} "
-                f"raw_adv_mean={rank0_summary['last_raw_advantage_mean']:.4f} "
-                f"raw_adv_std={rank0_summary['last_raw_advantage_std']:.4f} "
-                f"used_adv_mean={rank0_summary['last_used_advantage_mean']:.4f} "
-                f"used_adv_std={rank0_summary['last_used_advantage_std']:.4f} "
-                "old_new_kl_k3_token_mean="
-                f"{rank0_summary['last_old_new_kl_k3_token_mean']:.6f} "
-                "old_new_kl_k3_sample_sum_mean="
-                f"{rank0_summary['last_old_new_kl_k3_sample_sum_mean']:.6f} "
-                "old_new_kl_k3_loss="
-                f"{rank0_summary['last_old_new_kl_k3_loss']:.6f}"
-            )
             infer_delta_tokens = (
                 infer_stats_end["total_tokens"] - infer_stats_start["total_tokens"]
             )
-            infer_delta_requests = (
-                infer_stats_end["total_requests"]
-                - infer_stats_start["total_requests"]
-            )
             infer_tokens_per_sec = infer_delta_tokens / max(infer_elapsed, 1e-9)
-            infer_requests_per_sec = infer_delta_requests / max(infer_elapsed, 1e-9)
-            print(
-                "[infer-throughput] "
-                f"sync_round={sync_rounds} "
-                f"optimizer_step={rank0_summary['optimizer_step']} "
-                f"elapsed={infer_elapsed:.3f}s "
-                f"tokens={infer_delta_tokens} "
-                f"requests={infer_delta_requests} "
-                f"tokens_per_sec={infer_tokens_per_sec:.2f} "
-                f"requests_per_sec={infer_requests_per_sec:.2f} "
-                f"total_tokens={infer_stats_end['total_tokens']} "
-                f"total_requests={infer_stats_end['total_requests']}"
-            )
             replay_stats = ray.get([
                 worker.get_replay_stats.remote()
                 for worker in fsdp_workers
             ])
             rollout_stats = ray.get(stats_actor.get_stats.remote())
-            replay_sizes = ",".join(str(stats["size"]) for stats in replay_stats)
-            replay_received = ",".join(
-                str(stats["total_samples_added"])
-                for stats in replay_stats
-            )
-            replay_sampled = ",".join(
-                str(stats["total_samples_sampled"])
-                for stats in replay_stats
-            )
-            replay_evicted = ",".join(
-                str(stats["total_samples_evicted"])
-                for stats in replay_stats
-            )
-            print(
-                "[replay] "
-                f"sync_round={sync_rounds} "
-                f"sizes=[{replay_sizes}] "
-                f"total_received=[{replay_received}] "
-                f"total_sampled=[{replay_sampled}] "
-                f"total_evicted=[{replay_evicted}]"
-            )
-            print(
-                "[tw-train-stats] "
-                f"episodes={rollout_stats['tw_episode_count']:.0f} "
-                f"win_rate={rollout_stats['tw_win_rate']:.4f} "
-                f"normalized_score={rollout_stats['tw_normalized_score']:.4f} "
-                f"invalid_action_rate={rollout_stats['tw_invalid_action_rate']:.4f} "
-                f"env_steps_mean={rollout_stats['tw_env_steps_mean']:.2f} "
-                "selected_response_length_mean="
-                f"{rollout_stats['tw_selected_response_length_mean']:.2f}"
-            )
-            if args.rl_algorithm == "ppo":
-                print(
-                    "[ppo-rollout-stats] "
-                    f"token_reward_mean={rollout_stats['ppo_token_reward_mean']:.4f} "
-                    f"raw_advantage_mean={rollout_stats['ppo_raw_advantage_mean']:.4f} "
-                    f"raw_advantage_std={rollout_stats['ppo_raw_advantage_std']:.4f} "
-                    "invalid_actions_mean="
-                    f"{rollout_stats['ppo_invalid_actions_mean']:.2f}"
-                )
-            elif args.rl_algorithm == "grpo":
-                print(
-                    "[grpo-rollout-stats] "
-                    f"group_reward_mean={rollout_stats['grpo_group_reward_mean']:.4f} "
-                    f"group_reward_std={rollout_stats['grpo_group_reward_std']:.4f} "
-                    f"advantage_std={rollout_stats['grpo_advantage_std']:.4f} "
-                    "invalid_actions_mean="
-                    f"{rollout_stats['grpo_invalid_actions_mean']:.2f}"
-                )
             total_replay_size = sum(int(stats["size"]) for stats in replay_stats)
             total_replay_capacity = sum(int(stats["capacity"]) for stats in replay_stats)
             replay_fill_ratio = (
@@ -3318,45 +3153,47 @@ async def run_textworld_train(args: argparse.Namespace):
                 sum(float(summary["segment_loss_mean"]) for summary in summaries)
                 / len(summaries)
             )
-            episode_return_mean = (
-                sum(float(summary["segment_episode_return_mean"]) for summary in summaries)
-                / len(summaries)
-            )
-            old_new_kl_k3_token_mean = (
+            kl_token_mean = (
                 sum(
-                    float(summary["segment_old_new_kl_k3_token_mean"])
+                    float(summary["segment_kl_mean"])
                     for summary in summaries
                 )
                 / len(summaries)
             )
-            old_new_kl_k3_sample_sum_mean = (
+            clip_fraction = (
                 sum(
-                    float(summary["segment_old_new_kl_k3_sample_sum_mean"])
-                    for summary in summaries
-                )
-                / len(summaries)
-            )
-            old_new_kl_k3_loss = (
-                sum(
-                    float(summary["segment_old_new_kl_k3_loss"])
+                    float(summary["segment_clip_frac"])
                     for summary in summaries
                 )
                 / len(summaries)
             )
             version_lag_mean = (
                 sum(
-                    float(summary["train_sample_trainer_version_lag_mean"])
+                    float(summary["segment_version_lag_mean"])
                     for summary in summaries
                 )
                 / len(summaries)
             )
+            segment_valid_tokens = (
+                float(rank0_summary["segment_valid_tokens"])
+                if args.train_packing == "varlen"
+                else sum(
+                    float(summary["segment_valid_tokens"])
+                    for summary in summaries
+                )
+            )
+            train_tokens_per_sec = (
+                segment_valid_tokens
+                / max(train_segment_elapsed, 1e-9)
+            )
             optimizer_steps_per_sec = (
-                rank0_summary["optimizer_steps_run"] / max(train_segment_elapsed, 1e-9)
+                rank0_summary["optimizer_steps_run"]
+                / max(train_segment_elapsed, 1e-9)
             )
             tb_step = rank0_summary["optimizer_step"]
             writer.add_scalar(
-                "Rollout/GlobalRewardSumMean",
-                rollout_stats["global_reward_sum_mean"],
+                "TextWorld/NormalizedScore",
+                rollout_stats["tw_normalized_score"],
                 tb_step,
             )
             writer.add_scalar(
@@ -3365,65 +3202,8 @@ async def run_textworld_train(args: argparse.Namespace):
                 tb_step,
             )
             writer.add_scalar(
-                "TextWorld/NormalizedScore",
-                rollout_stats["tw_normalized_score"],
-                tb_step,
-            )
-            writer.add_scalar(
                 "TextWorld/InvalidActionRate",
                 rollout_stats["tw_invalid_action_rate"],
-                tb_step,
-            )
-            writer.add_scalar(
-                "TextWorld/EnvStepsMean",
-                rollout_stats["tw_env_steps_mean"],
-                tb_step,
-            )
-            if args.rl_algorithm == "ppo":
-                writer.add_scalar(
-                    "PPO/RolloutTokenRewardMean",
-                    rollout_stats["ppo_token_reward_mean"],
-                    tb_step,
-                )
-                writer.add_scalar(
-                    "PPO/RolloutRawAdvantageMean",
-                    rollout_stats["ppo_raw_advantage_mean"],
-                    tb_step,
-                )
-                writer.add_scalar(
-                    "PPO/RolloutRawAdvantageStd",
-                    rollout_stats["ppo_raw_advantage_std"],
-                    tb_step,
-                )
-                writer.add_scalar(
-                    "PPO/RolloutInvalidActionsMean",
-                    rollout_stats["ppo_invalid_actions_mean"],
-                    tb_step,
-                )
-            elif args.rl_algorithm == "grpo":
-                writer.add_scalar(
-                    "GRPO/GroupRewardMean",
-                    rollout_stats["grpo_group_reward_mean"],
-                    tb_step,
-                )
-                writer.add_scalar(
-                    "GRPO/GroupRewardStd",
-                    rollout_stats["grpo_group_reward_std"],
-                    tb_step,
-                )
-                writer.add_scalar(
-                    "GRPO/AdvantageStd",
-                    rollout_stats["grpo_advantage_std"],
-                    tb_step,
-                )
-                writer.add_scalar(
-                    "GRPO/InvalidActionsMean",
-                    rollout_stats["grpo_invalid_actions_mean"],
-                    tb_step,
-                )
-            writer.add_scalar(
-                "Rollout/ActiveWorkers",
-                rollout_stats["active_workers"],
                 tb_step,
             )
             writer.add_scalar("Replay/FillRatio", replay_fill_ratio, tb_step)
@@ -3432,32 +3212,15 @@ async def run_textworld_train(args: argparse.Namespace):
                 version_lag_mean,
                 tb_step,
             )
-            writer.add_scalar("Train/LossMeanAcrossRanks", train_loss_mean, tb_step)
-            if args.rl_algorithm == "ppo":
-                writer.add_scalar(
-                    "PPO/TrainEpisodeReturnMeanAcrossRanks",
-                    episode_return_mean,
-                    tb_step,
-                )
-            elif args.rl_algorithm == "grpo":
-                writer.add_scalar(
-                    "GRPO/TrainEpisodeReturnMeanAcrossRanks",
-                    episode_return_mean,
-                    tb_step,
-                )
+            writer.add_scalar(
+                "Rollout/ActiveWorkers",
+                rollout_stats["active_workers"],
+                tb_step,
+            )
+            writer.add_scalar("Train/Loss", train_loss_mean, tb_step)
             writer.add_scalar(
                 "KL/OldNewK3TokenMean",
-                old_new_kl_k3_token_mean,
-                tb_step,
-            )
-            writer.add_scalar(
-                "KL/OldNewK3SampleSumMean",
-                old_new_kl_k3_sample_sum_mean,
-                tb_step,
-            )
-            writer.add_scalar(
-                "KL/OldNewK3Loss",
-                old_new_kl_k3_loss,
+                kl_token_mean,
                 tb_step,
             )
             writer.add_scalar(
@@ -3465,6 +3228,7 @@ async def run_textworld_train(args: argparse.Namespace):
                 rank0_summary["learning_rate"],
                 tb_step,
             )
+            writer.add_scalar("Train/TokensPerSec", train_tokens_per_sec, tb_step)
             writer.add_scalar(
                 "Train/OptimizerStepsPerSec",
                 optimizer_steps_per_sec,
@@ -3473,10 +3237,18 @@ async def run_textworld_train(args: argparse.Namespace):
             if args.clip_mode == "ppo":
                 writer.add_scalar(
                     "Clip/PPOClipFrac",
-                    rank0_summary["last_ppo_clip_frac"],
+                    clip_fraction,
                     tb_step,
                 )
             writer.add_scalar("Infer/TokensPerSec", infer_tokens_per_sec, tb_step)
+            print(
+                "[metrics] "
+                f"step={tb_step} loss={train_loss_mean:.6f} "
+                f"kl={kl_token_mean:.6f} clip={clip_fraction:.4f} "
+                f"train_tokens_per_sec={train_tokens_per_sec:.2f} "
+                f"infer_tokens_per_sec={infer_tokens_per_sec:.2f} "
+                f"score={rollout_stats['tw_normalized_score']:.4f}"
+            )
             writer.flush()
 
             if (
@@ -3510,14 +3282,14 @@ async def run_textworld_train(args: argparse.Namespace):
             )
             ray.get(infer_actor.pause_and_wait_idle.remote())
 
-            last_sync_elapsed_seconds = await sync_weights_to_vllm(
+            sync_elapsed_seconds = await sync_weights_to_vllm(
                 infer_actor=infer_actor,
                 fsdp_workers=fsdp_workers,
                 scope="trainable",
                 transfer_world_size=transfer_world_size,
                 packed=True,
             )
-            writer.add_scalar("Sync/ElapsedSeconds", last_sync_elapsed_seconds, tb_step)
+            writer.add_scalar("Sync/ElapsedSeconds", sync_elapsed_seconds, tb_step)
             writer.flush()
             next_version = ray.get(
                 infer_actor.resume_generation.remote(increment_version=True)
@@ -3605,7 +3377,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--train-mode",
-        default="lm_head",
+        default="full",
         choices=("lm_head", "last_layer", "full"),
         help="Default lm_head mode is intended to validate the training loop.",
     )
@@ -3642,7 +3414,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rl-algorithm",
         type=str,
-        default="ppo",
+        default="grpo",
         choices=("ppo", "grpo"),
         help=(
             "RL rollout/advantage algorithm. 'ppo' uses token-level Monte Carlo "
@@ -3701,6 +3473,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
+        "--train-packing",
+        choices=["padded", "varlen"],
+        default="padded",
+        help=(
+            "Trainer batch layout. 'varlen' flattens independently sampled "
+            "RLSamples, uses FlashAttention 2 sequence boundaries, and "
+            "optimizes a global valid-response-token weighted objective."
+        ),
+    )
+    parser.add_argument(
+        "--train-token-budget",
+        type=int,
+        default=None,
+        help=(
+            "Maximum real tokens in one varlen training micro-batch. Required "
+            "with --train-packing varlen and must be >= --max-length."
+        ),
+    )
+    parser.add_argument(
+        "--train-pack-candidate-pool-size",
+        type=int,
+        default=None,
+        help=(
+            "Replay candidates retained locally for length-aware varlen packing. "
+            "Defaults to 4 * --batch-size."
+        ),
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=5000,
@@ -3717,7 +3517,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--grad-accum-steps", type=int, default=8)
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=8,
+        help=(
+            "Gradient accumulation microsteps. In varlen mode this is the "
+            "fixed number of packs prepared per rank for each optimizer step."
+        ),
+    )
     parser.add_argument(
         "--train-logprob-mode",
         type=str,
@@ -3727,10 +3535,8 @@ def parse_args() -> argparse.Namespace:
             "How the trainer computes per-token logprobs. "
             "'full_logits_ce' keeps the standard model forward but avoids "
             "materializing full log_softmax; "
-
-            "TODO: It hasn't been correctly implemented yet."
-            "'response_only_lm_head' is an "
-            "experimental path that applies the LM head only to response tokens."
+            "'response_only_lm_head' passes packed prediction indices through "
+            "the model-native logits_to_keep API and requires varlen packing."
         ),
     )
     parser.add_argument(
@@ -3905,7 +3711,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--infer-temperature",
         type=float,
-        default=0.7,
+        default=1.0,
         help="Sampling temperature for rollout generation.",
     )
     parser.add_argument(
@@ -3991,6 +3797,8 @@ def parse_args() -> argparse.Namespace:
     if args.replay_capacity is None:
         # args.replay_capacity = args.batch_size * 4
         args.replay_capacity = args.batch_size * args.grad_accum_steps * 4
+    if args.train_pack_candidate_pool_size is None:
+        args.train_pack_candidate_pool_size = args.batch_size * 4
     if args.replay_sample_timeout_seconds is None:
         args.replay_sample_timeout_seconds = 0.0
     if args.min_replay_size_per_rank is None:
@@ -4007,7 +3815,19 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def validate_varlen_training_options(args: argparse.Namespace) -> None:
+    if args.train_packing != "varlen":
+        return
+    if args.ppo_normalize_advantages:
+        raise ValueError(
+            "--ppo-normalize-advantages is not supported with "
+            "--train-packing varlen because the Varlen baseline uses a "
+            "global valid-response-token weighted objective."
+        )
+
+
 def validate_args(args: argparse.Namespace) -> None:
+    validate_varlen_training_options(args)
     if args.tw_game_limit is not None and args.tw_game_limit < 1:
         raise ValueError("--tw-game-limit must be >= 1 when set")
     if args.tw_max_episode_steps < 1:
@@ -4032,6 +3852,34 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--lr-warmup-steps must be >= 0")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
+    if args.train_pack_candidate_pool_size < 1:
+        raise ValueError("--train-pack-candidate-pool-size must be >= 1")
+    if args.train_packing == "varlen":
+        if args.train_token_budget is None:
+            raise ValueError(
+                "--train-token-budget is required with --train-packing varlen"
+            )
+        if args.train_token_budget < args.max_length:
+            raise ValueError(
+                "--train-token-budget must be >= --max-length in varlen mode; "
+                f"got {args.train_token_budget} < {args.max_length}"
+            )
+        if args.dtype == "float32":
+            raise ValueError(
+                "FlashAttention 2 varlen training requires float16, bfloat16, "
+                "or auto dtype"
+            )
+    elif args.train_token_budget is not None and args.train_token_budget < 1:
+        raise ValueError("--train-token-budget must be >= 1 when set")
+    if (
+        args.train_logprob_mode == "response_only_lm_head"
+        and args.train_packing != "varlen"
+    ):
+        raise ValueError(
+            "--train-logprob-mode response_only_lm_head requires "
+            "--train-packing varlen so tensor logits_to_keep can address "
+            "per-sample prediction positions"
+        )
     if args.replay_capacity < 1:
         raise ValueError("--replay-capacity must be >= 1")
     if args.min_replay_size_per_rank < 1:
