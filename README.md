@@ -35,7 +35,7 @@ If you only want to run the smallest working flow first, see [QUICKSTART.md](QUI
 | --- | --- |
 | `accerl_agent/run_agent_textworld.py` | Canonical launcher for Ray-safe TextWorld training startup. |
 | `accerl_agent/agent_textworld.py` | Full Ray + vLLM + FSDP online RL training implementation. |
-| `accerl_agent/ppo_data.py` | Canonical replay schemas, strict PPO validation, and detached token GAE. |
+| `accerl_agent/rl_data.py` | Canonical replay schemas, strict PPO validation, and detached scalar/batched token GAE. |
 | `accerl_agent/ppo_value.py` | Shared-backbone FP32 Value Head and Critic checkpoint helpers. |
 | `accerl_agent/textworld_local_infer.py` | Checks vLLM inference and TextWorld environment interaction without training. |
 | `accerl_agent/local_trainer.py` | Local dummy SFT smoke test for tokenizer/model/FSDP training paths. |
@@ -102,7 +102,7 @@ First, run the local multi-trainer smoke test. It does not depend on vLLM or Tex
 ```bash
 python accerl_agent/local_trainer.py \
   --model-path "$MODEL_PATH" \
-  --train-mode lm_head \
+  --train-mode full \
   --use-fsdp \
   --fsdp-world-size 2 \
   --max-steps 5 \
@@ -193,7 +193,7 @@ python -m accerl_agent.run_agent_textworld \
   --max-steps 2 \
   --max-sync-rounds 1 \
   --sync-every-optimizer-steps 1 \
-  --train-mode lm_head \
+  --train-mode full \
   --rl-algorithm ppo \
   --clip-mode ppo \
   --train-packing padded \
@@ -256,7 +256,7 @@ flowchart LR
     Trainer -->|"NCCL trainable weights"| Infer
 ```
 
-`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, selects trainable parameters according to `--train-mode`, and samples independent replay objects. It also owns a separately sharded FP32 Value Head. Padded PPO consumes the policy's final hidden states, computes current token values and detached TD(λ) targets when replay is sampled, and optimizes policy and Value losses over the same global response-token denominator. GRPO retains its padded and varlen paths. Weight synchronization to vLLM remains policy-only.
+`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, trains the full policy model, and samples independent replay objects. It also owns a separately sharded FP32 Value Head. Padded PPO uses native tensor `logits_to_keep` plus a temporary model-native LM-head hook, so only response/bootstrap logits and final hidden states are retained. It computes current values and batched detached TD(λ) targets when replay is sampled, then optimizes policy and Value losses over the same global response-token denominator. GRPO retains its padded and varlen paths. Weight synchronization to vLLM remains policy-only.
 
 `VLLMInferenceActor` handles rollout inference. It starts vLLM with dummy weights, waits for the initial full weight sync, pauses generation during later syncs, aborts requests when needed, updates weights, and then resumes generation.
 
@@ -338,7 +338,7 @@ prediction position. PPO rollout never stores values, returns, or advantages.
 | --- | --- |
 | `--model-path` | Local HuggingFace model path. |
 | `--dtype` | `auto`, `bfloat16`, `float16`, or `float32`. |
-| `--train-mode` | `lm_head`, `last_layer`, or `full`; start with `lm_head` when bringing up a new run. |
+| `--train-mode` | `full`; this is the only supported TextWorld trainer mode. |
 | `--tw-game-dir` | Directory containing TextWorld `.z8` games. |
 | `--tw-history-token-window` | Token limit for the episode transcript. |
 | `--max-length` | Maximum trainer-side sequence length; must be at least `--tw-history-token-window`. |
@@ -354,7 +354,7 @@ prediction position. PPO rollout never stores values, returns, or advantages.
 | `--ppo-normalize-advantages` | Normalize detached raw PPO advantages per microbatch across FSDP ranks; enabled by default. |
 | `--train-token-budget` | Maximum real tokens in a varlen pack; required for varlen and must be at least `--max-length`. |
 | `--train-pack-candidate-pool-size` | Replay candidate pool used for length-aware packing; defaults to four times `--batch-size`. |
-| `--train-logprob-mode` | `full_logits_ce` baseline, or `response_only_lm_head` to project only response prediction positions through native `logits_to_keep`; the latter requires varlen. |
+| `--train-logprob-mode` | GRPO logprob mode. Padded PPO always uses its native selected-position forward. |
 | `--grad-accum-steps` | Gradient accumulation steps. |
 | `--replay-capacity` | Maximum number of samples in each replay buffer. |
 | `--min-replay-size-per-rank` | Minimum replay size required before a trainer rank starts training. |

@@ -119,7 +119,7 @@ The example below starts 2 FSDP trainers and needs at least 2 visible GPUs:
 ```bash
 python accerl_agent/local_trainer.py \
   --model-path "$MODEL_PATH" \
-  --train-mode lm_head \
+  --train-mode full \
   --use-fsdp \
   --fsdp-world-size 2 \
   --max-steps 5 \
@@ -244,7 +244,7 @@ After the smoke test passes, scale one dimension at a time:
    `--train-token-budget`, `--batch-size`, and
    `--train-pack-candidate-pool-size` together.
 4. Increase `--grad-accum-steps` if more effective batch size is needed.
-5. Move from `--train-mode lm_head` to `last_layer`, then finally to `full`.
+5. Keep `--train-mode full`; partial policy training modes are unsupported.
 6. Tune `--sync-every-optimizer-steps` and `--replay-capacity` to control sample staleness.
 
 Watch these metrics first:
@@ -295,11 +295,8 @@ parameters but is not a full training-resume checkpoint.
 
 ## 8. Change Models
 
-When switching models, start with the smallest trainable scope:
-
-1. `--train-mode lm_head`
-2. `--train-mode last_layer`
-3. `--train-mode full`
+When switching models, use `--train-mode full`; partial policy training modes
+are unsupported by the TextWorld trainer.
 
 For non-Qwen or non-Qwen-MoE style models, carefully check:
 

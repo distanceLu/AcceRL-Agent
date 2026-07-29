@@ -229,3 +229,132 @@ def compute_token_gae(
 
     returns = values + advantages
     return advantages.detach(), returns.detach(), deltas.detach()
+
+
+def _parallel_reverse_affine_scan(
+    deltas: torch.Tensor,
+    coefficients: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate ``b_t + a_t * x_(t+1)`` recurrences in O(log T) stages."""
+    accumulated_coefficients = coefficients
+    accumulated_values = deltas
+    width = deltas.shape[1]
+    offset = 1
+    while offset < width:
+        composed_values = (
+            accumulated_values[:, :-offset]
+            + accumulated_coefficients[:, :-offset]
+            * accumulated_values[:, offset:]
+        )
+        composed_coefficients = (
+            accumulated_coefficients[:, :-offset]
+            * accumulated_coefficients[:, offset:]
+        )
+        accumulated_values = torch.cat(
+            (composed_values, accumulated_values[:, -offset:]),
+            dim=1,
+        )
+        accumulated_coefficients = torch.cat(
+            (
+                composed_coefficients,
+                accumulated_coefficients[:, -offset:],
+            ),
+            dim=1,
+        )
+        offset *= 2
+    return accumulated_values
+
+
+def compute_batched_token_gae(
+    rewards: torch.Tensor,
+    baseline_values: torch.Tensor,
+    valid_mask: torch.Tensor,
+    terminated: torch.Tensor,
+    truncated: torch.Tensor,
+    bootstrap_values: torch.Tensor,
+    *,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute detached token GAE for left-aligned dense episode timelines."""
+    dense_tensors = {
+        "rewards": rewards,
+        "baseline_values": baseline_values,
+        "valid_mask": valid_mask,
+        "terminated": terminated,
+        "truncated": truncated,
+    }
+    for name, tensor in dense_tensors.items():
+        if tensor.ndim != 2:
+            raise ValueError(f"{name} must have shape [batch, time].")
+    if any(tensor.shape != rewards.shape for tensor in dense_tensors.values()):
+        raise ValueError("All dense token GAE inputs must have the same shape.")
+    if rewards.shape[0] < 1 or rewards.shape[1] < 1:
+        raise ValueError("Batched token GAE requires a non-empty batch and time axis.")
+    if bootstrap_values.shape != (rewards.shape[0],):
+        raise ValueError("bootstrap_values must have shape [batch].")
+    if not 0.0 <= gamma:
+        raise ValueError("gamma must be non-negative.")
+    if not 0.0 <= gae_lambda <= 1.0:
+        raise ValueError("gae_lambda must be in [0, 1].")
+
+    valid = valid_mask.detach().bool()
+    terminal = terminated.detach().bool()
+    truncation = truncated.detach().bool()
+    if terminal.logical_and(truncation).any():
+        raise ValueError("A token cannot be both terminated and truncated.")
+    if terminal.logical_or(truncation).logical_and(~valid).any():
+        raise ValueError("Episode boundaries must be valid response tokens.")
+    valid_counts = valid.sum(dim=1)
+    if valid_counts.eq(0).any():
+        raise ValueError("Every batched GAE row requires a response token.")
+    expected_valid = (
+        torch.arange(valid.shape[1], device=valid.device).unsqueeze(0)
+        < valid_counts.unsqueeze(1)
+    )
+    if not torch.equal(valid, expected_valid):
+        raise ValueError("Batched GAE valid masks must be left-aligned.")
+    boundary = terminal.logical_or(truncation)
+    if boundary.sum(dim=1).ne(1).any():
+        raise ValueError("Every batched GAE row requires exactly one boundary.")
+    row_indices = torch.arange(valid.shape[0], device=valid.device)
+    final_indices = valid_counts - 1
+    if not boundary[row_indices, final_indices].all():
+        raise ValueError("Each episode boundary must be on its final token.")
+
+    values = baseline_values.detach().float()
+    rewards_float = rewards.detach().float()
+    bootstrap = bootstrap_values.detach().float()
+    next_values = torch.zeros_like(values)
+    if values.shape[1] > 1:
+        next_values[:, :-1] = values[:, 1:]
+    next_values[row_indices, final_indices] = bootstrap
+
+    bootstrap_mask = (~terminal).to(torch.float32)
+    deltas = (
+        rewards_float
+        + float(gamma) * bootstrap_mask * next_values
+        - values
+    )
+    deltas = torch.where(valid, deltas, torch.zeros_like(deltas))
+    trace_coefficients = (
+        float(gamma)
+        * float(gae_lambda)
+        * (~(terminal | truncation)).to(torch.float32)
+        * valid.to(torch.float32)
+    )
+    advantages = _parallel_reverse_affine_scan(
+        deltas,
+        trace_coefficients,
+    )
+    advantages = torch.where(
+        valid,
+        advantages,
+        torch.zeros_like(advantages),
+    )
+    returns = torch.where(
+        valid,
+        values + advantages,
+        torch.zeros_like(values),
+    )
+    return advantages.detach(), returns.detach(), deltas.detach()

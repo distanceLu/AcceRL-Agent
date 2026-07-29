@@ -59,7 +59,7 @@ from accerl_agent.rl_data import (
     RLSample,
     RawPPOSample,
     TerminationReason,
-    compute_token_gae,
+    compute_batched_token_gae,
     validate_raw_ppo_sample,
 )
 
@@ -77,6 +77,84 @@ def find_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("", 0))
         return sock.getsockname()[1]
+
+
+def wait_for_selected_ray_actor_debugger(role: str, rank: int) -> None:
+    """Wait for debugpy in the Ray actor selected through the environment."""
+    selected_role_value = os.environ.get("ACCERL_DEBUG_ROLE", "").strip().lower()
+    if not selected_role_value:
+        return
+
+    valid_roles = {"trainer", "infer", "rollout", "replay"}
+    if selected_role_value == "all":
+        selected_roles = valid_roles
+    else:
+        selected_roles = {
+            "replay" if item.strip() == "replaybuffer" else item.strip()
+            for item in selected_role_value.split(",")
+            if item.strip()
+        }
+    invalid_roles = selected_roles - valid_roles
+    if not selected_roles or invalid_roles:
+        raise ValueError(
+            "ACCERL_DEBUG_ROLE must be trainer, infer, rollout, replay "
+            "(or replaybuffer), all, or a comma-separated combination; "
+            f"got {selected_role_value!r}"
+        )
+    if role not in selected_roles:
+        return
+
+    if role == "infer":
+        selected_rank = 0
+    else:
+        debug_rank_value = os.environ.get("ACCERL_DEBUG_RANK", "0")
+        try:
+            selected_rank = int(debug_rank_value)
+        except ValueError as exc:
+            raise ValueError(
+                "ACCERL_DEBUG_RANK must be an integer, "
+                f"got {debug_rank_value!r}"
+            ) from exc
+    if rank != selected_rank:
+        return
+
+    try:
+        import debugpy
+    except ImportError as exc:
+        raise RuntimeError(
+            "ACCERL_DEBUG_ROLE is set, but debugpy is not installed in the "
+            "Ray actor environment. Install it with `python -m pip install "
+            "debugpy`."
+        ) from exc
+
+    debug_host = os.environ.get("ACCERL_DEBUG_HOST", "127.0.0.1")
+    default_ports = {
+        "trainer": 5678,
+        "infer": 5679,
+        "rollout": 5680,
+        "replay": 5681,
+    }
+    role_port_variable = f"ACCERL_DEBUG_{role.upper()}_PORT"
+    debug_port_value = os.environ.get(
+        role_port_variable,
+        os.environ.get("ACCERL_DEBUG_PORT", str(default_ports[role])),
+    )
+    try:
+        debug_port = int(debug_port_value)
+    except ValueError as exc:
+        raise ValueError(
+            "ACCERL_DEBUG_PORT must be an integer, "
+            f"got {debug_port_value!r}"
+        ) from exc
+
+    debugpy.listen((debug_host, debug_port))
+    print(
+        f"[debug] {role} rank {rank} waiting for debugger at "
+        f"{debug_host}:{debug_port}...",
+        flush=True,
+    )
+    debugpy.wait_for_client()
+    print(f"[debug] {role} rank {rank} debugger attached.", flush=True)
 
 
 @dataclass
@@ -335,25 +413,10 @@ def select_varlen_pack(
 
 
 def configure_trainable_parameters(model, train_mode: str) -> None:
-    if train_mode == "full":
-        for param in model.parameters():
-            param.requires_grad = True
-        return
-
-    for param in model.parameters():
-        param.requires_grad = False
-
-    if train_mode == "lm_head":
-        target_keywords = ("lm_head",)
-    elif train_mode == "last_layer":
-        num_layers = len(getattr(model.model, "layers"))
-        target_keywords = (f"model.layers.{num_layers - 1}.", "lm_head")
-    else:
+    if train_mode != "full":
         raise ValueError(f"Unsupported train mode: {train_mode}")
-
-    for name, param in model.named_parameters():
-        if any(keyword in name for keyword in target_keywords):
-            param.requires_grad = True
+    for param in model.parameters():
+        param.requires_grad = True
 
 
 def iter_trainable_parameters(model) -> Iterable:
@@ -439,6 +502,87 @@ def build_model(args: argparse.Namespace, device, torch_dtype, log: bool = True)
         model.gradient_checkpointing_enable()
 
     return model
+
+
+def validate_ppo_selected_forward_support(model, args) -> None:
+    """Reject PPO policies that cannot provide selected logits and hidden."""
+    if args.rl_algorithm != "ppo":
+        return
+    forward_parameters = inspect.signature(model.forward).parameters
+    if "logits_to_keep" not in forward_parameters:
+        raise RuntimeError(
+            "Padded PPO requires a model forward with explicit tensor "
+            "logits_to_keep support; no full-logits fallback is provided."
+        )
+    lm_head = getattr(model, "lm_head", None)
+    if not isinstance(lm_head, torch.nn.Module):
+        raise RuntimeError(
+            "Padded PPO requires a model-native lm_head module so the "
+            "selected final hidden states can be captured."
+        )
+
+
+def run_selected_causal_lm_forward(
+    model,
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    selected_positions: torch.Tensor,
+):
+    """Run the full CausalLM root and retain only selected logits/hidden."""
+    captured_lm_head_inputs = []
+
+    def capture_lm_head_input(_module, module_inputs):
+        if len(module_inputs) != 1:
+            raise RuntimeError(
+                "PPO expected the model-native lm_head to receive one "
+                "selected hidden-state tensor."
+            )
+        captured_lm_head_inputs.append(module_inputs[0])
+
+    hook_handle = model.lm_head.register_forward_pre_hook(
+        capture_lm_head_input
+    )
+    try:
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=False,
+            output_router_logits=False,
+            return_dict=True,
+            logits_to_keep=selected_positions,
+        )
+    finally:
+        hook_handle.remove()
+
+    if len(captured_lm_head_inputs) != 1:
+        raise RuntimeError(
+            "PPO selected-position forward requires exactly one "
+            "model-native lm_head invocation; got "
+            f"{len(captured_lm_head_inputs)}."
+        )
+    if outputs.hidden_states is not None:
+        raise RuntimeError(
+            "PPO selected-position forward unexpectedly retained all "
+            "model hidden states."
+        )
+    selected_hidden = captured_lm_head_inputs[0]
+    expected_prefix = (
+        input_ids.shape[0],
+        selected_positions.numel(),
+    )
+    if tuple(outputs.logits.shape[:2]) != expected_prefix:
+        raise RuntimeError(
+            "Unexpected selected PPO logits shape: "
+            f"{tuple(outputs.logits.shape[:2])} != {expected_prefix}"
+        )
+    if tuple(selected_hidden.shape[:2]) != expected_prefix:
+        raise RuntimeError(
+            "Unexpected selected PPO hidden shape: "
+            f"{tuple(selected_hidden.shape[:2])} != {expected_prefix}"
+        )
+    return outputs, selected_hidden
 
 
 def iter_vllm_loadable_weights(name: str, tensor: torch.Tensor):
@@ -543,6 +687,8 @@ class FSDPTrainWorker:
         self.fsdp_world_size = fsdp_world_size
         self.replay_buffer = replay_buffer
 
+        wait_for_selected_ray_actor_debugger("trainer", rank)
+
         os.environ["MASTER_ADDR"] = fsdp_master_addr
         os.environ["MASTER_PORT"] = str(fsdp_master_port)
 
@@ -560,6 +706,8 @@ class FSDPTrainWorker:
         self.grpo_collate_fn = make_grpo_collate_fn(self.tokenizer)
         torch_dtype = pick_dtype(args.dtype)
         model = build_model(args, self.device, torch_dtype, log=rank == 0)
+        # 验证取hidden_state和logits的forward是否支持selected_positions参数,同时计算 Policy logits 和 PPO value
+        validate_ppo_selected_forward_support(model, args)
         configure_trainable_parameters(model, args.train_mode)
         log_parameter_count(model, args.train_mode, rank=rank)
 
@@ -1314,29 +1462,6 @@ class FSDPTrainWorker:
             raise RuntimeError("No valid response tokens found for PPO loss.")
         valid_batch_indices = valid_positions[:, 0]
         valid_prediction_positions = valid_positions[:, 1]
-
-        outputs = self.model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            use_cache=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        logits = outputs.logits[:, :-1, :]
-        valid_token_log_probs = self._valid_token_log_probs_from_full_logits(
-            logits,
-            labels,
-            response_mask,
-        ).float()
-        valid_old_logprobs = batch["old_logprobs"][:, 1:][
-            response_mask
-        ].float()
-
-        final_hidden = outputs.hidden_states[-1]
-        response_hidden = final_hidden[
-            valid_batch_indices,
-            valid_prediction_positions,
-        ]
         bootstrap_positions = batch["bootstrap_prediction_positions"]
         bootstrap_mask = bootstrap_positions.ge(0)
         bootstrap_batch_indices = bootstrap_mask.nonzero(
@@ -1350,9 +1475,56 @@ class FSDPTrainWorker:
                 >= sequence_lengths[bootstrap_batch_indices]
             ).any():
                 raise RuntimeError("PPO bootstrap position exceeds sequence length.")
-            bootstrap_hidden = final_hidden[
-                bootstrap_batch_indices,
+        else:
+            selected_bootstrap_positions = bootstrap_positions.new_empty(
+                (0,)
+            )
+
+        selected_positions = torch.unique(
+            torch.cat(
+                (
+                    valid_prediction_positions,
+                    selected_bootstrap_positions,
+                )
+            ),
+            sorted=True,
+        )
+        outputs, selected_hidden = run_selected_causal_lm_forward(
+            self.model,
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            selected_positions=selected_positions,
+        )
+
+        response_columns = torch.searchsorted(
+            selected_positions,
+            valid_prediction_positions,
+        )
+        valid_logits = outputs.logits[
+            valid_batch_indices,
+            response_columns,
+        ]
+        valid_labels = labels[response_mask]
+        valid_token_log_probs = -F.cross_entropy(
+            valid_logits,
+            valid_labels,
+            reduction="none",
+        ).float()
+        valid_old_logprobs = batch["old_logprobs"][:, 1:][
+            response_mask
+        ].float()
+        response_hidden = selected_hidden[
+            valid_batch_indices,
+            response_columns,
+        ]
+        if bootstrap_batch_indices.numel() > 0:
+            bootstrap_columns = torch.searchsorted(
+                selected_positions,
                 selected_bootstrap_positions,
+            )
+            bootstrap_hidden = selected_hidden[
+                bootstrap_batch_indices,
+                bootstrap_columns,
             ]
         else:
             bootstrap_hidden = response_hidden.new_empty(
@@ -1376,40 +1548,62 @@ class FSDPTrainWorker:
                 num_response_values:
             ]
 
-        raw_advantage_parts = []
-        return_parts = []
-        delta_parts = []
-        value_offset = 0
+        response_counts = response_mask.sum(dim=1)
+        dense_width = response_mask.shape[1]
+        dense_valid_mask = (
+            torch.arange(dense_width, device=response_mask.device).unsqueeze(0)
+            < response_counts.unsqueeze(1)
+        )
+        response_ordinals = response_mask.long().cumsum(dim=1) - 1
+        valid_response_ordinals = response_ordinals[response_mask]
+        dense_values = current_values.new_zeros(
+            (response_mask.shape[0], dense_width)
+        )
+        dense_values[
+            valid_batch_indices,
+            valid_response_ordinals,
+        ] = current_values
         shifted_rewards = batch["token_rewards"][:, 1:]
         shifted_terminated = batch["token_terminated"][:, 1:]
         shifted_truncated = batch["token_truncated"][:, 1:]
-        for sample_index in range(response_mask.shape[0]):
-            sample_mask = response_mask[sample_index]
-            sample_token_count = int(sample_mask.sum().item())
-            sample_values = current_values[
-                value_offset:value_offset + sample_token_count
-            ]
-            value_offset += sample_token_count
-            sample_advantages, sample_returns, sample_deltas = (
-                compute_token_gae(
-                    rewards=shifted_rewards[sample_index][sample_mask],
-                    baseline_values=sample_values.detach(),
-                    terminated=shifted_terminated[sample_index][sample_mask],
-                    truncated=shifted_truncated[sample_index][sample_mask],
-                    bootstrap_value=bootstrap_values[sample_index].detach(),
-                    gamma=self.args.tw_gamma,
-                    gae_lambda=self.args.gae_lambda,
-                )
+        dense_rewards = dense_values.new_zeros(dense_values.shape)
+        dense_terminated = torch.zeros_like(
+            dense_valid_mask,
+            dtype=torch.bool,
+        )
+        dense_truncated = torch.zeros_like(
+            dense_valid_mask,
+            dtype=torch.bool,
+        )
+        dense_rewards[
+            valid_batch_indices,
+            valid_response_ordinals,
+        ] = shifted_rewards[response_mask]
+        dense_terminated[
+            valid_batch_indices,
+            valid_response_ordinals,
+        ] = shifted_terminated[response_mask]
+        dense_truncated[
+            valid_batch_indices,
+            valid_response_ordinals,
+        ] = shifted_truncated[response_mask]
+        dense_advantages, dense_returns, dense_deltas = (
+            compute_batched_token_gae(
+                rewards=dense_rewards,
+                baseline_values=dense_values,
+                valid_mask=dense_valid_mask,
+                terminated=dense_terminated,
+                truncated=dense_truncated,
+                bootstrap_values=bootstrap_values,
+                gamma=self.args.tw_gamma,
+                gae_lambda=self.args.gae_lambda,
             )
-            raw_advantage_parts.append(sample_advantages)
-            return_parts.append(sample_returns)
-            delta_parts.append(sample_deltas)
-        if value_offset != num_response_values:
-            raise RuntimeError("PPO value/token alignment mismatch.")
-
-        raw_advantages = torch.cat(raw_advantage_parts).detach()
-        returns = torch.cat(return_parts).detach()
-        deltas = torch.cat(delta_parts).detach()
+        )
+        raw_advantages = dense_advantages[dense_valid_mask]
+        returns = dense_returns[dense_valid_mask]
+        deltas = dense_deltas[dense_valid_mask]
+        if raw_advantages.numel() != num_response_values:
+            raise RuntimeError("PPO batched GAE value/token alignment mismatch.")
         if (
             raw_advantages.requires_grad
             or returns.requires_grad
@@ -2538,7 +2732,9 @@ class StatsActor:
 class ReplayBufferActor:
     """Replay buffer that stores rollout-produced RL samples."""
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, rank: int):
+        self.rank = int(rank)
+        wait_for_selected_ray_actor_debugger("replay", self.rank)
         self.samples = deque(maxlen=capacity)
         self.total_samples_added = 0
         self.total_samples_sampled = 0
@@ -2765,6 +2961,7 @@ class VLLMInferenceActor:
     """GPU Ray actor that owns vLLM and consumes tokenized rollout requests."""
 
     def __init__(self, args: argparse.Namespace):
+        wait_for_selected_ray_actor_debugger("infer", 0)
         engine_kwargs = dict(
             model=args.model_path,
             trust_remote_code=args.trust_remote_code,
@@ -3136,6 +3333,7 @@ class TextWorldRolloutWorkerActor:
         self.worker_id = int(worker_id)
         self.replay_buffer = replay_buffer
         self.stats_actor = stats_actor
+        wait_for_selected_ray_actor_debugger("rollout", self.worker_id)
         self.tokenizer = build_tokenizer(args, log=False)
         self.game_files = load_textworld_game_files(args)
         self.stopped = False
@@ -3325,6 +3523,7 @@ class TextWorldRolloutWorkerActor:
                     infer_max_tokens,
                 )
             )
+            # 当前 TextWorld step 中“已经提交推理、但结果尚未返回”的请求上下文列表。
             pending.append(
                 TextWorldPendingRequest(
                     state=state,
@@ -3860,6 +4059,8 @@ async def run_textworld_train(args: argparse.Namespace):
         f"train_token_budget={args.train_token_budget} "
         f"train_pack_candidate_pool_size={args.train_pack_candidate_pool_size} "
         f"train_logprob_mode={args.train_logprob_mode} "
+        "ppo_forward_mode="
+        f"{'selected_positions' if args.rl_algorithm == 'ppo' else 'inactive'} "
         f"infer_tp_size={args.infer_tp_size} "
         f"infer_size={args.infer_size} "
         f"infer_max_tokens={args.infer_max_tokens} "
@@ -3893,8 +4094,11 @@ async def run_textworld_train(args: argparse.Namespace):
         fsdp_master_port = args.fsdp_master_port or find_open_port()
 
         replay_buffers = [
-            ReplayBufferActor.remote(capacity=args.replay_capacity)
-            for _ in range(args.fsdp_world_size)
+            ReplayBufferActor.remote(
+                capacity=args.replay_capacity,
+                rank=rank,
+            )
+            for rank in range(args.fsdp_world_size)
         ]
         stats_actor = StatsActor.remote(
             window_size=args.metrics_window_size,
@@ -4351,8 +4555,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-mode",
         default="full",
-        choices=("lm_head", "last_layer", "full"),
-        help="Default lm_head mode is intended to validate the training loop.",
+        choices=("full",),
+        help="Train the full policy model. This is the only supported mode.",
     )
     parser.add_argument(
         "--tw-game-dir",
@@ -4506,7 +4710,8 @@ def parse_args() -> argparse.Namespace:
         default="full_logits_ce",
         choices=["full_logits_ce", "response_only_lm_head"],
         help=(
-            "How the trainer computes per-token logprobs. "
+            "How GRPO computes per-token logprobs. Padded PPO always uses "
+            "the native selected-position logits_to_keep path. "
             "'full_logits_ce' keeps the standard model forward but avoids "
             "materializing full log_softmax; "
             "'response_only_lm_head' passes packed prediction indices through "
