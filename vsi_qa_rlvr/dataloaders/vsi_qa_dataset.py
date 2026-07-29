@@ -56,9 +56,11 @@ class VSIQADataset(Dataset):
         video_info = row["videos"][0]
         frame_paths = video_info["video"]
         system_message, user_message = row["prompt"]
+        question = user_message["content"][len("<video>\n"):]
         return {
             "row_index": row_index,
             "sample_id": row["sample_id"],
+            "question": question,
             "messages": [
                 system_message,
                 {
@@ -67,7 +69,7 @@ class VSIQADataset(Dataset):
                         {"type": "video"},
                         {
                             "type": "text",
-                            "text": user_message["content"][len("<video>\n"):],
+                            "text": question,
                         },
                     ],
                 },
