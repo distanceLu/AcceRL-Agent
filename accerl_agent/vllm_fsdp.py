@@ -55,18 +55,9 @@ from vllm.distributed.weight_transfer.nccl_engine import (
 from vllm.v1.executor import Executor
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# TODO: Remove this project-root sys.path injection after accerl_agent is
-# packaged and all framework entrypoints use module-based imports.
-PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
-if PROJECT_DIR not in sys.path:
-    sys.path.insert(0, PROJECT_DIR)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from accerl_agent.vllm_weight_converter import (
-    get_qwen3vl_weight_metadata,
-    iter_qwen3vl_kernel_weights,
-)
 from scripts.drgrpo_grader import r1_zero_reward_fn
 
 MODEL_NAME = "/mnt/data/lcx4/hf_cache/Qwen1.5-MoE-A2.7B-Chat"
@@ -390,30 +381,21 @@ class FSDPTrainWorker:
         log_parameter_count(model, args.train_mode, rank=rank)
 
         named_parameters = list(model.named_parameters())
-        trainable_parameters = [
-            (name, param)
-            for name, param in named_parameters
-            if param.requires_grad
-        ]
-        model_type = model.config.model_type
-        if model_type == "qwen3_vl":
-            self.vllm_weight_converter = iter_qwen3vl_kernel_weights
-            self.vllm_is_checkpoint_format = False
-            self.weight_metadata_by_scope = {
-                "all": get_qwen3vl_weight_metadata(named_parameters),
-                "trainable": get_qwen3vl_weight_metadata(trainable_parameters),
-            }
-        elif model_type == "qwen2_moe":
-            self.vllm_weight_converter = None
-            self.vllm_is_checkpoint_format = True
-            self.weight_metadata_by_scope = {
-                "all": get_vllm_weight_metadata(named_parameters),
-                "trainable": get_vllm_weight_metadata(trainable_parameters),
-            }
-        else:
-            raise ValueError(f"Unsupported model type: {model_type!r}")
         all_param_names = [name for name, _ in named_parameters]
-        trainable_param_names = [name for name, _ in trainable_parameters]
+        trainable_param_names = [
+            name for name, param in named_parameters if param.requires_grad
+        ]
+        self.vllm_is_checkpoint_format = True
+        self.weight_metadata_by_scope = {
+            "all": get_vllm_weight_metadata(named_parameters),
+            "trainable": get_vllm_weight_metadata(
+                [
+                    (name, param)
+                    for name, param in named_parameters
+                    if param.requires_grad
+                ]
+            ),
+        }
 
         for layer in model.model.layers:
             fully_shard(layer)
@@ -917,22 +899,14 @@ class FSDPTrainWorker:
             def _full_param_iter():
                 for name, param in params:
                     full_param = param.full_tensor().detach()
-                    yield name, full_param
-
-            def _vllm_weight_iter():
-                weights = _full_param_iter()
-                if self.vllm_weight_converter is not None:
-                    yield from self.vllm_weight_converter(weights)
-                    return
-                for name, tensor in weights:
-                    yield from iter_vllm_loadable_weights(name, tensor)
+                    yield from iter_vllm_loadable_weights(name, full_param)
 
             trainer_args = NCCLTrainerSendWeightsArgs(
                 group=self.model_update_group,
                 packed=packed,
             )
             NCCLWeightTransferEngine.trainer_send_weights(
-                iterator=_vllm_weight_iter(),
+                iterator=_full_param_iter(),
                 trainer_args=trainer_args,
             )
         else:

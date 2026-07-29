@@ -11,11 +11,8 @@ from transformers import AutoModelForImageTextToText
 
 from accerl_agent.vllm_fsdp import (
     FSDPTrainWorker,
+    get_vllm_weight_metadata,
     set_seed,
-)
-from accerl_agent.vllm_weight_converter import (
-    get_qwen3vl_weight_metadata,
-    get_vllm_weight_converter,
 )
 from vsi_qa_rlvr.dataloaders.qwen3vl_rl_collator import Qwen3VLRLDataCollator
 
@@ -86,11 +83,8 @@ class VSIQAFSDPTrainWorker(FSDPTrainWorker):
         model.train()
 
         named_parameters = list(model.named_parameters())
-        self.vllm_weight_converter = get_vllm_weight_converter(
-            model.config.model_type
-        )
-        self.vllm_is_checkpoint_format = self.vllm_weight_converter is None
-        weight_metadata = get_qwen3vl_weight_metadata(named_parameters)
+        self.vllm_is_checkpoint_format = True
+        weight_metadata = get_vllm_weight_metadata(named_parameters)
         self.weight_metadata_by_scope = {
             "all": weight_metadata,
             "trainable": weight_metadata,

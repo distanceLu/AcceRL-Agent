@@ -24,9 +24,6 @@ from accerl_agent.vllm_fsdp import (
 ROLLOUT_ATTENTION_BACKENDS = ("TRITON_ATTN", "FLASH_ATTN")
 
 
-def _disable_model_gradients(model):
-    model.requires_grad_(False)
-
 
 def _build_attempt_engine_input(llm_input, output_tokens):
     """Restart one generation attempt from an already rendered EngineInput."""
@@ -90,18 +87,7 @@ class VSIQAVLLMInferenceActor(VLLMInferenceActor):
         )
 
     async def start_weight_update(self):
-        if self.args.infer_tp_size != 1:
-            raise RuntimeError(
-                "Qwen3-VL kernel-format weight sync currently requires "
-                f"infer TP=1, got TP={self.args.infer_tp_size}."
-            )
-        if not getattr(self, "_kernel_weight_update_ready", False):
-            await self.engine.collective_rpc(
-                "apply_model",
-                args=(_disable_model_gradients,),
-            )
-            self._kernel_weight_update_ready = True
-        await self.engine.start_weight_update(is_checkpoint_format=False)
+        await self.engine.start_weight_update()
 
     async def _change_active_attempts(self, delta):
         async with self.active_changed:
