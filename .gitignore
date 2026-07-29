@@ -77,6 +77,6 @@ triton_cache/
 accerl_agent/data/*
 accerl_agent/tests/*
 
-# Local AcceRL adaptation and preserved problem snapshot
+# Preserved local migration snapshots; vsi_qa_rlvr is tracked training code
 /accerl_rlvr/
 /accerl_rlvr_bug/
