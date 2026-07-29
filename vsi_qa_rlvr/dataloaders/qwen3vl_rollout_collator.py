@@ -134,7 +134,6 @@ class Qwen3VLRolloutDataCollator:
             batch.append(
                 {
                     "sample_id": item["sample_id"],
-                    "question": item["question"],
                     "reward_model": item["reward_model"],
                     "extra_info": item["extra_info"],
                     "llm_input": llm_input,

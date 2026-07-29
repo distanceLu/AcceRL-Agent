@@ -62,7 +62,7 @@ python -m vsi_qa_rlvr.main \
   --rollout-data-batch-size 1 \
   --rollout-data-workers 1 \
   --rollout-prefetch-factor 2 \
-  --rollout-batch-size 8 \
+  --rollout-n 8 \
   --rollout-stop-timeout 600 \
   --infer-max-tokens 512 \
   --infer-temperature 1.0 \
