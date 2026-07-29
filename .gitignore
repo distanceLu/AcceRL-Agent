@@ -77,3 +77,6 @@ triton_cache/
 accerl_agent/data/*
 accerl_agent/tests/*
 
+# Local AcceRL adaptation and preserved problem snapshot
+/accerl_rlvr/
+/accerl_rlvr_bug/
