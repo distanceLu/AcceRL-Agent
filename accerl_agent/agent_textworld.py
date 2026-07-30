@@ -3383,8 +3383,8 @@ class InterruptibleGenerationRunner:
     def __init__(
         self,
         engine,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
         stop_sequences: List[str] | None = None,
         collect_logprobs: bool = False,
         max_resubmit_retries: int = 200,
@@ -3683,7 +3683,7 @@ class TextWorldTrajectoryState:
     latest_score: float
     step_records: List[TextWorldStepRecord] = field(default_factory=list)
     transcript_ids: List[int] = field(default_factory=list)
-    invalid_actions: int = 0 # 非法动作的个数，感觉可以去掉
+    invalid_actions: int = 0
     done: bool = False
     won: bool = False
     lost: bool = False
@@ -3972,7 +3972,6 @@ class TextWorldRolloutWorkerActor:
         self,
         pending: TextWorldPendingRequest,
         result: InferenceResult,
-        invalid_reward_mode: Literal["zero", "ppo_penalty"],
     ) -> None:
         state = pending.state
         admissible_commands = state.infos.get("admissible_commands", []) or []
@@ -4029,17 +4028,7 @@ class TextWorldRolloutWorkerActor:
                 pending.prompt_obs,
                 pending.prompt_infos,
             )
-            if invalid_reward_mode == "zero":
-                reward = 0.0
-            elif invalid_reward_mode == "ppo_penalty":
-                if result.output_tokens and result.stop_reason != "abort":
-                    reward = -self.args.tw_invalid_action_penalty
-                else:
-                    reward = 0.0
-            else:
-                raise ValueError(
-                    f"Unsupported invalid_reward_mode: {invalid_reward_mode}"
-                )
+            reward = 0.0
 
         state.step_records.append(
             TextWorldStepRecord(
@@ -4052,7 +4041,6 @@ class TextWorldRolloutWorkerActor:
     async def _run_textworld_step_batch(
         self,
         states: List[TextWorldTrajectoryState],
-        invalid_reward_mode: Literal["zero", "ppo_penalty"],
     ) -> int:
         if self.stopped:
             return 0
@@ -4105,7 +4093,6 @@ class TextWorldRolloutWorkerActor:
             self._apply_textworld_action_result(
                 pending_request,
                 result,
-                invalid_reward_mode=invalid_reward_mode,
             )
 
         return len(active_states)
@@ -4315,7 +4302,6 @@ class TextWorldRolloutWorkerActor:
             for _ in range(self.args.tw_max_episode_steps):
                 active_count = await self._run_textworld_step_batch(
                     states=states,
-                    invalid_reward_mode="zero",
                 )
                 if active_count == 0:
                     break
@@ -4324,13 +4310,8 @@ class TextWorldRolloutWorkerActor:
                 sum(record.reward for record in state.step_records)
                 for state in states
             ]
-            grpo_rewards = [
-                raw_return
-                - self.args.tw_invalid_action_penalty * state.invalid_actions
-                for raw_return, state in zip(raw_returns, states)
-            ]
             _, _, advantages = (
-                self._compute_grpo_group_advantages(grpo_rewards)
+                self._compute_grpo_group_advantages(raw_returns)
             )
 
             samples = []
@@ -4397,7 +4378,6 @@ class TextWorldRolloutWorkerActor:
             for _ in range(self.args.tw_max_episode_steps):
                 active_count = await self._run_textworld_step_batch(
                     states=states,
-                    invalid_reward_mode="ppo_penalty", # 感觉可以去掉
                 )
                 if active_count == 0:
                     break
@@ -4637,7 +4617,6 @@ async def run_textworld_train(args: argparse.Namespace):
         f"gae_lambda={args.gae_lambda} "
         f"value_loss_coef={args.value_loss_coef} "
         f"ppo_normalize_advantages={args.ppo_normalize_advantages} "
-        f"tw_invalid_action_penalty={args.tw_invalid_action_penalty} "
         f"tw_lost_penalty={args.tw_lost_penalty}"
     )
     print(
@@ -5189,16 +5168,6 @@ def parse_args() -> argparse.Namespace:
         help="Penalty subtracted from the terminal losing TextWorld step.",
     )
     parser.add_argument(
-        "--tw-invalid-action-penalty",
-        type=float,
-        default=0.0,
-        help=(
-            "Penalty assigned to the last token of a non-aborted invalid "
-            "TextWorld action response for PPO, or subtracted from the "
-            "trajectory reward per invalid action for GRPO."
-        ),
-    )
-    parser.add_argument(
         "--grpo-group-size",
         type=int,
         default=None,
@@ -5684,8 +5653,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--grpo-adv-eps must be > 0")
     if args.ppo_adv_norm_eps <= 0:
         raise ValueError("--ppo-adv-norm-eps must be > 0")
-    if args.tw_invalid_action_penalty < 0:
-        raise ValueError("--tw-invalid-action-penalty must be >= 0")
     if args.tw_lost_penalty < 0:
         raise ValueError("--tw-lost-penalty must be >= 0")
     if args.rollout_stop_timeout <= 0:
