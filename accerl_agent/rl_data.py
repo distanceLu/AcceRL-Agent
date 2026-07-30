@@ -19,15 +19,15 @@ TerminationReason: TypeAlias = Literal[
 class RawPPOSample:
     algorithm: Literal["ppo"]
     input_ids: List[int]
-    attention_mask: List[int]
-    labels: List[int]
-    old_logprobs: List[float]
-    token_rewards: List[float]
-    token_terminated: List[bool]
-    token_truncated: List[bool]
-    response_indices: List[int]
+    attention_mask: List[int]  # padding的位置为0，非padding的位置为1
+    labels: List[int]  # 模型生成的response/action token:label 等于对应的 input_ids, prompt、observation、padding token:label 等于 -100
+    old_logprobs: List[float]  # rollout时模型生成的response/action token的logprob
+    token_rewards: List[float]  # 每个 token 对应的奖励
+    token_terminated: List[bool]  # 每个 token 是否是终止状态的标记,终止token的回来回报为0
+    token_truncated: List[bool]  # 每个 token 是否是截断状态的标记,截断token回来回报可能不为0,需要用bootstrap_value来计算gae
+    response_indices: List[int]  # 标识每个生成 token 属于 trajectory 中的第几个 response/action
     output_versions: List[int]
-    bootstrap_prediction_position: int | None
+    bootstrap_prediction_position: int | None  # 仅用于被截断的 PPO 样本，指出应该在哪个上下文位置预测最终状态价值 V(s_final)
     termination_reason: TerminationReason
 
 
@@ -40,7 +40,7 @@ class GRPOSample:
     old_logprobs: List[float]
     response_indices: List[int]
     output_versions: List[int]
-    advantage: float
+    advantage: float  # reward 在构造样本之前已经转换成了组内相对 advantage，所以训练样本不再需要保存原始 reward。
 
 
 RLSample: TypeAlias = RawPPOSample | GRPOSample
@@ -331,11 +331,13 @@ def compute_batched_token_gae(
     next_values[row_indices, final_indices] = bootstrap
 
     bootstrap_mask = (~terminal).to(torch.float32)
+    # 计算 TD delta: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
     deltas = (
         rewards_float
         + float(gamma) * bootstrap_mask * next_values
         - values
     )
+    # 仅在有效 token 上计算 GAE padding位置清零
     deltas = torch.where(valid, deltas, torch.zeros_like(deltas))
     trace_coefficients = (
         float(gamma)
@@ -343,6 +345,7 @@ def compute_batched_token_gae(
         * (~(terminal | truncation)).to(torch.float32)
         * valid.to(torch.float32)
     )
+    # 并行反向计算 GAE: A_t = δ_t + γ * λ * (1 - done) * A_{t+1}
     advantages = _parallel_reverse_affine_scan(
         deltas,
         trace_coefficients,
