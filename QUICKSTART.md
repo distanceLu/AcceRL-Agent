@@ -173,7 +173,7 @@ python -m accerl_agent.run_agent_textworld \
   --tw-history-token-window 8192 \
   --tw-game-limit 400 \
   --max-length 8192 \
-  --tw-gamma 1.0 \
+  --gae-gamma 1.0 \
   --tw-lost-penalty 0.0 \
   --fsdp-world-size 3 \
   --infer-size 1 \
@@ -244,7 +244,7 @@ After the smoke test passes, scale one dimension at a time:
    `--train-token-budget`, `--batch-size`, and
    `--train-pack-candidate-pool-size` together.
 4. Increase `--grad-accum-steps` if more effective batch size is needed.
-5. Keep `--train-mode full`; partial policy training modes are unsupported.
+5. Keep `--train-mode full`; `lora` is reserved but not implemented yet.
 6. Tune `--sync-every-optimizer-steps` and `--replay-capacity` to control sample staleness.
 
 Watch these metrics first:
@@ -282,11 +282,8 @@ Periodic saving:
 --save-checkpoint --checkpoint-every-sync-rounds 5
 ```
 
-By default, periodic and final saves both overwrite `latest`. To keep independent directories for each step, set:
-
-```bash
---checkpoint-name ""
-```
+Periodic and final saves both overwrite `latest`, so only the newest model is
+retained.
 
 The current checkpoint contains policy weights, config, tokenizer files,
 `trainer_state.json`, and Value Head weights under `critic/`. It does not
@@ -295,8 +292,8 @@ parameters but is not a full training-resume checkpoint.
 
 ## 8. Change Models
 
-When switching models, use `--train-mode full`; partial policy training modes
-are unsupported by the TextWorld trainer.
+When switching models, use `--train-mode full`; `lora` is reserved but not
+implemented yet.
 
 For non-Qwen or non-Qwen-MoE style models, carefully check:
 

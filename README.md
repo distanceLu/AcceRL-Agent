@@ -141,7 +141,7 @@ python -m accerl_agent.run_agent_textworld \
   --tw-history-token-window 8192 \
   --tw-game-limit 400 \
   --max-length 8192 \
-  --tw-gamma 1.0 \
+  --gae-gamma 1.0 \
   --tw-lost-penalty 0.0 \
   --fsdp-world-size 3 \
   --infer-size 1 \
@@ -284,7 +284,7 @@ The TextWorld prompt includes the objective, observation, inventory, and admissi
 TextWorld step reward is computed in `_compute_step_reward()` from score deltas:
 
 ```python
-reward = score_after - score_before - tw_step_penalty
+reward = score_after - score_before
 if won:
     reward += tw_win_bonus
 if lost:
@@ -295,7 +295,7 @@ PPO mode is enabled with `--rl-algorithm ppo` and currently requires
 `--train-packing padded`. Rollout stores token-aligned rewards, behavior
 logprobs, terminal/truncation boundaries, and optional final-state bootstrap
 context, but no values, returns, or advantages. The trainer recomputes current
-values and detached token TD(λ) targets on every replay sample. `--tw-gamma`
+values and detached token TD(λ) targets on every replay sample. `--gae-gamma`
 discounts once per valid response token; configure the trace and Critic weight
 with `--gae-lambda` and `--value-loss-coef`.
 
@@ -338,7 +338,7 @@ prediction position. PPO rollout never stores values, returns, or advantages.
 | --- | --- |
 | `--model-path` | Local HuggingFace model path. |
 | `--dtype` | `auto`, `bfloat16`, `float16`, or `float32`. |
-| `--train-mode` | `full`; this is the only supported TextWorld trainer mode. |
+| `--train-mode` | `full` is supported; `lora` is reserved for a future adapter-training implementation. |
 | `--tw-game-dir` | Directory containing TextWorld `.z8` games. |
 | `--tw-history-token-window` | Token limit for the episode transcript. |
 | `--max-length` | Maximum trainer-side sequence length; must be at least `--tw-history-token-window`. |
@@ -377,11 +377,8 @@ Default output path:
 <log-dir>/checkpoints/latest
 ```
 
-By default, periodic and final saves both overwrite `latest`. To keep `step-XXXXXX` directories, set:
-
-```bash
---checkpoint-name ""
-```
+Periodic and final saves both overwrite `latest`, so only the newest model is
+retained.
 
 Saved checkpoint contents include model weights, config, tokenizer files, and `trainer_state.json`. Optimizer state and replay-buffer contents are not saved yet, so these checkpoints are mainly for inference/evaluation rather than full training resume.
 

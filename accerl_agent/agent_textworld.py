@@ -613,10 +613,17 @@ def select_varlen_pack(
 
 
 def configure_trainable_parameters(model, train_mode: str) -> None:
-    if train_mode != "full":
-        raise ValueError(f"Unsupported train mode: {train_mode}")
-    for param in model.parameters():
-        param.requires_grad = True
+    if train_mode == "full":
+        for param in model.parameters():
+            param.requires_grad = True
+        return
+    if train_mode == "lora":
+        # TODO(lora): Inject LoRA adapters before FSDP wrapping, freeze the
+        # base policy, expose only adapter parameters to the optimizer, save
+        # adapter checkpoints, and add a vLLM-compatible adapter sync path.
+        # Remove the matching validate_args guard once that path is complete.
+        raise NotImplementedError("LoRA training is not implemented yet.")
+    raise ValueError(f"Unsupported train mode: {train_mode}")
 
 
 def iter_trainable_parameters(model) -> Iterable:
@@ -2012,7 +2019,7 @@ class FSDPTrainWorker:
                 terminated=dense_terminated,
                 truncated=dense_truncated,
                 bootstrap_values=view.bootstrap_values,
-                gamma=self.args.tw_gamma,
+                gamma=self.args.gae_gamma,
                 gae_lambda=self.args.gae_lambda,
             )
         )
@@ -3537,12 +3544,11 @@ class VLLMInferenceActor:
             gpu_memory_utilization=0.5,
             max_num_seqs=args.vllm_max_num_seqs,
             max_num_batched_tokens=args.vllm_max_num_batched_tokens,
-            enable_prefix_caching=not args.disable_vllm_prefix_caching,
+            max_model_len=args.vllm_max_model_len,
+            enable_prefix_caching=True,
             weight_transfer_config=WeightTransferConfig(backend="nccl"),
             load_format="dummy",
         )
-        if args.vllm_max_model_len is not None:
-            engine_kwargs["max_model_len"] = args.vllm_max_model_len
         self.engine = create_async_engine(**engine_kwargs)
         self.runner = InterruptibleGenerationRunner(
             self.engine,
@@ -3922,7 +3928,7 @@ class TextWorldRolloutWorkerActor:
         won: bool,
         lost: bool,
     ) -> float:
-        reward = score_after - score_before - self.args.tw_step_penalty
+        reward = score_after - score_before
         if won:
             reward += self.args.tw_win_bonus
         if lost:
@@ -4557,23 +4563,12 @@ def format_shell_command(argv: List[str]) -> str:
     return "\n".join(lines)
 
 
-def checkpoint_tag(optimizer_step: int, suffix: str | None = None) -> str:
-    tag = f"step-{optimizer_step:06d}"
-    if suffix:
-        tag = f"{tag}-{suffix}"
-    return tag
-
-
 def save_fsdp_checkpoint(
     fsdp_workers: List[Any],
     checkpoint_dir: str,
-    optimizer_step: int,
-    suffix: str | None = None,
-    fixed_tag: str | None = None,
 ) -> str:
-    tag = fixed_tag or checkpoint_tag(optimizer_step, suffix=suffix)
     results = ray.get([
-        worker.save_checkpoint.remote(checkpoint_dir, tag)
+        worker.save_checkpoint.remote(checkpoint_dir, "latest")
         for worker in fsdp_workers
     ])
     rank0_result = next(result for result in results if result["rank"] == 0)
@@ -4613,7 +4608,7 @@ async def run_textworld_train(args: argparse.Namespace):
         f"rollout_batch_size={args.rollout_batch_size} "
         f"rl_algorithm={args.rl_algorithm} "
         f"grpo_group_size={args.grpo_group_size} "
-        f"tw_gamma={args.tw_gamma} "
+        f"gae_gamma={args.gae_gamma} "
         f"gae_lambda={args.gae_lambda} "
         f"value_loss_coef={args.value_loss_coef} "
         f"ppo_normalize_advantages={args.ppo_normalize_advantages} "
@@ -4748,7 +4743,7 @@ async def run_textworld_train(args: argparse.Namespace):
             f"rollout_batch_size={args.rollout_batch_size} "
             f"rl_algorithm={args.rl_algorithm} "
             f"grpo_group_size={args.grpo_group_size} "
-            f"tw_gamma={args.tw_gamma} "
+            f"gae_gamma={args.gae_gamma} "
             f"gae_lambda={args.gae_lambda} "
             f"value_loss_coef={args.value_loss_coef} "
             f"ppo_normalize_advantages={args.ppo_normalize_advantages} "
@@ -4980,8 +4975,6 @@ async def run_textworld_train(args: argparse.Namespace):
                 checkpoint_path = save_fsdp_checkpoint(
                     fsdp_workers=fsdp_workers,
                     checkpoint_dir=args.checkpoint_dir,
-                    optimizer_step=latest_optimizer_step,
-                    fixed_tag=args.checkpoint_name,
                 )
                 last_checkpoint_step = latest_optimizer_step
                 print(f"[checkpoint] Periodic checkpoint ready: {checkpoint_path}")
@@ -5048,9 +5041,6 @@ async def run_textworld_train(args: argparse.Namespace):
             checkpoint_path = save_fsdp_checkpoint(
                 fsdp_workers=fsdp_workers,
                 checkpoint_dir=args.checkpoint_dir,
-                optimizer_step=latest_optimizer_step,
-                suffix="final",
-                fixed_tag=args.checkpoint_name,
             )
             last_checkpoint_step = latest_optimizer_step
             print(f"[checkpoint] Final checkpoint ready: {checkpoint_path}")
@@ -5099,8 +5089,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-mode",
         default="full",
-        choices=("full",),
-        help="Train the full policy model. This is the only supported mode.",
+        choices=("full", "lora"),
+        help=(
+            "Policy training mode. 'full' is supported; 'lora' is reserved "
+            "for the forthcoming adapter-training implementation."
+        ),
     )
     parser.add_argument(
         "--tw-game-dir",
@@ -5144,16 +5137,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--tw-gamma",
+        "--gae-gamma",
         type=float,
         default=1.0,
-        help="Discount factor applied once per valid response token.",
-    )
-    parser.add_argument(
-        "--tw-step-penalty",
-        type=float,
-        default=0.0,
-        help="Penalty subtracted from each TextWorld environment step reward.",
+        help="PPO discount factor applied once per valid response token.",
     )
     parser.add_argument(
         "--tw-win-bonus",
@@ -5381,16 +5368,6 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint root directory. Defaults to <log-dir>/checkpoints.",
     )
     parser.add_argument(
-        "--checkpoint-name",
-        default="latest",
-        help=(
-            "Checkpoint subdirectory name under --checkpoint-dir. The default "
-            "'latest' overwrites the previous model instead of creating "
-            "step-XXXXXX directories. Set to an empty string to keep per-step "
-            "checkpoint directories."
-        ),
-    )
-    parser.add_argument(
         "--checkpoint-every-sync-rounds",
         type=int,
         default=0,
@@ -5470,14 +5447,14 @@ def parse_args() -> argparse.Namespace:
         default=10.0,
         help="Seconds to wait for TextWorldRolloutWorkerActor run loops to stop cleanly.",
     )
-    # vllm 最多同时调度多少条sequence，也就是最多256个active请求
+    # vLLM 同时调度的最大 active sequence 数。
     parser.add_argument(
         "--vllm-max-num-seqs",
         type=int,
         default=128,
         help="Maximum number of sequences vLLM may schedule concurrently.",
     )
-    # vllm 最多同时调度多少个batched tokens，也就是最多16384个batched tokens
+    # vLLM 每次调度迭代最多处理的 token 数。
     parser.add_argument(
         "--vllm-max-num-batched-tokens",
         type=int,
@@ -5489,14 +5466,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Optional vLLM max_model_len override. When unset, vLLM infers "
-            "the model context length from the model config."
+            "vLLM max_model_len override. Defaults to "
+            "--tw-history-token-window."
         ),
-    )
-    parser.add_argument(
-        "--disable-vllm-prefix-caching",
-        action="store_true",
-        help="Disable vLLM automatic prefix caching for history prompts.",
     )
     # 可选的最大同步轮数，超过这个轮数后即使训练还没结束也停止同步，让推理继续跑下去，适合验证推理在不同版本权重下的表现差异
     parser.add_argument(
@@ -5533,6 +5505,8 @@ def parse_args() -> argparse.Namespace:
         args.num_rollout_workers = args.fsdp_world_size
     if args.grpo_group_size is None:
         args.grpo_group_size = args.rollout_batch_size
+    if args.vllm_max_model_len is None:
+        args.vllm_max_model_len = args.tw_history_token_window
     if args.log_dir is None:
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         args.log_dir = os.path.join("runs", "TextWorld_FSDP", timestamp)
@@ -5542,14 +5516,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.train_mode == "lora":
+        raise NotImplementedError(
+            "--train-mode lora is reserved but not implemented yet."
+        )
     if args.tw_game_limit is not None and args.tw_game_limit < 1:
         raise ValueError("--tw-game-limit must be >= 1 when set")
     if args.tw_max_episode_steps < 1:
         raise ValueError("--tw-max-episode-steps must be >= 1")
     if args.tw_history_token_window < 1:
         raise ValueError("--tw-history-token-window must be >= 1")
-    if args.tw_gamma < 0:
-        raise ValueError("--tw-gamma must be >= 0")
+    if args.gae_gamma < 0:
+        raise ValueError("--gae-gamma must be >= 0")
     if not 0.0 <= args.gae_lambda <= 1.0:
         raise ValueError("--gae-lambda must be in [0, 1]")
     if args.value_loss_coef < 0:
@@ -5661,8 +5639,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--vllm-max-num-seqs must be >= 1")
     if args.vllm_max_num_batched_tokens < 1:
         raise ValueError("--vllm-max-num-batched-tokens must be >= 1")
-    if args.vllm_max_model_len is not None and args.vllm_max_model_len < 1:
-        raise ValueError("--vllm-max-model-len must be >= 1 when set")
+    if args.vllm_max_model_len < args.tw_history_token_window:
+        raise ValueError(
+            "--vllm-max-model-len must be >= --tw-history-token-window; "
+            f"got {args.vllm_max_model_len} < {args.tw_history_token_window}"
+        )
     if args.max_sync_rounds is not None and args.max_sync_rounds < 0:
         raise ValueError("--max-sync-rounds must be >= 0 when set")
 
