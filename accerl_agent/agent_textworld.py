@@ -2570,11 +2570,11 @@ class FSDPTrainWorker:
             "current_lr": current_lr,
         }
 
-    def _run_varlen_optimizer_step(
+    def _run_varlen_grpo_optimizer_step(
         self,
         trainer_version: float,
     ) -> Dict[str, float]:
-        """Run one globally token-normalized Varlen optimizer step."""
+        """Run one globally token-normalized Varlen GRPO optimizer step."""
         window = self._prepare_varlen_optimizer_window(trainer_version)
         local_valid_token_count = sum(
             pack.valid_token_count for pack in window
@@ -2662,9 +2662,10 @@ class FSDPTrainWorker:
         kl_token_mean = global_kl_sum / token_count
 
         return {
-            "global_policy_sum": global_policy_sum,
-            "global_kl_sum": global_kl_sum,
-            "global_clip_count": global_clip_count,
+            "policy_metric_sum": global_policy_sum,
+            "kl_metric_sum": global_kl_sum,
+            "clip_metric_sum": global_clip_count,
+            "metric_weight": token_count,
             "global_valid_token_count": token_count,
             "global_version_lag_sum": global_version_lag_sum,
             "global_sample_count": global_sample_count,
@@ -2677,150 +2678,74 @@ class FSDPTrainWorker:
             "current_lr": current_lr,
         }
 
-    def _train_padded_grpo_until_next_sync(
+    def _run_padded_grpo_optimizer_step(
         self,
-        num_optimizer_steps: int = 100,
+        trainer_version: float,
     ) -> Dict[str, float]:
-        """
-        Continue the persistent training loop until this worker finishes the
-        requested number of optimizer steps, or reaches args.max_steps.
+        """Run one sample-normalized padded GRPO optimizer step."""
+        policy_metric_sum = 0.0
+        kl_metric_sum = 0.0
+        clip_metric_sum = 0.0
+        version_lag_sum = 0.0
+        valid_token_count = 0.0
 
-        args.max_steps is interpreted as optimizer steps.
-        """
-        if num_optimizer_steps < 1:
-            raise ValueError("num_optimizer_steps must be >= 1")
-
-        start_optimizer_step = self.optimizer_step
-        target_optimizer_step = min(
-            self.optimizer_step + num_optimizer_steps,
-            self.args.max_steps,
-        )
-        segment_losses = []
-        segment_kls = []
-        segment_clips = []
-        segment_version_lags = []
-        segment_valid_tokens = 0.0
-        segment_varlen_steps = []
-
-        while self.optimizer_step < target_optimizer_step:
-            trainer_version = (
-                self.optimizer_step / self.args.sync_every_optimizer_steps
-            )
-            if self.args.train_packing == "varlen":
-                step_stats = self._run_varlen_optimizer_step(trainer_version)
-                segment_varlen_steps.append(step_stats)
-                if self.rank == 0 and self.optimizer_step % self.args.log_every == 0:
-                    print(
-                        "[train] "
-                        f"optimizer_step={self.optimizer_step} "
-                        f"loss={step_stats['loss_mean']:.6f} "
-                        f"kl_token_mean={step_stats['kl_token_mean']:.6f} "
-                        f"clip_frac={step_stats['clip_fraction']:.4f} "
-                        f"tokens={step_stats['global_valid_token_count']:.0f} "
-                        f"lr={step_stats['current_lr']:.8g}"
-                    )
-                continue
-
+        for _ in range(self.args.grad_accum_steps):
             batch, version_lag = self._next_rl_training_batch(trainer_version)
             raw_loss, response_token_counts, loss_stats = self._compute_rl_loss(
                 batch,
             )
+            (raw_loss / self.args.grad_accum_steps).backward()
 
-            loss = raw_loss / self.args.grad_accum_steps
-            loss.backward()
-            segment_losses.append(float(raw_loss.item()))
-            segment_kls.append(
-                float(loss_stats.get("old_new_kl_k3_token_mean", 0.0))
+            kl_mean = float(
+                loss_stats.get("old_new_kl_k3_token_mean", 0.0)
             )
-            segment_clips.append(
-                float(loss_stats.get("ppo_clip_frac", 0.0))
+            policy_metric_sum += (
+                float(raw_loss.item())
+                - self.args.old_new_kl_coef * kl_mean
             )
-            segment_version_lags.append(version_lag)
-            segment_valid_tokens += float(response_token_counts.sum().item())
+            kl_metric_sum += kl_mean
+            clip_metric_sum += float(
+                loss_stats.get("ppo_clip_frac", 0.0)
+            )
+            version_lag_sum += version_lag
+            valid_token_count += float(response_token_counts.sum().item())
             self.train_micro_step += 1
-            should_step = self.train_micro_step % self.args.grad_accum_steps == 0
-            if not should_step:
-                continue
 
-            torch.nn.utils.clip_grad_norm_(
-                self.trainable_parameter_list,
-                max_norm=1.0,
-            )
-            current_lr = self._get_current_lr(
-                self.optimizer_step,
-                self.args.learning_rate,
-                self.args.lr_warmup_steps,
-                self.args.max_steps,
-            )
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = current_lr
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.optimizer_step += 1
-            if self.rank == 0 and self.optimizer_step % self.args.log_every == 0:
-                print(
-                    "[train] "
-                    f"optimizer_step={self.optimizer_step} "
-                    f"loss={raw_loss.item():.6f} "
-                    "kl_token_mean="
-                    f"{loss_stats.get('old_new_kl_k3_token_mean', 0.0):.6f} "
-                    f"clip_frac={loss_stats.get('ppo_clip_frac', 0.0):.4f} "
-                    f"lr={current_lr:.8g}"
-                )
+        torch.nn.utils.clip_grad_norm_(
+            self.trainable_parameter_list,
+            max_norm=1.0,
+        )
+        current_lr = self._get_current_lr(
+            self.optimizer_step,
+            self.args.learning_rate,
+            self.args.lr_warmup_steps,
+            self.args.max_steps,
+        )
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = current_lr
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer_step += 1
 
-        if segment_varlen_steps:
-            segment_valid_tokens = sum(
-                step["global_valid_token_count"]
-                for step in segment_varlen_steps
-            )
-            policy_sum = sum(
-                step["global_policy_sum"] for step in segment_varlen_steps
-            )
-            kl_sum = sum(step["global_kl_sum"] for step in segment_varlen_steps)
-            clip_count = sum(
-                step["global_clip_count"] for step in segment_varlen_steps
-            )
-            segment_kls = [kl_sum / segment_valid_tokens]
-            segment_losses = [
-                (policy_sum + self.args.old_new_kl_coef * kl_sum)
-                / segment_valid_tokens
-            ]
-            segment_clips = [clip_count / segment_valid_tokens]
-            version_lag_sum = sum(
-                step["global_version_lag_sum"] for step in segment_varlen_steps
-            )
-            sample_count = sum(
-                step["global_sample_count"] for step in segment_varlen_steps
-            )
-            segment_version_lags = [version_lag_sum / sample_count]
-
-        dist.barrier()
-        optimizer_steps_run = self.optimizer_step - start_optimizer_step
-        current_lr = self.optimizer.param_groups[0]["lr"]
+        metric_weight = float(self.args.grad_accum_steps)
+        policy_loss_mean = policy_metric_sum / metric_weight
+        kl_mean = kl_metric_sum / metric_weight
+        clip_fraction = clip_metric_sum / metric_weight
         return {
-            "rank": self.rank,
-            "optimizer_steps_run": optimizer_steps_run,
-            "optimizer_step": self.optimizer_step,
-            "micro_step": self.train_micro_step,
-            "reached_max_steps": self.optimizer_step >= self.args.max_steps,
-            "segment_loss_mean": (
-                sum(segment_losses) / len(segment_losses)
-                if segment_losses
-                else 0.0
+            "policy_metric_sum": policy_metric_sum,
+            "kl_metric_sum": kl_metric_sum,
+            "clip_metric_sum": clip_metric_sum,
+            "metric_weight": metric_weight,
+            "global_valid_token_count": valid_token_count,
+            "global_version_lag_sum": version_lag_sum,
+            "global_sample_count": metric_weight,
+            "loss_mean": (
+                policy_loss_mean
+                + self.args.old_new_kl_coef * kl_mean
             ),
-            "segment_kl_mean": (
-                sum(segment_kls) / len(segment_kls) if segment_kls else 0.0
-            ),
-            "segment_clip_frac": (
-                sum(segment_clips) / len(segment_clips)
-                if segment_clips else 0.0
-            ),
-            "segment_valid_tokens": segment_valid_tokens,
-            "segment_version_lag_mean": (
-                sum(segment_version_lags) / len(segment_version_lags)
-                if segment_version_lags else 0.0
-            ),
-            "learning_rate": current_lr,
+            "kl_token_mean": kl_mean,
+            "clip_fraction": clip_fraction,
+            "current_lr": current_lr,
         }
 
     def train_until_next_sync(
@@ -2835,20 +2760,6 @@ class FSDPTrainWorker:
             self.optimizer_step + num_optimizer_steps,
             self.args.max_steps,
         )
-
-        if (
-            self.args.rl_algorithm == "grpo"
-            and self.args.train_packing == "padded"
-        ):
-            result = self._train_padded_grpo_until_next_sync(
-                num_optimizer_steps
-            )
-            result.setdefault(
-                "segment_policy_loss_mean",
-                result["segment_loss_mean"],
-            )
-            result.setdefault("segment_value_loss_mean", 0.0)
-            return result
 
         global_steps = []
         aggregate_ppo_stats = {
@@ -2869,8 +2780,14 @@ class FSDPTrainWorker:
                     )
                 for name, value in step_stats["global_ppo_stats"].items():
                     aggregate_ppo_stats[name] += value
+            elif self.args.train_packing == "varlen":
+                step_stats = self._run_varlen_grpo_optimizer_step(
+                    trainer_version
+                )
             else:
-                step_stats = self._run_varlen_optimizer_step(trainer_version)
+                step_stats = self._run_padded_grpo_optimizer_step(
+                    trainer_version
+                )
             global_steps.append(step_stats)
             if (
                 self.rank == 0
@@ -2918,18 +2835,21 @@ class FSDPTrainWorker:
         }
 
         if self.args.rl_algorithm == "grpo":
-            policy_sum = sum(
-                float(step["global_policy_sum"]) for step in global_steps
+            metric_weight = sum(
+                float(step["metric_weight"]) for step in global_steps
             )
-            kl_sum = sum(
-                float(step["global_kl_sum"]) for step in global_steps
+            policy_metric_sum = sum(
+                float(step["policy_metric_sum"]) for step in global_steps
             )
-            clip_count = sum(
-                float(step["global_clip_count"]) for step in global_steps
+            kl_metric_sum = sum(
+                float(step["kl_metric_sum"]) for step in global_steps
             )
-            denominator = max(valid_tokens, 1.0)
-            policy_mean = policy_sum / denominator
-            kl_mean = kl_sum / denominator
+            clip_metric_sum = sum(
+                float(step["clip_metric_sum"]) for step in global_steps
+            )
+            denominator = max(metric_weight, 1.0)
+            policy_mean = policy_metric_sum / denominator
+            kl_mean = kl_metric_sum / denominator
             result.update(
                 {
                     "segment_loss_mean": (
@@ -2939,7 +2859,7 @@ class FSDPTrainWorker:
                     "segment_policy_loss_mean": policy_mean,
                     "segment_value_loss_mean": 0.0,
                     "segment_kl_mean": kl_mean,
-                    "segment_clip_frac": clip_count / denominator,
+                    "segment_clip_frac": clip_metric_sum / denominator,
                 }
             )
             dist.barrier()
