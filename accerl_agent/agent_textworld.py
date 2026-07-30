@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
 from typing import Any, Dict, Iterable, List, Literal, Tuple
 
 # Keep direct script execution import-compatible, then delegate to the
@@ -193,31 +193,73 @@ class PPOFlatTokenView:
     bootstrap_mask: torch.Tensor
 
 
-VARLEN_TOKEN_STAT_NAMES = (
-    "policy_token_sum",
-    "old_new_kl_k3_sum",
-    "ppo_clip_count",
-)
+class PackedTensorStats:
+    """Named scalar statistics packed into one tensor for one all-reduce."""
 
-PPO_TOKEN_STAT_NAMES = (
-    "policy_sum",
-    "value_loss_sum",
-    "kl_sum",
-    "clip_count",
-    "value_sum",
-    "value_sq_sum",
-    "return_sum",
-    "return_sq_sum",
-    "residual_sum",
-    "residual_sq_sum",
-    "delta_sum",
-    "delta_sq_sum",
-    "advantage_sum",
-    "advantage_sq_sum",
-    "terminated_count",
-    "truncated_count",
-    "bootstrap_count",
-)
+    @classmethod
+    def names(cls) -> Tuple[str, ...]:
+        return tuple(item.name for item in dataclass_fields(cls))
+
+    @classmethod
+    def zeros(cls, device) -> torch.Tensor:
+        return torch.zeros(
+            len(dataclass_fields(cls)),
+            device=device,
+            dtype=torch.float64,
+        )
+
+    def pack(self) -> torch.Tensor:
+        values = [
+            getattr(self, item.name)
+            for item in dataclass_fields(self)
+        ]
+        if any(
+            not isinstance(value, torch.Tensor) or value.ndim != 0
+            for value in values
+        ):
+            raise TypeError("Packed statistics fields must be scalar tensors.")
+        return torch.stack(values).detach().to(dtype=torch.float64)
+
+    @classmethod
+    def unpack(cls, packed: torch.Tensor):
+        expected_shape = (len(dataclass_fields(cls)),)
+        if packed.shape != expected_shape:
+            raise ValueError(
+                f"{cls.__name__} expected packed shape {expected_shape}, "
+                f"got {tuple(packed.shape)}."
+            )
+        return cls(**{
+            item.name: packed[index]
+            for index, item in enumerate(dataclass_fields(cls))
+        })
+
+    def to_float_dict(self) -> Dict[str, float]:
+        values = self.pack().tolist()
+        return {
+            item.name: float(values[index])
+            for index, item in enumerate(dataclass_fields(self))
+        }
+
+
+@dataclass(frozen=True)
+class VarlenTokenStats(PackedTensorStats):
+    policy_token_sum: torch.Tensor
+    old_new_kl_k3_sum: torch.Tensor
+    ppo_clip_count: torch.Tensor
+
+
+@dataclass(frozen=True)
+class PPOTokenStats(PackedTensorStats):
+    policy_sum: torch.Tensor
+    value_loss_sum: torch.Tensor
+    kl_sum: torch.Tensor
+    clip_count: torch.Tensor
+    value_sum: torch.Tensor
+    value_sq_sum: torch.Tensor
+    return_sum: torch.Tensor
+    return_sq_sum: torch.Tensor
+    terminated_count: torch.Tensor
+    truncated_count: torch.Tensor
 
 
 def set_seed(seed: int) -> None:
@@ -1649,13 +1691,11 @@ class FSDPTrainWorker:
                 # Keep per-pack statistics on the accelerator. The optimizer
                 # window accumulates this detached vector and transfers it to
                 # Python only once after the cross-rank all-reduce.
-                varlen_token_stats = torch.stack(
-                    [
-                        policy_token_sum,
-                        old_new_kl_k3_sum,
-                        ppo_clip_count,
-                    ]
-                ).detach().to(dtype=torch.float64)
+                varlen_token_stats = VarlenTokenStats(
+                    policy_token_sum=policy_token_sum,
+                    old_new_kl_k3_sum=old_new_kl_k3_sum,
+                    ppo_clip_count=ppo_clip_count,
+                ).pack()
                 return (
                     loss,
                     None,
@@ -2011,7 +2051,7 @@ class FSDPTrainWorker:
             )
         if view.bootstrap_mask.logical_and(final_terminated).any():
             raise RuntimeError("Terminated PPO samples cannot bootstrap.")
-        dense_advantages, dense_returns, dense_deltas = (
+        dense_advantages, dense_returns, _ = (
             compute_batched_token_gae(
                 rewards=dense_rewards,
                 baseline_values=dense_values,
@@ -2031,17 +2071,9 @@ class FSDPTrainWorker:
             view.response_sample_indices,
             view.response_ordinals,
         ]
-        deltas = dense_deltas[
-            view.response_sample_indices,
-            view.response_ordinals,
-        ]
         if raw_advantages.numel() != view.current_values.numel():
             raise RuntimeError("PPO batched GAE value/token alignment mismatch.")
-        if (
-            raw_advantages.requires_grad
-            or returns.requires_grad
-            or deltas.requires_grad
-        ):
+        if raw_advantages.requires_grad or returns.requires_grad:
             raise RuntimeError("PPO GAE targets must be detached.")
 
         if self.args.ppo_normalize_advantages:
@@ -2124,28 +2156,18 @@ class FSDPTrainWorker:
         with torch.no_grad():
             values_detached = view.current_values.detach().float()
             returns_float = returns.float()
-            residuals_detached = returns_float - values_detached
-            stats = torch.stack(
-                (
-                    policy_sum.detach().double(),
-                    value_loss_sum.detach().double(),
-                    kl_sum.detach().double(),
-                    clipped_mask.sum().double(),
-                    values_detached.double().sum(),
-                    values_detached.double().square().sum(),
-                    returns_float.double().sum(),
-                    returns_float.double().square().sum(),
-                    residuals_detached.double().sum(),
-                    residuals_detached.double().square().sum(),
-                    deltas.double().sum(),
-                    deltas.double().square().sum(),
-                    raw_advantages.double().sum(),
-                    raw_advantages.double().square().sum(),
-                    view.terminated.sum().double(),
-                    view.truncated.sum().double(),
-                    view.bootstrap_mask.sum().double(),
-                )
-            )
+            stats = PPOTokenStats(
+                policy_sum=policy_sum,
+                value_loss_sum=value_loss_sum,
+                kl_sum=kl_sum,
+                clip_count=clipped_mask.sum(),
+                value_sum=values_detached.sum(),
+                value_sq_sum=values_detached.square().sum(),
+                return_sum=returns_float.sum(),
+                return_sq_sum=returns_float.square().sum(),
+                terminated_count=view.terminated.sum(),
+                truncated_count=view.truncated.sum(),
+            ).pack()
         return token_loss_sum, stats
 
     def _compute_padded_ppo_token_sums(
@@ -2374,11 +2396,7 @@ class FSDPTrainWorker:
                 "response tokens."
             )
 
-        local_token_stats = torch.zeros(
-            len(PPO_TOKEN_STAT_NAMES),
-            device=self.device,
-            dtype=torch.float64,
-        )
+        local_token_stats = PPOTokenStats.zeros(self.device)
         local_version_stats = torch.zeros(
             2,
             device=self.device,
@@ -2425,13 +2443,7 @@ class FSDPTrainWorker:
         self.optimizer.zero_grad(set_to_none=True)
         self.optimizer_step += 1
 
-        stats = {
-            name: float(value)
-            for name, value in zip(
-                PPO_TOKEN_STAT_NAMES,
-                local_token_stats.tolist(),
-            )
-        }
+        stats = PPOTokenStats.unpack(local_token_stats).to_float_dict()
         token_count = float(global_valid_token_count)
         policy_loss_mean = stats["policy_sum"] / token_count
         value_loss_mean = stats["value_loss_sum"] / token_count
@@ -2483,11 +2495,7 @@ class FSDPTrainWorker:
                 "response tokens."
             )
 
-        local_token_stats = torch.zeros(
-            len(PPO_TOKEN_STAT_NAMES),
-            device=self.device,
-            dtype=torch.float64,
-        )
+        local_token_stats = PPOTokenStats.zeros(self.device)
         local_version_stats = torch.zeros(
             2,
             device=self.device,
@@ -2537,13 +2545,7 @@ class FSDPTrainWorker:
         self.optimizer.zero_grad(set_to_none=True)
         self.optimizer_step += 1
 
-        stats = {
-            name: float(value)
-            for name, value in zip(
-                PPO_TOKEN_STAT_NAMES,
-                local_token_stats.tolist(),
-            )
-        }
+        stats = PPOTokenStats.unpack(local_token_stats).to_float_dict()
         token_count = float(global_valid_token_count)
         policy_loss_mean = stats["policy_sum"] / token_count
         value_loss_mean = stats["value_loss_sum"] / token_count
@@ -2593,11 +2595,7 @@ class FSDPTrainWorker:
                 "response tokens."
             )
 
-        local_token_stats = torch.zeros(
-            len(VARLEN_TOKEN_STAT_NAMES),
-            device=self.device,
-            dtype=torch.float64,
-        )
+        local_token_stats = VarlenTokenStats.zeros(self.device)
         local_version_stats = torch.zeros(
             2,
             device=self.device,
@@ -2635,9 +2633,12 @@ class FSDPTrainWorker:
 
         dist.all_reduce(local_token_stats, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_version_stats, op=dist.ReduceOp.SUM)
-        global_policy_sum, global_kl_sum, global_clip_count = (
-            local_token_stats.tolist()
+        reduced_stats = (
+            VarlenTokenStats.unpack(local_token_stats).to_float_dict()
         )
+        global_policy_sum = reduced_stats["policy_token_sum"]
+        global_kl_sum = reduced_stats["old_new_kl_k3_sum"]
+        global_clip_count = reduced_stats["ppo_clip_count"]
         global_version_lag_sum, global_sample_count = local_version_stats.tolist()
 
         torch.nn.utils.clip_grad_norm_(
@@ -2851,7 +2852,7 @@ class FSDPTrainWorker:
 
         global_steps = []
         aggregate_ppo_stats = {
-            name: 0.0 for name in PPO_TOKEN_STAT_NAMES
+            name: 0.0 for name in PPOTokenStats.names()
         }
         while self.optimizer_step < target_optimizer_step:
             trainer_version = (
@@ -2962,12 +2963,14 @@ class FSDPTrainWorker:
 
         value_mean, value_std = moments("value")
         return_mean, return_std = moments("return")
-        residual_mean, residual_std = moments("residual")
-        delta_mean, delta_std = moments("delta")
-        advantage_mean, advantage_std = moments("advantage")
+        residual_mean = return_mean - value_mean
+        residual_variance = max(
+            2.0 * value_loss_mean - residual_mean * residual_mean,
+            0.0,
+        )
         return_variance = return_std * return_std
         explained_variance = (
-            1.0 - residual_std * residual_std / return_variance
+            1.0 - residual_variance / return_variance
             if return_variance > 1e-12
             else 0.0
         )
@@ -2992,17 +2995,12 @@ class FSDPTrainWorker:
                 "segment_value_prediction_std": value_std,
                 "segment_return_mean": return_mean,
                 "segment_return_std": return_std,
-                "segment_value_residual_mean": residual_mean,
                 "segment_value_mse": (
                     2.0
                     * aggregate_ppo_stats["value_loss_sum"]
                     / denominator
                 ),
                 "segment_explained_variance": explained_variance,
-                "segment_td_delta_mean": delta_mean,
-                "segment_td_delta_std": delta_std,
-                "segment_raw_advantage_mean": advantage_mean,
-                "segment_raw_advantage_std": advantage_std,
                 "segment_terminated_token_count": (
                     aggregate_ppo_stats["terminated_count"]
                 ),
@@ -3010,7 +3008,7 @@ class FSDPTrainWorker:
                     aggregate_ppo_stats["truncated_count"]
                 ),
                 "segment_bootstrap_fraction": (
-                    aggregate_ppo_stats["bootstrap_count"]
+                    aggregate_ppo_stats["truncated_count"]
                     / max(boundary_count, 1.0)
                 ),
             }
@@ -3541,7 +3539,7 @@ class VLLMInferenceActor:
             enable_expert_parallel=True,
             distributed_executor_backend="mp",
             data_parallel_backend="mp",
-            gpu_memory_utilization=0.5,
+            gpu_memory_utilization=0.8,
             max_num_seqs=args.vllm_max_num_seqs,
             max_num_batched_tokens=args.vllm_max_num_batched_tokens,
             max_model_len=args.vllm_max_model_len,
@@ -4891,7 +4889,6 @@ async def run_textworld_train(args: argparse.Namespace):
                 rollout_stats["active_workers"],
                 tb_step,
             )
-            writer.add_scalar("Train/Loss", train_loss_mean, tb_step)
             writer.add_scalar(
                 "Train/TotalLoss",
                 train_loss_mean,
@@ -4935,13 +4932,8 @@ async def run_textworld_train(args: argparse.Namespace):
                     "Value/PredictionStd": "segment_value_prediction_std",
                     "Value/ReturnMean": "segment_return_mean",
                     "Value/ReturnStd": "segment_return_std",
-                    "Value/ResidualMean": "segment_value_residual_mean",
                     "Value/MSE": "segment_value_mse",
                     "Value/ExplainedVariance": "segment_explained_variance",
-                    "Value/TDDeltaMean": "segment_td_delta_mean",
-                    "Value/TDDeltaStd": "segment_td_delta_std",
-                    "Advantage/RawMean": "segment_raw_advantage_mean",
-                    "Advantage/RawStd": "segment_raw_advantage_std",
                     "PPO/TerminatedTokenCount": (
                         "segment_terminated_token_count"
                     ),
