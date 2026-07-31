@@ -80,3 +80,6 @@ accerl_agent/tests/*
 # Preserved local migration snapshots; vsi_qa_rlvr is tracked training code
 /accerl_rlvr/
 /accerl_rlvr_bug/
+
+# Local MVP investigations and benchmark notes
+/mvp/
