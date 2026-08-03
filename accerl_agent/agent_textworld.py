@@ -162,10 +162,12 @@ class PreparedVarlenPack:
     """One CPU-resident pack prepared for a Varlen optimizer window."""
 
     batch: Dict[str, torch.Tensor]
+    total_token_count: int
     valid_token_count: int
     max_seqlen: int
     version_lag_sum: float
     sample_count: int
+    cpu_milliseconds: float
 
 
 @dataclass
@@ -1489,11 +1491,18 @@ class FSDPTrainWorker:
                 )
             time.sleep(self.args.replay_wait_sleep_seconds)
 
+        pack_start_time = time.perf_counter()
         collected = self._select_varlen_pack()
         batch = self._collate_prepared_rl_samples(
             collected,
             move_to_device=False,
         )
+        cpu_milliseconds = (
+            time.perf_counter() - pack_start_time
+        ) * 1000.0
+        total_token_count = int(batch["input_ids"].numel())
+        if total_token_count <= 0:
+            raise RuntimeError("A Varlen pack must contain at least one token.")
         valid_token_count = int(batch["target_indices"].numel())
         if valid_token_count <= 0:
             raise RuntimeError("A Varlen pack must contain at least one target.")
@@ -1504,10 +1513,12 @@ class FSDPTrainWorker:
         )
         return PreparedVarlenPack(
             batch=batch,
+            total_token_count=total_token_count,
             valid_token_count=valid_token_count,
             max_seqlen=max_seqlen,
             version_lag_sum=version_lag_sum,
             sample_count=sample_count,
+            cpu_milliseconds=cpu_milliseconds,
         )
 
     def _compute_rl_loss(
@@ -2314,6 +2325,42 @@ class FSDPTrainWorker:
         assert window is not None
         return window
 
+    def _reduce_varlen_pack_stats(
+        self,
+        window: List[PreparedVarlenPack],
+    ) -> Dict[str, float]:
+        """Aggregate pack-shape and CPU-construction statistics across ranks."""
+        pack_sums = torch.tensor(
+            [
+                sum(pack.total_token_count for pack in window),
+                len(window),
+                sum(pack.sample_count for pack in window),
+                sum(pack.cpu_milliseconds for pack in window),
+            ],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        max_seqlen = torch.tensor(
+            max((pack.max_seqlen for pack in window), default=0),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        dist.all_reduce(pack_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(max_seqlen, op=dist.ReduceOp.MAX)
+        (
+            global_token_count,
+            global_pack_count,
+            global_sample_count,
+            global_cpu_milliseconds,
+        ) = pack_sums.tolist()
+        return {
+            "global_pack_token_count": global_token_count,
+            "global_pack_count": global_pack_count,
+            "global_pack_sample_count": global_sample_count,
+            "global_pack_cpu_milliseconds": global_cpu_milliseconds,
+            "global_pack_max_seqlen": float(max_seqlen.item()),
+        }
+
     def _prepare_padded_ppo_optimizer_window(
         self,
         trainer_version: float,
@@ -2475,6 +2522,7 @@ class FSDPTrainWorker:
     ) -> Dict[str, object]:
         """Run one globally token-normalized varlen PPO optimizer step."""
         window = self._prepare_varlen_optimizer_window(trainer_version)
+        pack_stats = self._reduce_varlen_pack_stats(window)
         local_valid_token_count = sum(
             prepared.valid_token_count for prepared in window
         )
@@ -2554,6 +2602,7 @@ class FSDPTrainWorker:
             local_version_stats.tolist()
         )
         return {
+            **pack_stats,
             "global_ppo_stats": stats,
             "global_valid_token_count": token_count,
             "global_version_lag_sum": global_version_lag_sum,
@@ -2576,6 +2625,7 @@ class FSDPTrainWorker:
     ) -> Dict[str, float]:
         """Run one globally token-normalized Varlen GRPO optimizer step."""
         window = self._prepare_varlen_optimizer_window(trainer_version)
+        pack_stats = self._reduce_varlen_pack_stats(window)
         local_valid_token_count = sum(
             pack.valid_token_count for pack in window
         )
@@ -2662,6 +2712,7 @@ class FSDPTrainWorker:
         kl_token_mean = global_kl_sum / token_count
 
         return {
+            **pack_stats,
             "policy_metric_sum": global_policy_sum,
             "kl_metric_sum": global_kl_sum,
             "clip_metric_sum": global_clip_count,
@@ -2833,6 +2884,52 @@ class FSDPTrainWorker:
             ),
             "learning_rate": self.optimizer.param_groups[0]["lr"],
         }
+        if self.args.train_packing == "varlen":
+            pack_token_count = sum(
+                float(step["global_pack_token_count"])
+                for step in global_steps
+            )
+            pack_count = sum(
+                float(step["global_pack_count"])
+                for step in global_steps
+            )
+            pack_sample_count = sum(
+                float(step["global_pack_sample_count"])
+                for step in global_steps
+            )
+            pack_cpu_milliseconds = sum(
+                float(step["global_pack_cpu_milliseconds"])
+                for step in global_steps
+            )
+            pack_capacity = (
+                pack_count * float(self.args.train_token_budget)
+            )
+            result.update(
+                {
+                    "segment_pack_token_utilization": (
+                        pack_token_count / pack_capacity
+                        if pack_capacity > 0
+                        else 0.0
+                    ),
+                    "segment_pack_sample_count": (
+                        pack_sample_count / pack_count
+                        if pack_count > 0
+                        else 0.0
+                    ),
+                    "segment_pack_max_sequence_length": max(
+                        (
+                            float(step["global_pack_max_seqlen"])
+                            for step in global_steps
+                        ),
+                        default=0.0,
+                    ),
+                    "segment_pack_cpu_milliseconds": (
+                        pack_cpu_milliseconds / pack_count
+                        if pack_count > 0
+                        else 0.0
+                    ),
+                }
+            )
 
         if self.args.rl_algorithm == "grpo":
             metric_weight = sum(
@@ -4446,23 +4543,36 @@ def save_run_config(args: argparse.Namespace) -> None:
         file.write("\n")
 
     command_path = os.path.join(args.log_dir, "command.txt")
-    command = format_shell_command(sys.argv)
+    command = format_shell_command(
+        sys.argv,
+        module="accerl_agent.run_agent_textworld",
+    )
     with open(command_path, "w", encoding="utf-8") as file:
         file.write(command)
         file.write("\n")
 
 
-def format_shell_command(argv: List[str]) -> str:
-    if not argv:
+def format_shell_command(
+    argv: List[str],
+    *,
+    module: str | None = None,
+) -> str:
+    if not argv and module is None:
         return "python"
 
-    command = f"python {shlex.quote(argv[0])}"
-    if len(argv) == 1:
+    if module is None:
+        command = f"python {shlex.quote(argv[0])}"
+        argument_start = 1
+    else:
+        command = f"python -m {shlex.quote(module)}"
+        argument_start = 1 if argv else 0
+
+    if len(argv) == argument_start:
         return command
 
     lines = [f"{command} \\"]
     parts: List[List[str]] = []
-    idx = 1
+    idx = argument_start
     while idx < len(argv):
         part = argv[idx]
         if part.startswith("-") and idx + 1 < len(argv) and not argv[idx + 1].startswith("-"):
@@ -4840,6 +4950,27 @@ async def run_textworld_train(args: argparse.Namespace):
                 optimizer_steps_per_sec,
                 tb_step,
             )
+            if args.train_packing == "varlen":
+                writer.add_scalar(
+                    "Train/PackTokenUtilization",
+                    rank0_summary["segment_pack_token_utilization"],
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Train/PackSampleCount",
+                    rank0_summary["segment_pack_sample_count"],
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Train/PackMaxSequenceLength",
+                    rank0_summary["segment_pack_max_sequence_length"],
+                    tb_step,
+                )
+                writer.add_scalar(
+                    "Train/PackCpuMilliseconds",
+                    rank0_summary["segment_pack_cpu_milliseconds"],
+                    tb_step,
+                )
             if args.clip_mode == "ppo":
                 writer.add_scalar(
                     "Clip/PPOClipFrac",
