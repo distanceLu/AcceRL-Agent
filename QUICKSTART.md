@@ -162,7 +162,7 @@ total GPUs >= fsdp_world_size + infer_tp_size * infer_size
 The commonly used configuration below uses 3 FSDP trainer GPUs and one vLLM
 inference GPU, so at least 4 visible GPUs are required. It trains the full
 Qwen-MoE model with GRPO advantages, PPO-style policy clipping, FlashAttention
-varlen packing, and response-only LM-head projection:
+packed training, and response-only LM-head projection:
 
 ```bash
 python -m accerl_agent.run_agent_textworld \
@@ -183,7 +183,7 @@ python -m accerl_agent.run_agent_textworld \
   --infer-max-tokens 16 \
   --infer-temperature 1.0 \
   --infer-top-p 1.0 \
-  --batch-size 2 \
+  --train-max-sequences-per-pack 2 \
   --grad-accum-steps 32 \
   --max-steps 500000 \
   --lr-warmup-steps 500 \
@@ -194,25 +194,22 @@ python -m accerl_agent.run_agent_textworld \
   --replay-capacity 256 \
   --min-replay-size-per-rank 32 \
   --rl-algorithm grpo \
-  --train-packing varlen \
   --train-token-budget 16384 \
   --train-pack-candidate-pool-size 64 \
   --train-logprob-mode response_only_lm_head \
   --dtype bfloat16
 ```
 
-Varlen argument rules:
+Packed training argument rules:
 
-- `--batch-size` is the maximum number of independent `RLSample` objects in
+- `--train-max-sequences-per-pack` is the maximum number of independent `RLSample` objects in
   one pack, rather than a padded tensor batch dimension.
 - `--train-token-budget` is the maximum total number of real tokens in a pack
   and must be at least `--max-length`.
 - Replay stores independent samples; only the trainer constructs packed
   micro-batches.
 - `response_only_lm_head` uses model-native
-  `logits_to_keep=prediction_indices` and requires varlen packing.
-- Use `--train-packing padded --train-logprob-mode full_logits_ce` to return to
-  the baseline path.
+  `logits_to_keep=prediction_indices`.
 
 This is a long-running configuration: `--max-steps` counts optimizer steps,
 and no `--max-sync-rounds` limit is set. For a short end-to-end check, append
@@ -240,8 +237,7 @@ After the smoke test passes, scale one dimension at a time:
 
 1. Increase `--tw-game-limit` and `--tw-max-episode-steps`.
 2. Increase `--rollout-batch-size` and `--num-rollout-workers`.
-3. For padded training, increase `--batch-size`; for varlen training, tune
-   `--train-token-budget`, `--batch-size`, and
+3. Tune `--train-token-budget`, `--train-max-sequences-per-pack`, and
    `--train-pack-candidate-pool-size` together.
 4. Increase `--grad-accum-steps` if more effective batch size is needed.
 5. Keep `--train-mode full`; `lora` is reserved but not implemented yet.
@@ -255,7 +251,7 @@ Watch these metrics first:
 | `Replay/FillRatio` | Checks whether rollout keeps the trainer fed. |
 | `Replay/TrainSampleTrainerVersionLagMean` | Checks whether training samples are too stale. |
 | `Train/LossMeanAcrossRanks` | Checks training stability. |
-| `Train/PackTokenUtilization` | Checks how much of the varlen token budget is used. |
+| `Train/PackTokenUtilization` | Checks how much of the packed token budget is used. |
 | `Train/PackSampleCount` | Shows how many independent samples were packed. |
 | `Train/PackCpuMilliseconds` | Checks whether CPU packing is a bottleneck. |
 | `KL/OldNewK3TokenMean` | Checks whether policy updates are too large. |
@@ -386,24 +382,21 @@ This is the most important stability check. Every sample must guarantee:
 
 - Lower the learning rate.
 - Reduce `--sync-every-optimizer-steps` or `--replay-capacity` to reduce sample staleness.
-- PPO uses padded training, on-the-fly current values, and token TD(λ).
+- PPO uses packed training, on-the-fly current values, and token TD(λ).
   Advantage normalization is enabled by default; use
-  `--no-ppo-normalize-advantages` to disable it. PPO varlen is not yet
-  supported, while GRPO varlen remains available.
+  `--no-ppo-normalize-advantages` to disable it.
 - Increase `--old-new-kl-coef`.
 - Confirm that invalid, aborted, or empty outputs are not mistakenly marked as trainable tokens.
 
-### Varlen or FlashAttention initialization fails
+### Packed training or FlashAttention initialization fails
 
 - Confirm that `flash_attn` imports in the same environment used by Ray
   trainers.
-- Use `bfloat16`, `float16`, or `auto`; varlen rejects `float32`.
+- Use `bfloat16`, `float16`, or `auto`; packed training rejects `float32`.
 - Confirm that the model supports Transformers `flash_attention_2`.
 - When using `--train-logprob-mode response_only_lm_head`, confirm that the
   CausalLM forward accepts tensor `logits_to_keep`; this is verified with
-  Transformers 5.12.1 Qwen/Qwen-MoE. Varlen with `full_logits_ce` does not
+  Transformers 5.12.1 Qwen/Qwen-MoE. Packed GRPO with `full_logits_ce` does not
   require this API.
-- To retain varlen while diagnosing response-only projection compatibility,
+- To diagnose response-only projection compatibility for GRPO,
   switch to `--train-logprob-mode full_logits_ce`.
-- Fall back to `--train-packing padded --train-logprob-mode full_logits_ce` to
-  separate model/FlashAttention compatibility problems from the RL loop.

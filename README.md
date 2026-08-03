@@ -56,9 +56,9 @@ This project targets Linux GPU environments. Exact package versions must match y
 
 Several parts of the current code assume a model layout close to Qwen/Qwen-MoE, such as `model.model.layers` and `lm_head`. If you use another HuggingFace model family, carefully check `build_model()`, `configure_trainable_parameters()`, the FSDP wrapping path, and `iter_vllm_loadable_weights()`.
 
-The optional varlen path additionally requires a GPU-supported `flash-attn`
+Packed training requires a GPU-supported `flash-attn`
 build. The `response_only_lm_head` logprob mode also requires a Transformers
-model that implements tensor `logits_to_keep`; varlen with `full_logits_ce`
+model that implements tensor `logits_to_keep`; packed GRPO with `full_logits_ce`
 does not require that API. Transformers 5.12.1 with Qwen/Qwen-MoE is the
 currently verified combination for response-only LM-head projection. Other
 Transformers versions or model classes may not support this API.
@@ -151,7 +151,7 @@ python -m accerl_agent.run_agent_textworld \
   --infer-max-tokens 16 \
   --infer-temperature 1.0 \
   --infer-top-p 1.0 \
-  --batch-size 2 \
+  --train-max-sequences-per-pack 2 \
   --grad-accum-steps 32 \
   --max-steps 500000 \
   --lr-warmup-steps 500 \
@@ -162,15 +162,14 @@ python -m accerl_agent.run_agent_textworld \
   --replay-capacity 256 \
   --min-replay-size-per-rank 32 \
   --rl-algorithm grpo \
-  --train-packing varlen \
   --train-token-budget 16384 \
   --train-pack-candidate-pool-size 64 \
   --train-logprob-mode response_only_lm_head \
   --dtype bfloat16
 ```
 
-The command above is the full GRPO + varlen configuration and is intended for
-long-running training. For a much smaller 2-GPU padded PPO validation run, use:
+The command above is the full GRPO packed configuration and is intended for
+long-running training. For a much smaller 2-GPU PPO validation run, use:
 
 ```bash
 python -m accerl_agent.run_agent_textworld \
@@ -186,7 +185,7 @@ python -m accerl_agent.run_agent_textworld \
   --infer-tp-size 1 \
   --num-rollout-workers 1 \
   --rollout-batch-size 2 \
-  --batch-size 2 \
+  --train-max-sequences-per-pack 2 \
   --grad-accum-steps 1 \
   --replay-capacity 8 \
   --min-replay-size-per-rank 2 \
@@ -196,18 +195,17 @@ python -m accerl_agent.run_agent_textworld \
   --train-mode full \
   --rl-algorithm ppo \
   --clip-mode ppo \
-  --train-packing padded \
+  --train-token-budget 2048 \
   --gae-lambda 0.95 \
   --value-loss-coef 0.5 \
   --dtype bfloat16 \
   --trust-remote-code
 ```
 
-GRPO varlen selects at most `--batch-size` samples and packs no more than
-`--train-token-budget` real tokens into one microbatch. Padded PPO instead
-prepares `--grad-accum-steps` CPU microbatches before each optimizer step and
-normalizes every policy, Value, and KL sum by the global response-token count
-of that complete window.
+Packed training selects at most `--train-max-sequences-per-pack` samples and packs no more than
+`--train-token-budget` real tokens into one microbatch. PPO and GRPO prepare
+`--grad-accum-steps` CPU packs before each optimizer step and normalize losses
+by the global valid response-token count of that complete window.
 
 GPU requirement for full training:
 
@@ -256,7 +254,7 @@ flowchart LR
     Trainer -->|"NCCL trainable weights"| Infer
 ```
 
-`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, trains the full policy model, and samples independent replay objects. It also owns a separately sharded FP32 Value Head. Padded PPO uses native tensor `logits_to_keep` plus a temporary model-native LM-head hook, so only response/bootstrap logits and final hidden states are retained. It computes current values and batched detached TD(λ) targets when replay is sampled, then optimizes policy and Value losses over the same global response-token denominator. GRPO retains its padded and varlen paths. Weight synchronization to vLLM remains policy-only.
+`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, trains the full policy model, and samples independent replay objects. It also owns a separately sharded FP32 Value Head. PPO uses packed FlashAttention 2 boundaries, native tensor `logits_to_keep`, and a temporary model-native LM-head hook, so only response/bootstrap logits and final hidden states are retained. It computes current values and batched detached TD(λ) targets when replay is sampled, then optimizes policy and Value losses over the same global response-token denominator. GRPO uses the same token-budget packing pipeline. Weight synchronization to vLLM remains policy-only.
 
 `VLLMInferenceActor` handles rollout inference. It starts vLLM with dummy weights, waits for the initial full weight sync, pauses generation during later syncs, aborts requests when needed, updates weights, and then resumes generation.
 
@@ -291,8 +289,7 @@ if lost:
     reward -= tw_lost_penalty
 ```
 
-PPO mode is enabled with `--rl-algorithm ppo` and currently requires
-`--train-packing padded`. Rollout stores token-aligned rewards, behavior
+PPO mode is enabled with `--rl-algorithm ppo`. Rollout stores token-aligned rewards, behavior
 logprobs, terminal/truncation boundaries, and optional final-state bootstrap
 context, but no values, returns, or advantages. The trainer recomputes current
 values and detached token TD(λ) targets on every replay sample. `--gae-gamma`
@@ -317,7 +314,6 @@ Replay stores `RawPPOSample | GRPOSample`. Every token field is aligned to
 `input_ids`:
 
 ```text
-len(input_ids) == len(attention_mask)
 len(input_ids) == len(labels)
 len(input_ids) == len(old_logprobs)
 len(input_ids) == len(response_indices)
@@ -347,14 +343,13 @@ prediction position. PPO rollout never stores values, returns, or advantages.
 | `--infer-tp-size` | vLLM tensor-parallel size. |
 | `--num-rollout-workers` | Number of CPU rollout actors; must be at least `--fsdp-world-size`. |
 | `--rollout-batch-size` | Episode batch size per rollout worker in PPO mode; also the default GRPO group size. |
-| `--batch-size` | Samples per padded micro-batch, or the maximum number of `RLSample` objects in one varlen pack, per FSDP rank. |
-| `--train-packing` | `padded` (default) or `varlen`; varlen removes trainer-side attention padding with FlashAttention 2. |
+| `--train-max-sequences-per-pack` | Maximum number of independent `RLSample` objects in one packed microbatch, per FSDP rank. |
 | `--gae-lambda` | PPO token TD(λ) trace parameter; defaults to `0.95`. |
 | `--value-loss-coef` | Coefficient for the unclipped token Value MSE; defaults to `0.5`. |
 | `--ppo-normalize-advantages` | Normalize detached raw PPO advantages per microbatch across FSDP ranks; enabled by default. |
-| `--train-token-budget` | Maximum real tokens in a varlen pack; required for varlen and must be at least `--max-length`. |
-| `--train-pack-candidate-pool-size` | Replay candidate pool used for length-aware packing; defaults to four times `--batch-size`. |
-| `--train-logprob-mode` | GRPO logprob mode. Padded PPO always uses its native selected-position forward. |
+| `--train-token-budget` | Maximum real tokens in a pack; required and must be at least `--max-length`. |
+| `--train-pack-candidate-pool-size` | Replay candidate pool used for length-aware packing; defaults to four times `--train-max-sequences-per-pack`. |
+| `--train-logprob-mode` | GRPO logprob mode. PPO always uses its native selected-position forward. |
 | `--grad-accum-steps` | Gradient accumulation steps. |
 | `--replay-capacity` | Maximum number of samples in each replay buffer. |
 | `--min-replay-size-per-rank` | Minimum replay size required before a trainer rank starts training. |
@@ -393,9 +388,9 @@ Saved checkpoint contents include model weights, config, tokenizer files, and `t
 | `Replay/FillRatio` | Replay-buffer fill ratio. |
 | `Replay/TrainSampleTrainerVersionLagMean` | Version lag between training samples and the current trainer. |
 | `Train/LossMeanAcrossRanks` | Average loss across FSDP ranks. |
-| `Train/PackTokenUtilization` | Fraction of `--train-token-budget` occupied by real tokens in a varlen pack. |
-| `Train/PackSampleCount` | Number of independent samples in a varlen pack. |
-| `Train/PackMaxSequenceLength` | Longest sequence in the current varlen pack. |
+| `Train/PackTokenUtilization` | Fraction of `--train-token-budget` occupied by real tokens in a pack. |
+| `Train/PackSampleCount` | Number of independent samples in a pack. |
+| `Train/PackMaxSequenceLength` | Longest sequence in the current pack. |
 | `Train/PackCpuMilliseconds` | CPU time spent selecting and constructing a pack. |
 | `KL/OldNewK3TokenMean` | Token-level KL-style metric between old and new policies. |
 | `Infer/TokensPerSec` | vLLM generation throughput. |
@@ -413,14 +408,11 @@ If loss or KL is unstable, lower the learning rate, reduce replay staleness,
 increase the KL penalty, and confirm that invalid, aborted, or empty outputs
 are not mistakenly labeled as trainable tokens. PPO advantage normalization
 is enabled by default and can be disabled with
-`--no-ppo-normalize-advantages`. PPO varlen is intentionally unsupported;
-GRPO varlen remains available.
+`--no-ppo-normalize-advantages`.
 
-If varlen model loading fails, verify that `flash_attn` imports in the trainer
+If packed model loading fails, verify that `flash_attn` imports in the trainer
 environment, the model supports `flash_attention_2`, and the dtype is
 `bfloat16`, `float16`, or `auto`. If
 `--train-logprob-mode response_only_lm_head` fails, also confirm that the model
-forward accepts tensor `logits_to_keep`; alternatively, keep varlen packing and
-use `--train-logprob-mode full_logits_ce`. Use `--train-packing padded` with
-`--train-logprob-mode full_logits_ce` as the broader correctness and
-compatibility fallback.
+forward accepts tensor `logits_to_keep`; alternatively, use
+`--train-logprob-mode full_logits_ce` for GRPO.

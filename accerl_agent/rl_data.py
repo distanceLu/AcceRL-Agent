@@ -19,8 +19,7 @@ TerminationReason: TypeAlias = Literal[
 class RawPPOSample:
     algorithm: Literal["ppo"]
     input_ids: List[int]
-    attention_mask: List[int]  # padding的位置为0，非padding的位置为1
-    labels: List[int]  # 模型生成的response/action token:label 等于对应的 input_ids, prompt、observation、padding token:label 等于 -100
+    labels: List[int]  # 模型生成的response/action token:label 等于对应的 input_ids, prompt、observation token:label 等于 -100
     old_logprobs: List[float]  # rollout时模型生成的response/action token的logprob
     token_rewards: List[float]  # 每个 token 对应的奖励
     token_terminated: List[bool]  # 每个 token 是否是终止状态的标记,终止token的回来回报为0
@@ -35,7 +34,6 @@ class RawPPOSample:
 class GRPOSample:
     algorithm: Literal["grpo"]
     input_ids: List[int]
-    attention_mask: List[int]
     labels: List[int]
     old_logprobs: List[float]
     response_indices: List[int]
@@ -49,7 +47,6 @@ RLSample: TypeAlias = RawPPOSample | GRPOSample
 def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
     length = len(sample.input_ids)
     token_fields = {
-        "attention_mask": sample.attention_mask,
         "labels": sample.labels,
         "old_logprobs": sample.old_logprobs,
         "token_rewards": sample.token_rewards,
@@ -67,9 +64,6 @@ def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
             )
     if sample.labels[0] != -100:
         raise ValueError("The first PPO token cannot be a causal target.")
-    if any(mask != 1 for mask in sample.attention_mask):
-        raise ValueError("Raw PPO samples cannot contain padding.")
-
     valid_targets = [
         index for index, label in enumerate(sample.labels) if label != -100
     ]
