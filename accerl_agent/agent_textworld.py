@@ -187,6 +187,20 @@ class PPOFlatTokenView:
     bootstrap_mask: torch.Tensor
 
 
+@dataclass(frozen=True)
+class FrozenPPOTargets:
+    """CPU-resident PPO targets frozen at optimizer-window start."""
+
+    raw_advantages: torch.Tensor
+    returns: torch.Tensor
+    response_sample_indices: torch.Tensor
+    response_ordinals: torch.Tensor
+    response_counts: torch.Tensor
+    valid_token_count: int
+    cpu_rng_state: torch.Tensor
+    cuda_rng_state: torch.Tensor | None
+
+
 class PackedTensorStats:
     """Named scalar statistics packed into one tensor for one all-reduce."""
 
@@ -252,6 +266,8 @@ class PPOTokenStats(PackedTensorStats):
     value_sq_sum: torch.Tensor
     return_sum: torch.Tensor
     return_sq_sum: torch.Tensor
+    raw_advantage_sum: torch.Tensor
+    raw_advantage_sq_sum: torch.Tensor
     terminated_count: torch.Tensor
     truncated_count: torch.Tensor
 
@@ -1005,6 +1021,7 @@ class FSDPTrainWorker:
         self.train_micro_step = 0
         self.optimizer_step = 0
         self.pending_prepared_samples: List[RLSample] = []
+        self._ppo_forward_buffers_validated = False
 
         self.transfer_port = None
         self.transfer_master_address = None
@@ -1571,12 +1588,54 @@ class FSDPTrainWorker:
             or view.response_ordinals.ge(expected_counts).any()
         ):
             raise RuntimeError("PPO response ordinal is out of range.")
+        actual_counts = torch.bincount(
+            view.response_sample_indices.long(),
+            minlength=sample_count,
+        )
+        if not torch.equal(actual_counts, view.response_counts.long()):
+            raise RuntimeError(
+                "PPO response sample indices do not match response counts."
+            )
+        dense_width = int(view.response_counts.max().item())
+        timeline_keys = (
+            view.response_sample_indices.long() * dense_width
+            + view.response_ordinals.long()
+        )
+        if torch.unique(timeline_keys).numel() != num_tokens:
+            raise RuntimeError("PPO response timeline coordinates must be unique.")
 
-    def _compute_ppo_token_sums(
+    @staticmethod
+    def _validate_ppo_boundary_layout(view: PPOFlatTokenView) -> None:
+        expected_final = view.response_ordinals.eq(
+            view.response_counts[view.response_sample_indices] - 1
+        )
+        boundaries = view.terminated.logical_or(view.truncated)
+        if not torch.equal(boundaries, expected_final):
+            raise RuntimeError(
+                "Every PPO sample must have exactly one boundary on its "
+                "final response token."
+            )
+        final_truncated = torch.zeros_like(view.bootstrap_mask)
+        final_sample_indices = view.response_sample_indices[expected_final]
+        final_truncated[final_sample_indices] = (
+            view.truncated[expected_final]
+        )
+        if not torch.equal(view.bootstrap_mask, final_truncated):
+            raise RuntimeError(
+                "PPO bootstrap mask must exactly match truncated samples."
+            )
+        final_terminated = torch.zeros_like(view.bootstrap_mask)
+        final_terminated[final_sample_indices] = view.terminated[expected_final]
+        if view.bootstrap_mask.logical_and(final_terminated).any():
+            raise RuntimeError("Terminated PPO samples cannot bootstrap.")
+
+    def _compute_ppo_raw_targets(
         self,
         view: PPOFlatTokenView,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute detached FP32 token advantages and returns for one pack."""
         self._validate_ppo_flat_token_view(view)
+        self._validate_ppo_boundary_layout(view)
         sample_count = int(view.response_counts.numel())
         dense_width = int(view.response_counts.max().item())
         dense_valid_mask = (
@@ -1651,35 +1710,159 @@ class FSDPTrainWorker:
             raise RuntimeError("PPO batched GAE value/token alignment mismatch.")
         if raw_advantages.requires_grad or returns.requires_grad:
             raise RuntimeError("PPO GAE targets must be detached.")
+        return raw_advantages.float().detach(), returns.float().detach()
 
-        if self.args.ppo_normalize_advantages:
-            advantage_stats = torch.stack(
-                (
-                    raw_advantages.double().sum(),
-                    raw_advantages.double().square().sum(),
-                    raw_advantages.new_tensor(
-                        raw_advantages.numel(),
-                        dtype=torch.float64,
-                    ),
+    @staticmethod
+    def _capture_ppo_rng_state(device: torch.device) -> Tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        cpu_rng_state = torch.get_rng_state().clone()
+        cuda_rng_state = None
+        if device.type == "cuda":
+            cuda_rng_state = torch.cuda.get_rng_state(device).clone()
+        return cpu_rng_state, cuda_rng_state
+
+    @staticmethod
+    def _restore_ppo_rng_state(
+        device: torch.device,
+        cpu_rng_state: torch.Tensor,
+        cuda_rng_state: torch.Tensor | None,
+    ) -> None:
+        torch.set_rng_state(cpu_rng_state)
+        if device.type == "cuda":
+            if cuda_rng_state is None:
+                raise RuntimeError("Frozen PPO target is missing CUDA RNG state.")
+            torch.cuda.set_rng_state(cuda_rng_state, device)
+
+    @staticmethod
+    def _finalize_ppo_advantage_moments(
+        moments: torch.Tensor,
+        *,
+        expected_count: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if moments.shape != (3,) or moments.dtype != torch.float64:
+            raise ValueError(
+                "PPO advantage moments must be a three-element FP64 tensor."
+            )
+        global_sum, global_sq_sum, global_count = moments
+        advantage_count = int(global_count.item())
+        if advantage_count != expected_count:
+            raise RuntimeError(
+                "Global PPO advantage count does not match the optimizer-window "
+                "valid response-token count: "
+                f"{advantage_count} != {expected_count}."
+            )
+        if advantage_count <= 0:
+            raise RuntimeError("Global PPO advantage count must be positive.")
+        mean = global_sum / global_count
+        variance = (
+            global_sq_sum / global_count - mean.square()
+        ).clamp_min(0.0)
+        return mean, variance.sqrt()
+
+    @staticmethod
+    def _normalize_ppo_advantages(
+        raw_advantages: torch.Tensor,
+        *,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        if mean.ndim != 0 or std.ndim != 0:
+            raise ValueError("PPO advantage mean and std must be scalars.")
+        return (
+            raw_advantages.detach().float()
+            - mean.to(device=raw_advantages.device, dtype=torch.float32)
+        ) / (
+            std.to(device=raw_advantages.device, dtype=torch.float32)
+            + float(eps)
+        )
+
+    @staticmethod
+    def _freeze_ppo_targets(
+        view: PPOFlatTokenView,
+        raw_advantages: torch.Tensor,
+        returns: torch.Tensor,
+        *,
+        cpu_rng_state: torch.Tensor,
+        cuda_rng_state: torch.Tensor | None,
+    ) -> FrozenPPOTargets:
+        return FrozenPPOTargets(
+            raw_advantages=raw_advantages.detach().float().cpu().contiguous(),
+            returns=returns.detach().float().cpu().contiguous(),
+            response_sample_indices=(
+                view.response_sample_indices.detach().long().cpu().contiguous()
+            ),
+            response_ordinals=(
+                view.response_ordinals.detach().long().cpu().contiguous()
+            ),
+            response_counts=(
+                view.response_counts.detach().long().cpu().contiguous()
+            ),
+            valid_token_count=int(raw_advantages.numel()),
+            cpu_rng_state=cpu_rng_state.detach().cpu().clone(),
+            cuda_rng_state=(
+                cuda_rng_state.detach().cpu().clone()
+                if cuda_rng_state is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _validate_frozen_ppo_targets(
+        view: PPOFlatTokenView,
+        targets: FrozenPPOTargets,
+    ) -> None:
+        token_count = int(view.current_values.numel())
+        if targets.valid_token_count != token_count:
+            raise RuntimeError(
+                "Frozen PPO target token count does not match current view: "
+                f"{targets.valid_token_count} != {token_count}."
+            )
+        if targets.raw_advantages.numel() != targets.returns.numel():
+            raise RuntimeError(
+                "Frozen PPO advantages and returns must have equal length."
+            )
+        layout_fields = {
+            "response_counts": view.response_counts,
+            "response_sample_indices": view.response_sample_indices,
+            "response_ordinals": view.response_ordinals,
+        }
+        for name, current in layout_fields.items():
+            frozen = getattr(targets, name)
+            if not torch.equal(frozen, current.detach().long().cpu()):
+                raise RuntimeError(
+                    f"Frozen PPO target {name} does not match current view."
                 )
-            )
-            dist.all_reduce(advantage_stats, op=dist.ReduceOp.SUM)
-            global_sum, global_sq_sum, global_count = advantage_stats
-            if global_count.item() <= 0:
-                raise RuntimeError("Global PPO advantage count must be positive.")
-            advantage_mean = global_sum / global_count
-            advantage_variance = (
-                global_sq_sum / global_count - advantage_mean.square()
-            ).clamp_min(0.0)
-            actor_advantages = (
-                raw_advantages - advantage_mean.to(raw_advantages.dtype)
-            ) / (
-                advantage_variance.sqrt().to(raw_advantages.dtype)
-                + self.args.ppo_adv_norm_eps
-            )
-        else:
-            actor_advantages = raw_advantages
-        actor_advantages = actor_advantages.detach()
+
+    def _compute_ppo_loss_from_targets(
+        self,
+        view: PPOFlatTokenView,
+        *,
+        raw_advantages: torch.Tensor,
+        actor_advantages: torch.Tensor,
+        returns: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute PPO token sums from already detached actor/critic targets."""
+        self._validate_ppo_flat_token_view(view)
+        expected_shape = view.current_values.shape
+        target_fields = {
+            "raw_advantages": raw_advantages,
+            "actor_advantages": actor_advantages,
+            "returns": returns,
+        }
+        for name, tensor in target_fields.items():
+            if tensor.shape != expected_shape:
+                raise RuntimeError(
+                    f"PPO {name} shape must be {tuple(expected_shape)}, "
+                    f"got {tuple(tensor.shape)}."
+                )
+            if tensor.requires_grad:
+                raise RuntimeError(f"PPO {name} must be detached.")
+        raw_advantages = raw_advantages.detach().float()
+        actor_advantages = actor_advantages.detach().float()
+        returns = returns.detach().float()
 
         valid_log_ratio = view.current_logprobs.float() - view.old_logprobs.float()
         valid_ratio = torch.exp(valid_log_ratio)
@@ -1741,10 +1924,29 @@ class FSDPTrainWorker:
                 value_sq_sum=values_detached.square().sum(),
                 return_sum=returns_float.sum(),
                 return_sq_sum=returns_float.square().sum(),
+                raw_advantage_sum=raw_advantages.sum(),
+                raw_advantage_sq_sum=raw_advantages.square().sum(),
                 terminated_count=view.terminated.sum(),
                 truncated_count=view.truncated.sum(),
             ).pack()
         return token_loss_sum, stats
+
+    def _compute_ppo_token_sums(
+        self,
+        view: PPOFlatTokenView,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Single-pass PPO path used when advantage normalization is off."""
+        if self.args.ppo_normalize_advantages:
+            raise RuntimeError(
+                "Normalized PPO must use optimizer-window frozen targets."
+            )
+        raw_advantages, returns = self._compute_ppo_raw_targets(view)
+        return self._compute_ppo_loss_from_targets(
+            view,
+            raw_advantages=raw_advantages,
+            actor_advantages=raw_advantages,
+            returns=returns,
+        )
 
     def _compute_packed_ppo_token_sums(
         self,
@@ -1757,6 +1959,176 @@ class FSDPTrainWorker:
                 batch,
                 max_seqlen=max_seqlen,
             )
+        )
+
+    def _validate_prepared_packed_ppo_batch(
+        self,
+        prepared: PreparedVarlenPack,
+    ) -> None:
+        """Validate PPO timeline metadata on CPU before any FSDP forward."""
+        batch = prepared.batch
+        target_indices = batch["target_indices"]
+        valid_token_count = int(target_indices.numel())
+        if valid_token_count != prepared.valid_token_count:
+            raise RuntimeError(
+                "Prepared PPO valid-token count does not match target indices: "
+                f"{prepared.valid_token_count} != {valid_token_count}."
+            )
+        sample_count = int(batch["response_counts"].numel())
+        bootstrap_mask = torch.zeros(sample_count, dtype=torch.bool)
+        bootstrap_sample_indices = batch["bootstrap_sample_indices"].long()
+        if bootstrap_sample_indices.numel() > 0:
+            bootstrap_mask[bootstrap_sample_indices] = True
+        zeros = torch.zeros(valid_token_count, dtype=torch.float32)
+        bootstrap_values = torch.zeros(sample_count, dtype=torch.float32)
+        view = PPOFlatTokenView(
+            current_logprobs=zeros,
+            old_logprobs=batch["old_logprobs"][target_indices].float(),
+            current_values=zeros,
+            rewards=batch["token_rewards"][target_indices].float(),
+            terminated=batch["token_terminated"][target_indices],
+            truncated=batch["token_truncated"][target_indices],
+            response_sample_indices=batch["response_sample_indices"].long(),
+            response_ordinals=batch["response_ordinals"].long(),
+            response_counts=batch["response_counts"].long(),
+            bootstrap_values=bootstrap_values,
+            bootstrap_mask=bootstrap_mask,
+        )
+        self._validate_ppo_flat_token_view(view)
+        self._validate_ppo_boundary_layout(view)
+
+    def _snapshot_ppo_forward_buffers(self) -> Dict[str, torch.Tensor]:
+        snapshots = {}
+        for root_name, root in (
+            ("model", self.model),
+            ("value_head", self.value_head),
+        ):
+            for name, buffer in root.named_buffers():
+                snapshots[f"{root_name}.{name}"] = buffer.detach().clone()
+        return snapshots
+
+    def _validate_ppo_forward_buffers_unchanged(
+        self,
+        snapshots: Dict[str, torch.Tensor],
+    ) -> None:
+        current = {
+            f"{root_name}.{name}": buffer
+            for root_name, root in (
+                ("model", self.model),
+                ("value_head", self.value_head),
+            )
+            for name, buffer in root.named_buffers()
+        }
+        if current.keys() != snapshots.keys():
+            raise RuntimeError(
+                "PPO forward changed the model buffer set; two-pass target "
+                "replay does not support mutable forward state."
+            )
+        changed = [
+            name
+            for name, before in snapshots.items()
+            if not torch.equal(before, current[name])
+        ]
+        if changed:
+            raise RuntimeError(
+                "PPO forward mutated persistent model buffers; two-pass "
+                "target replay is unsupported. Changed buffers: "
+                f"{changed[:8]}"
+            )
+
+    def _precompute_ppo_optimizer_window_targets(
+        self,
+        window: List[PreparedVarlenPack],
+        *,
+        global_valid_token_count: int,
+    ) -> Tuple[
+        List[FrozenPPOTargets],
+        torch.Tensor,
+        torch.Tensor,
+        float,
+    ]:
+        """Freeze one optimizer window and compute its cross-rank moments."""
+        start_time = time.perf_counter()
+        local_moments = torch.zeros(
+            3,
+            device=self.device,
+            dtype=torch.float64,
+        )
+        frozen_targets = []
+        validate_buffers = not self._ppo_forward_buffers_validated
+
+        for pack_index, prepared in enumerate(window):
+            local_error = None
+            frozen = None
+            batch = None
+            try:
+                batch = move_batch_to_device(prepared.batch, self.device)
+                cpu_rng_state, cuda_rng_state = self._capture_ppo_rng_state(
+                    self.device
+                )
+                buffer_snapshots = (
+                    self._snapshot_ppo_forward_buffers()
+                    if validate_buffers and pack_index == 0
+                    else None
+                )
+                with torch.no_grad():
+                    view = self._forward_ppo_token_view(
+                        batch,
+                        max_seqlen=prepared.max_seqlen,
+                    )
+                    raw_advantages, returns = self._compute_ppo_raw_targets(view)
+                if buffer_snapshots is not None:
+                    self._validate_ppo_forward_buffers_unchanged(
+                        buffer_snapshots
+                    )
+                frozen = self._freeze_ppo_targets(
+                    view,
+                    raw_advantages,
+                    returns,
+                    cpu_rng_state=cpu_rng_state,
+                    cuda_rng_state=cuda_rng_state,
+                )
+                advantages64 = raw_advantages.double()
+                local_moments[0] += advantages64.sum()
+                local_moments[1] += advantages64.square().sum()
+                local_moments[2] += advantages64.numel()
+            except Exception as exc:
+                local_error = repr(exc)
+                print(
+                    f"[rank {self.rank}] PPO target prepass failed at "
+                    f"pack {pack_index}: {local_error}"
+                )
+            finally:
+                del batch
+
+            success = torch.tensor(
+                0 if local_error is not None else 1,
+                device=self.device,
+                dtype=torch.int32,
+            )
+            dist.all_reduce(success, op=dist.ReduceOp.MIN)
+            if int(success.item()) != 1:
+                raise RuntimeError(
+                    "At least one FSDP rank failed during PPO target "
+                    f"prepass pack {pack_index}; see rank logs."
+                )
+            assert frozen is not None
+            frozen_targets.append(frozen)
+
+        self._ppo_forward_buffers_validated = True
+        dist.all_reduce(local_moments, op=dist.ReduceOp.SUM)
+        advantage_mean, advantage_std = (
+            self._finalize_ppo_advantage_moments(
+                local_moments,
+                expected_count=global_valid_token_count,
+            )
+        )
+        elapsed_milliseconds = (time.perf_counter() - start_time) * 1000.0
+        return (
+            frozen_targets,
+            advantage_mean,
+            advantage_std,
+            elapsed_milliseconds,
         )
 
     def _prepare_varlen_optimizer_window(
@@ -1776,6 +2148,9 @@ class FSDPTrainWorker:
                     "Varlen optimizer window has an unexpected pack count: "
                     f"{len(window)} != {self.args.grad_accum_steps}"
                 )
+            if self.args.rl_algorithm == "ppo":
+                for prepared in window:
+                    self._validate_prepared_packed_ppo_batch(prepared)
         except Exception as exc:
             local_error = repr(exc)
             print(
@@ -1860,20 +2235,72 @@ class FSDPTrainWorker:
                 "response tokens."
             )
 
+        frozen_window = None
+        advantage_mean = None
+        advantage_std = None
+        target_prepass_milliseconds = 0.0
+        if self.args.ppo_normalize_advantages:
+            (
+                frozen_window,
+                advantage_mean,
+                advantage_std,
+                target_prepass_milliseconds,
+            ) = self._precompute_ppo_optimizer_window_targets(
+                window,
+                global_valid_token_count=global_valid_token_count,
+            )
+
         local_token_stats = PPOTokenStats.zeros(self.device)
         local_version_stats = torch.zeros(
             2,
             device=self.device,
             dtype=torch.float64,
         )
-        for prepared in window:
+        for pack_index, prepared in enumerate(window):
             batch = move_batch_to_device(prepared.batch, self.device)
-            token_loss_sum, token_stats = (
-                self._compute_packed_ppo_token_sums(
+            if frozen_window is not None:
+                frozen = frozen_window[pack_index]
+                self._restore_ppo_rng_state(
+                    self.device,
+                    frozen.cpu_rng_state,
+                    frozen.cuda_rng_state,
+                )
+                view = self._forward_ppo_token_view(
                     batch,
                     max_seqlen=prepared.max_seqlen,
                 )
-            )
+                self._validate_frozen_ppo_targets(view, frozen)
+                raw_advantages = frozen.raw_advantages.to(
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                returns = frozen.returns.to(
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                assert advantage_mean is not None
+                assert advantage_std is not None
+                actor_advantages = self._normalize_ppo_advantages(
+                    raw_advantages,
+                    mean=advantage_mean,
+                    std=advantage_std,
+                    eps=self.args.ppo_adv_norm_eps,
+                )
+                token_loss_sum, token_stats = (
+                    self._compute_ppo_loss_from_targets(
+                        view,
+                        raw_advantages=raw_advantages,
+                        actor_advantages=actor_advantages,
+                        returns=returns,
+                    )
+                )
+            else:
+                token_loss_sum, token_stats = (
+                    self._compute_packed_ppo_token_sums(
+                        batch,
+                        max_seqlen=prepared.max_seqlen,
+                    )
+                )
             backward_loss = token_loss_sum * (
                 float(self.fsdp_world_size)
                 / float(global_valid_token_count)
@@ -1890,6 +2317,8 @@ class FSDPTrainWorker:
             local_version_stats[1] += prepared.sample_count
             self.train_micro_step += 1
             del batch, token_loss_sum, token_stats, backward_loss
+            if frozen_window is not None:
+                del view, raw_advantages, actor_advantages, returns, frozen
 
         dist.all_reduce(local_token_stats, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_version_stats, op=dist.ReduceOp.SUM)
@@ -1934,6 +2363,7 @@ class FSDPTrainWorker:
             "kl_token_mean": kl_mean,
             "clip_fraction": stats["clip_count"] / token_count,
             "current_lr": current_lr,
+            "ppo_target_prepass_milliseconds": target_prepass_milliseconds,
         }
 
     def _run_grpo_optimizer_step(
@@ -2210,6 +2640,7 @@ class FSDPTrainWorker:
 
         value_mean, value_std = moments("value")
         return_mean, return_std = moments("return")
+        raw_advantage_mean, raw_advantage_std = moments("raw_advantage")
         residual_mean = return_mean - value_mean
         residual_variance = max(
             2.0 * value_loss_mean - residual_mean * residual_mean,
@@ -2242,6 +2673,15 @@ class FSDPTrainWorker:
                 "segment_value_prediction_std": value_std,
                 "segment_return_mean": return_mean,
                 "segment_return_std": return_std,
+                "segment_raw_advantage_mean": raw_advantage_mean,
+                "segment_raw_advantage_std": raw_advantage_std,
+                "segment_ppo_target_prepass_milliseconds": (
+                    sum(
+                        float(step["ppo_target_prepass_milliseconds"])
+                        for step in global_steps
+                    )
+                    / max(len(global_steps), 1)
+                ),
                 "segment_value_mse": (
                     2.0
                     * aggregate_ppo_stats["value_loss_sum"]
@@ -4093,6 +4533,18 @@ async def run_textworld_train(args: argparse.Namespace):
                 )
                 / len(summaries)
             )
+            ppo_target_prepass_milliseconds = (
+                sum(
+                    float(
+                        summary.get(
+                            "segment_ppo_target_prepass_milliseconds",
+                            0.0,
+                        )
+                    )
+                    for summary in summaries
+                )
+                / len(summaries)
+            )
             version_lag_mean = (
                 sum(
                     float(summary["segment_version_lag_mean"])
@@ -4196,6 +4648,11 @@ async def run_textworld_train(args: argparse.Namespace):
                     tb_step,
                 )
             if args.rl_algorithm == "ppo":
+                writer.add_scalar(
+                    "Train/PPOTargetPrepassMilliseconds",
+                    ppo_target_prepass_milliseconds,
+                    tb_step,
+                )
                 ppo_metric_tags = {
                     "Value/PredictionMean": "segment_value_prediction_mean",
                     "Value/PredictionStd": "segment_value_prediction_std",
@@ -4210,6 +4667,10 @@ async def run_textworld_train(args: argparse.Namespace):
                         "segment_truncated_token_count"
                     ),
                     "PPO/BootstrapFraction": "segment_bootstrap_fraction",
+                    "PPO/RawAdvantageMean": (
+                        "segment_raw_advantage_mean"
+                    ),
+                    "PPO/RawAdvantageStd": "segment_raw_advantage_std",
                 }
                 for tag, summary_key in ppo_metric_tags.items():
                     writer.add_scalar(
@@ -4509,8 +4970,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Normalize detached raw PPO token advantages across all FSDP "
-            "ranks in each microbatch."
+            "Normalize detached raw PPO token advantages across the full "
+            "optimizer accumulation window on all FSDP ranks."
         ),
     )
     parser.add_argument(
