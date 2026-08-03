@@ -268,6 +268,7 @@ class PPOTokenStats(PackedTensorStats):
     return_sq_sum: torch.Tensor
     raw_advantage_sum: torch.Tensor
     raw_advantage_sq_sum: torch.Tensor
+    raw_advantage_count: torch.Tensor
     terminated_count: torch.Tensor
     truncated_count: torch.Tensor
 
@@ -1020,6 +1021,8 @@ class FSDPTrainWorker:
 
         self.train_micro_step = 0
         self.optimizer_step = 0
+        self.ppo_adv_ema_mean: float | None = None
+        self.ppo_adv_ema_variance: float | None = None
         self.pending_prepared_samples: List[RLSample] = []
         self._ppo_forward_buffers_validated = False
 
@@ -1915,6 +1918,7 @@ class FSDPTrainWorker:
         with torch.no_grad():
             values_detached = view.current_values.detach().float()
             returns_float = returns.float()
+            raw_advantages64 = raw_advantages.double()
             stats = PPOTokenStats(
                 policy_sum=policy_sum,
                 value_loss_sum=value_loss_sum,
@@ -1924,8 +1928,11 @@ class FSDPTrainWorker:
                 value_sq_sum=values_detached.square().sum(),
                 return_sum=returns_float.sum(),
                 return_sq_sum=returns_float.square().sum(),
-                raw_advantage_sum=raw_advantages.sum(),
-                raw_advantage_sq_sum=raw_advantages.square().sum(),
+                raw_advantage_sum=raw_advantages64.sum(),
+                raw_advantage_sq_sum=raw_advantages64.square().sum(),
+                raw_advantage_count=raw_advantages64.new_tensor(
+                    raw_advantages64.numel()
+                ),
                 terminated_count=view.terminated.sum(),
                 truncated_count=view.truncated.sum(),
             ).pack()
@@ -1934,17 +1941,43 @@ class FSDPTrainWorker:
     def _compute_ppo_token_sums(
         self,
         view: PPOFlatTokenView,
+        *,
+        ema_mean: float | None = None,
+        ema_scale: float | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Single-pass PPO path used when advantage normalization is off."""
-        if self.args.ppo_normalize_advantages:
+        """Compute a single-forward PPO objective from current raw targets."""
+        mode = self.args.ppo_advantage_normalization
+        if mode == "optimizer_window":
             raise RuntimeError(
-                "Normalized PPO must use optimizer-window frozen targets."
+                "Optimizer-window PPO must use frozen two-pass targets."
             )
         raw_advantages, returns = self._compute_ppo_raw_targets(view)
+        if mode == "none":
+            actor_advantages = raw_advantages
+        elif mode == "ema_rms":
+            if ema_scale is None:
+                raise RuntimeError("EMA-RMS PPO requires a frozen EMA scale.")
+            actor_advantages = raw_advantages / ema_scale
+        elif mode == "ema_zscore":
+            if ema_mean is None or ema_scale is None:
+                raise RuntimeError(
+                    "EMA-ZScore PPO requires frozen EMA mean and scale."
+                )
+            actor_advantages = (raw_advantages - ema_mean) / ema_scale
+        else:
+            raise ValueError(
+                "Unsupported PPO advantage normalization mode: "
+                f"{mode!r}."
+            )
+        if not torch.isfinite(actor_advantages).all():
+            raise RuntimeError(
+                "PPO actor advantages contain non-finite values after "
+                f"{mode} normalization."
+            )
         return self._compute_ppo_loss_from_targets(
             view,
             raw_advantages=raw_advantages,
-            actor_advantages=raw_advantages,
+            actor_advantages=actor_advantages,
             returns=returns,
         )
 
@@ -1953,12 +1986,16 @@ class FSDPTrainWorker:
         batch: Dict[str, torch.Tensor],
         *,
         max_seqlen: int,
+        ema_mean: float | None = None,
+        ema_scale: float | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._compute_ppo_token_sums(
             self._forward_ppo_token_view(
                 batch,
                 max_seqlen=max_seqlen,
-            )
+            ),
+            ema_mean=ema_mean,
+            ema_scale=ema_scale,
         )
 
     def _validate_prepared_packed_ppo_batch(
@@ -2235,11 +2272,48 @@ class FSDPTrainWorker:
                 "response tokens."
             )
 
+        normalization_mode = self.args.ppo_advantage_normalization
+        ema_mode = normalization_mode in ("ema_rms", "ema_zscore")
+        ema_mean = self.ppo_adv_ema_mean
+        ema_variance = self.ppo_adv_ema_variance
+        if (ema_mean is None) != (ema_variance is None):
+            raise RuntimeError(
+                "PPO advantage EMA mean and variance must be initialized "
+                "together."
+            )
+        ema_initialized = ema_mean is not None
+        use_optimizer_window = (
+            normalization_mode == "optimizer_window"
+            or (ema_mode and not ema_initialized)
+        )
+        ema_scale = None
+        ema_scale_clamped = False
+        if ema_mode and ema_initialized:
+            assert ema_mean is not None
+            assert ema_variance is not None
+            if not math.isfinite(ema_mean) or not math.isfinite(ema_variance):
+                raise RuntimeError("PPO advantage EMA state must be finite.")
+            if ema_variance < 0.0:
+                raise RuntimeError("PPO advantage EMA variance must be >= 0.")
+            if normalization_mode == "ema_rms":
+                raw_ema_scale = math.sqrt(
+                    max(ema_variance + ema_mean * ema_mean, 0.0)
+                )
+            else:
+                raw_ema_scale = math.sqrt(max(ema_variance, 0.0))
+            ema_scale = max(
+                raw_ema_scale,
+                self.args.ppo_advantage_min_scale,
+            )
+            ema_scale_clamped = (
+                raw_ema_scale < self.args.ppo_advantage_min_scale
+            )
+
         frozen_window = None
         advantage_mean = None
         advantage_std = None
         target_prepass_milliseconds = 0.0
-        if self.args.ppo_normalize_advantages:
+        if use_optimizer_window:
             (
                 frozen_window,
                 advantage_mean,
@@ -2299,6 +2373,8 @@ class FSDPTrainWorker:
                     self._compute_packed_ppo_token_sums(
                         batch,
                         max_seqlen=prepared.max_seqlen,
+                        ema_mean=ema_mean,
+                        ema_scale=ema_scale,
                     )
                 )
             backward_loss = token_loss_sum * (
@@ -2323,6 +2399,60 @@ class FSDPTrainWorker:
         dist.all_reduce(local_token_stats, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_version_stats, op=dist.ReduceOp.SUM)
 
+        stats = PPOTokenStats.unpack(local_token_stats).to_float_dict()
+        raw_advantage_count = stats["raw_advantage_count"]
+        if raw_advantage_count != float(global_valid_token_count):
+            raise RuntimeError(
+                "Global raw advantage count does not match global valid-token "
+                f"count: {raw_advantage_count} != "
+                f"{global_valid_token_count}."
+            )
+        raw_advantage_mean = (
+            stats["raw_advantage_sum"] / raw_advantage_count
+        )
+        raw_advantage_variance = max(
+            stats["raw_advantage_sq_sum"] / raw_advantage_count
+            - raw_advantage_mean * raw_advantage_mean,
+            0.0,
+        )
+        if not math.isfinite(raw_advantage_mean) or not math.isfinite(
+            raw_advantage_variance
+        ):
+            raise RuntimeError(
+                "Global PPO raw advantage moments must be finite."
+            )
+
+        candidate_ema_mean = None
+        candidate_ema_variance = None
+        if ema_mode:
+            if not ema_initialized:
+                candidate_ema_mean = raw_advantage_mean
+                candidate_ema_variance = raw_advantage_variance
+            else:
+                assert ema_mean is not None
+                assert ema_variance is not None
+                alpha = 1.0 - self.args.ppo_advantage_ema_beta
+                delta = raw_advantage_mean - ema_mean
+                candidate_ema_mean = (
+                    self.args.ppo_advantage_ema_beta * ema_mean
+                    + alpha * raw_advantage_mean
+                )
+                candidate_ema_variance = max(
+                    self.args.ppo_advantage_ema_beta * ema_variance
+                    + alpha * raw_advantage_variance
+                    + self.args.ppo_advantage_ema_beta
+                    * alpha
+                    * delta
+                    * delta,
+                    0.0,
+                )
+            if not math.isfinite(candidate_ema_mean) or not math.isfinite(
+                candidate_ema_variance
+            ):
+                raise RuntimeError(
+                    "Updated PPO advantage EMA moments must be finite."
+                )
+
         torch.nn.utils.clip_grad_norm_(
             self.trainable_parameter_list,
             max_norm=1.0,
@@ -2336,10 +2466,14 @@ class FSDPTrainWorker:
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = current_lr
         self.optimizer.step()
+        if ema_mode:
+            assert candidate_ema_mean is not None
+            assert candidate_ema_variance is not None
+            self.ppo_adv_ema_mean = candidate_ema_mean
+            self.ppo_adv_ema_variance = candidate_ema_variance
         self.optimizer.zero_grad(set_to_none=True)
         self.optimizer_step += 1
 
-        stats = PPOTokenStats.unpack(local_token_stats).to_float_dict()
         token_count = float(global_valid_token_count)
         policy_loss_mean = stats["policy_sum"] / token_count
         value_loss_mean = stats["value_loss_sum"] / token_count
@@ -2364,6 +2498,14 @@ class FSDPTrainWorker:
             "clip_fraction": stats["clip_count"] / token_count,
             "current_lr": current_lr,
             "ppo_target_prepass_milliseconds": target_prepass_milliseconds,
+            "ppo_ema_active": float(ema_mode and ema_initialized),
+            "ppo_ema_mean_used": (
+                float(ema_mean) if ema_mode and ema_initialized else 0.0
+            ),
+            "ppo_ema_scale_used": (
+                float(ema_scale) if ema_scale is not None else 0.0
+            ),
+            "ppo_ema_scale_clamped": float(ema_scale_clamped),
         }
 
     def _run_grpo_optimizer_step(
@@ -2641,6 +2783,20 @@ class FSDPTrainWorker:
         value_mean, value_std = moments("value")
         return_mean, return_std = moments("return")
         raw_advantage_mean, raw_advantage_std = moments("raw_advantage")
+        raw_advantage_rms = math.sqrt(
+            max(
+                aggregate_ppo_stats["raw_advantage_sq_sum"] / denominator,
+                0.0,
+            )
+        )
+        last_ema_step = next(
+            (
+                step
+                for step in reversed(global_steps)
+                if float(step["ppo_ema_active"]) > 0.0
+            ),
+            None,
+        )
         residual_mean = return_mean - value_mean
         residual_variance = max(
             2.0 * value_loss_mean - residual_mean * residual_mean,
@@ -2675,6 +2831,22 @@ class FSDPTrainWorker:
                 "segment_return_std": return_std,
                 "segment_raw_advantage_mean": raw_advantage_mean,
                 "segment_raw_advantage_std": raw_advantage_std,
+                "segment_raw_advantage_rms": raw_advantage_rms,
+                "segment_ppo_ema_mean_used": (
+                    float(last_ema_step["ppo_ema_mean_used"])
+                    if last_ema_step is not None
+                    else 0.0
+                ),
+                "segment_ppo_ema_scale_used": (
+                    float(last_ema_step["ppo_ema_scale_used"])
+                    if last_ema_step is not None
+                    else 0.0
+                ),
+                "segment_ppo_ema_scale_clamped": (
+                    float(last_ema_step["ppo_ema_scale_clamped"])
+                    if last_ema_step is not None
+                    else 0.0
+                ),
                 "segment_ppo_target_prepass_milliseconds": (
                     sum(
                         float(step["ppo_target_prepass_milliseconds"])
@@ -3719,7 +3891,11 @@ class TextWorldRolloutWorkerActor:
                 pending.prompt_obs,
                 pending.prompt_infos,
             )
-            reward = 0.0
+            reward = (
+                0.0
+                if result.stop_reason == "abort"
+                else -self.args.tw_invalid_action_penalty
+            )
 
         state.step_records.append(
             TextWorldStepRecord(
@@ -4306,8 +4482,10 @@ async def run_textworld_train(args: argparse.Namespace):
         f"gae_gamma={args.gae_gamma} "
         f"gae_lambda={args.gae_lambda} "
         f"value_loss_coef={args.value_loss_coef} "
-        f"ppo_normalize_advantages={args.ppo_normalize_advantages} "
-        f"tw_lost_penalty={args.tw_lost_penalty}"
+        "ppo_advantage_normalization="
+        f"{args.ppo_advantage_normalization} "
+        f"tw_lost_penalty={args.tw_lost_penalty} "
+        f"tw_invalid_action_penalty={args.tw_invalid_action_penalty}"
     )
     print(
         "[data] TextWorld full-history token-window transcript mode enabled: "
@@ -4441,7 +4619,8 @@ async def run_textworld_train(args: argparse.Namespace):
             f"gae_gamma={args.gae_gamma} "
             f"gae_lambda={args.gae_lambda} "
             f"value_loss_coef={args.value_loss_coef} "
-            f"ppo_normalize_advantages={args.ppo_normalize_advantages} "
+            "ppo_advantage_normalization="
+            f"{args.ppo_advantage_normalization} "
             f"infer_tp_size={args.infer_tp_size} "
             f"infer_size={args.infer_size} "
             f"infer_max_tokens={args.infer_max_tokens} "
@@ -4671,7 +4850,21 @@ async def run_textworld_train(args: argparse.Namespace):
                         "segment_raw_advantage_mean"
                     ),
                     "PPO/RawAdvantageStd": "segment_raw_advantage_std",
+                    "PPO/RawAdvantageRMS": "segment_raw_advantage_rms",
                 }
+                if args.ppo_advantage_normalization in (
+                    "ema_rms",
+                    "ema_zscore",
+                ):
+                    ppo_metric_tags.update(
+                        {
+                            "PPO/EMAMeanUsed": "segment_ppo_ema_mean_used",
+                            "PPO/EMAScaleUsed": "segment_ppo_ema_scale_used",
+                            "PPO/EMAScaleClamped": (
+                                "segment_ppo_ema_scale_clamped"
+                            ),
+                        }
+                    )
                 for tag, summary_key in ppo_metric_tags.items():
                     writer.add_scalar(
                         tag,
@@ -4877,6 +5070,16 @@ def parse_args() -> argparse.Namespace:
         help="Penalty subtracted from the terminal losing TextWorld step.",
     )
     parser.add_argument(
+        "--tw-invalid-action-penalty",
+        type=float,
+        default=0.0,
+        help=(
+            "Penalty subtracted when the model emits an invalid TextWorld "
+            "command. Generation aborts caused by synchronization are not "
+            "penalized."
+        ),
+    )
+    parser.add_argument(
         "--grpo-group-size",
         type=int,
         default=None,
@@ -4966,13 +5169,37 @@ def parse_args() -> argparse.Namespace:
         help="Policy objective clipping mode.",
     )
     parser.add_argument(
-        "--ppo-normalize-advantages",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        "--ppo-advantage-normalization",
+        choices=("none", "optimizer_window", "ema_rms", "ema_zscore"),
+        default=None,
         help=(
-            "Normalize detached raw PPO token advantages across the full "
-            "optimizer accumulation window on all FSDP ranks."
+            "PPO actor-advantage normalization: exact full optimizer-window "
+            "moments, historical EMA RMS/Z-score moments, or none. Defaults "
+            "to optimizer_window."
         ),
+    )
+    parser.add_argument(
+        "--ppo-normalize-advantages",
+        dest="ppo_normalize_advantages",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Deprecated compatibility alias: true selects optimizer_window "
+            "and false selects none. Do not combine with "
+            "--ppo-advantage-normalization."
+        ),
+    )
+    parser.add_argument(
+        "--ppo-advantage-ema-beta",
+        type=float,
+        default=0.9,
+        help="Per-optimizer-step decay for historical PPO advantage moments.",
+    )
+    parser.add_argument(
+        "--ppo-advantage-min-scale",
+        type=float,
+        default=1e-3,
+        help="Positive scale floor used by EMA PPO normalization modes.",
     )
     parser.add_argument(
         "--gae-lambda",
@@ -5199,6 +5426,22 @@ def parse_args() -> argparse.Namespace:
         help="Optional maximum number of trainable-only sync rounds in the demo.",
     )
     args = parser.parse_args()
+    if (
+        args.ppo_advantage_normalization is not None
+        and args.ppo_normalize_advantages is not None
+    ):
+        raise ValueError(
+            "Do not combine --ppo-advantage-normalization with "
+            "--ppo-normalize-advantages/--no-ppo-normalize-advantages."
+        )
+    if args.ppo_advantage_normalization is None:
+        if args.ppo_normalize_advantages is False:
+            args.ppo_advantage_normalization = "none"
+        else:
+            args.ppo_advantage_normalization = "optimizer_window"
+    args.ppo_normalize_advantages = (
+        args.ppo_advantage_normalization == "optimizer_window"
+    )
     if args.clip_eps <= 0:
         raise ValueError(f"--clip-eps must be > 0, got {args.clip_eps}")
     if args.old_new_kl_coef < 0:
@@ -5340,8 +5583,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--grpo-adv-eps must be > 0")
     if args.ppo_adv_norm_eps <= 0:
         raise ValueError("--ppo-adv-norm-eps must be > 0")
+    if not 0.0 <= args.ppo_advantage_ema_beta < 1.0:
+        raise ValueError("--ppo-advantage-ema-beta must be in [0, 1)")
+    if args.ppo_advantage_min_scale <= 0.0:
+        raise ValueError("--ppo-advantage-min-scale must be > 0")
     if args.tw_lost_penalty < 0:
         raise ValueError("--tw-lost-penalty must be >= 0")
+    if args.tw_invalid_action_penalty < 0:
+        raise ValueError("--tw-invalid-action-penalty must be >= 0")
     if args.rollout_stop_timeout <= 0:
         raise ValueError("--rollout-stop-timeout must be > 0")
     if args.vllm_max_num_seqs < 1:

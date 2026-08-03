@@ -294,7 +294,11 @@ logprobs, terminal/truncation boundaries, and optional final-state bootstrap
 context, but no values, returns, or advantages. The trainer recomputes current
 values and detached token TD(λ) targets on every replay sample. `--gae-gamma`
 discounts once per valid response token; configure the trace and Critic weight
-with `--gae-lambda` and `--value-loss-coef`.
+with `--gae-lambda` and `--value-loss-coef`. PPO advantage normalization
+defaults to exact moments over the complete optimizer accumulation window on
+all FSDP ranks. The `ema_rms` and `ema_zscore` modes use historical global
+moments so initialized EMA steps need only one forward per pack; their first
+step uses the exact window to initialize those moments.
 
 GRPO mode is enabled with `--rl-algorithm grpo`. A group of full trajectories is sampled from the same game, then rewards are normalized within the group:
 
@@ -346,7 +350,10 @@ prediction position. PPO rollout never stores values, returns, or advantages.
 | `--train-max-sequences-per-pack` | Maximum number of independent `RLSample` objects in one packed microbatch, per FSDP rank. |
 | `--gae-lambda` | PPO token TD(λ) trace parameter; defaults to `0.95`. |
 | `--value-loss-coef` | Coefficient for the unclipped token Value MSE; defaults to `0.5`. |
-| `--ppo-normalize-advantages` | Normalize detached raw PPO advantages per microbatch across FSDP ranks; enabled by default. |
+| `--ppo-advantage-normalization` | PPO advantage mode: `optimizer_window` (default), `ema_rms`, `ema_zscore`, or `none`. |
+| `--ppo-advantage-ema-beta` | Per-optimizer-step EMA decay for historical advantage moments; defaults to `0.9`. |
+| `--ppo-advantage-min-scale` | Positive scale floor for EMA normalization; defaults to `1e-3`. |
+| `--ppo-normalize-advantages` | Deprecated compatibility alias for `optimizer_window`; its `--no-...` form selects `none`. |
 | `--train-token-budget` | Maximum real tokens in a pack; required and must be at least `--max-length`. |
 | `--train-pack-candidate-pool-size` | Replay candidate pool used for length-aware packing; defaults to four times `--train-max-sequences-per-pack`. |
 | `--train-logprob-mode` | GRPO logprob mode. PPO always uses its native selected-position forward. |
@@ -406,9 +413,9 @@ If vLLM weight sync fails, check GPU counts, vLLM weight-transfer API support, t
 
 If loss or KL is unstable, lower the learning rate, reduce replay staleness,
 increase the KL penalty, and confirm that invalid, aborted, or empty outputs
-are not mistakenly labeled as trainable tokens. PPO advantage normalization
-is enabled by default and can be disabled with
-`--no-ppo-normalize-advantages`.
+are not mistakenly labeled as trainable tokens. Compare the default exact
+`optimizer_window` normalization with the single-forward `ema_rms` mode, or
+disable normalization with `--ppo-advantage-normalization none`.
 
 If packed model loading fails, verify that `flash_attn` imports in the trainer
 environment, the model supports `flash_attention_2`, and the dtype is

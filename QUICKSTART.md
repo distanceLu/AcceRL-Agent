@@ -383,8 +383,9 @@ This is the most important stability check. Every sample must guarantee:
 - Lower the learning rate.
 - Reduce `--sync-every-optimizer-steps` or `--replay-capacity` to reduce sample staleness.
 - PPO uses packed training, on-the-fly current values, and token TD(λ).
-  Advantage normalization is enabled by default; use
-  `--no-ppo-normalize-advantages` to disable it.
+  `--ppo-advantage-normalization optimizer_window` is the default exact
+  full-window mode. Use `ema_rms` or `ema_zscore` for historical-moment,
+  single-forward steps, or `none` to disable normalization.
 - Increase `--old-new-kl-coef`.
 - Confirm that invalid, aborted, or empty outputs are not mistakenly marked as trainable tokens.
 
