@@ -193,10 +193,6 @@ class FrozenPPOTargets:
 
     raw_advantages: torch.Tensor
     returns: torch.Tensor
-    response_sample_indices: torch.Tensor
-    response_ordinals: torch.Tensor
-    response_counts: torch.Tensor
-    valid_token_count: int
     cpu_rng_state: torch.Tensor
     cuda_rng_state: torch.Tensor | None
 
@@ -302,7 +298,6 @@ def make_grpo_varlen_batch(
     input_ids = []
     labels = []
     old_logprobs = []
-    response_indices = []
     output_versions = []
     position_ids = []
     sequence_ids = []
@@ -318,7 +313,6 @@ def make_grpo_varlen_batch(
         input_ids.extend(example.input_ids)
         labels.extend(example.labels)
         old_logprobs.extend(example.old_logprobs)
-        response_indices.extend(example.response_indices)
         output_versions.extend(example.output_versions)
         position_ids.extend(range(length))
         sequence_ids.extend([sequence_id] * length)
@@ -350,11 +344,9 @@ def make_grpo_varlen_batch(
         "sample_advantages": torch.tensor(
             [example.advantage for example in examples], dtype=torch.float32
         ),
-        "response_indices": torch.tensor(response_indices, dtype=torch.long),
         "output_versions": torch.tensor(output_versions, dtype=torch.long),
         "sequence_ids": torch.tensor(sequence_ids, dtype=torch.long),
         "target_indices": torch.tensor(target_indices, dtype=torch.long),
-        "prediction_indices": torch.tensor(prediction_indices, dtype=torch.long),
     }
 
 
@@ -373,7 +365,6 @@ def make_ppo_varlen_batch(
     token_rewards: List[float] = []
     token_terminated: List[bool] = []
     token_truncated: List[bool] = []
-    response_indices: List[int] = []
     output_versions: List[int] = []
     position_ids: List[int] = []
     sequence_ids: List[int] = []
@@ -397,7 +388,6 @@ def make_ppo_varlen_batch(
         token_rewards.extend(example.token_rewards)
         token_terminated.extend(example.token_terminated)
         token_truncated.extend(example.token_truncated)
-        response_indices.extend(example.response_indices)
         output_versions.extend(example.output_versions)
         position_ids.extend(range(length))
         sequence_ids.extend([sequence_id] * length)
@@ -499,14 +489,8 @@ def make_ppo_varlen_batch(
         "token_rewards": torch.tensor(token_rewards, dtype=torch.float32),
         "token_terminated": torch.tensor(token_terminated, dtype=torch.bool),
         "token_truncated": torch.tensor(token_truncated, dtype=torch.bool),
-        "response_indices": torch.tensor(response_indices, dtype=torch.long),
         "output_versions": torch.tensor(output_versions, dtype=torch.long),
-        "sequence_ids": torch.tensor(sequence_ids, dtype=torch.long),
         "target_indices": torch.tensor(target_indices, dtype=torch.long),
-        "prediction_indices": torch.tensor(
-            prediction_indices,
-            dtype=torch.long,
-        ),
         "response_sample_indices": torch.tensor(
             response_sample_indices,
             dtype=torch.long,
@@ -518,10 +502,6 @@ def make_ppo_varlen_batch(
         "response_counts": torch.tensor(response_counts, dtype=torch.long),
         "bootstrap_sample_indices": torch.tensor(
             bootstrap_sample_indices,
-            dtype=torch.long,
-        ),
-        "bootstrap_prediction_indices": torch.tensor(
-            bootstrap_prediction_indices,
             dtype=torch.long,
         ),
         "selected_positions": torch.tensor(
@@ -1066,11 +1046,9 @@ class FSDPTrainWorker:
             dist.destroy_process_group()
 
     def _prepare_rl_sample(self, sample: RLSample) -> RLSample | None:
-        if sample.algorithm != self.args.rl_algorithm:
-            return None
-        if isinstance(sample, RawPPOSample):
+        if self.args.rl_algorithm == "ppo" and isinstance(sample, RawPPOSample):
             return self._prepare_ppo_sample(sample)
-        if isinstance(sample, GRPOSample):
+        if self.args.rl_algorithm == "grpo" and isinstance(sample, GRPOSample):
             return self._prepare_grpo_sample(sample)
         return None
 
@@ -1084,7 +1062,6 @@ class FSDPTrainWorker:
         token_rewards = list(sample.token_rewards)
         token_terminated = list(sample.token_terminated)
         token_truncated = list(sample.token_truncated)
-        response_indices = list(sample.response_indices)
         output_versions = list(sample.output_versions)
         bootstrap_position = sample.bootstrap_prediction_position
         original_length = len(input_ids)
@@ -1094,7 +1071,6 @@ class FSDPTrainWorker:
             token_rewards,
             token_terminated,
             token_truncated,
-            response_indices,
             output_versions,
         )
         if not input_ids or any(
@@ -1110,7 +1086,6 @@ class FSDPTrainWorker:
             token_rewards = token_rewards[-max_length:]
             token_terminated = token_terminated[-max_length:]
             token_truncated = token_truncated[-max_length:]
-            response_indices = response_indices[-max_length:]
             output_versions = output_versions[-max_length:]
             if bootstrap_position is not None:
                 bootstrap_position -= truncate_offset
@@ -1124,21 +1099,17 @@ class FSDPTrainWorker:
         token_rewards[0] = 0.0
         token_terminated[0] = False
         token_truncated[0] = False
-        response_indices[0] = -1
         output_versions[0] = -1
 
         prepared = RawPPOSample(
-            algorithm="ppo",
             input_ids=input_ids,
             labels=labels,
             old_logprobs=old_logprobs,
             token_rewards=token_rewards,
             token_terminated=token_terminated,
             token_truncated=token_truncated,
-            response_indices=response_indices,
             output_versions=output_versions,
             bootstrap_prediction_position=bootstrap_position,
-            termination_reason=sample.termination_reason,
         )
         try:
             validate_raw_ppo_sample(prepared)
@@ -1153,7 +1124,6 @@ class FSDPTrainWorker:
         input_ids = list(sample.input_ids)
         labels = list(sample.labels)
         old_logprobs = list(sample.old_logprobs)
-        response_indices = list(sample.response_indices)
         output_versions = list(sample.output_versions)
         original_length = len(input_ids)
         if not input_ids or any(
@@ -1161,7 +1131,6 @@ class FSDPTrainWorker:
             for field in (
                 labels,
                 old_logprobs,
-                response_indices,
                 output_versions,
             )
         ):
@@ -1171,33 +1140,25 @@ class FSDPTrainWorker:
             input_ids = input_ids[-max_length:]
             labels = labels[-max_length:]
             old_logprobs = old_logprobs[-max_length:]
-            response_indices = response_indices[-max_length:]
             output_versions = output_versions[-max_length:]
         if len(input_ids) < 2:
             return None
         labels[0] = -100
         old_logprobs[0] = 0.0
-        response_indices[0] = -1
         output_versions[0] = -1
         if all(label == -100 for label in labels[1:]):
             return None
         if any(
-            response_index < 0 or output_version < 0
-            for response_index, output_version, label in zip(
-                response_indices[1:],
-                output_versions[1:],
-                labels[1:],
-            )
+            output_version < 0
+            for output_version, label in zip(output_versions[1:], labels[1:])
             if label != -100
         ):
             return None
         return GRPOSample(
-            algorithm="grpo",
             input_ids=input_ids,
             labels=labels,
             old_logprobs=old_logprobs,
             advantage=sample.advantage,
-            response_indices=response_indices,
             output_versions=output_versions,
         )
 
@@ -1361,7 +1322,7 @@ class FSDPTrainWorker:
                 "use its token-sum path."
             )
         target_indices = batch["target_indices"]
-        prediction_indices = batch["prediction_indices"]
+        prediction_indices = target_indices - 1
         if target_indices.numel() == 0:
             raise RuntimeError("No valid response tokens found for RL loss.")
         valid_sample_indices = batch["sequence_ids"][target_indices]
@@ -1784,7 +1745,6 @@ class FSDPTrainWorker:
 
     @staticmethod
     def _freeze_ppo_targets(
-        view: PPOFlatTokenView,
         raw_advantages: torch.Tensor,
         returns: torch.Tensor,
         *,
@@ -1794,16 +1754,6 @@ class FSDPTrainWorker:
         return FrozenPPOTargets(
             raw_advantages=raw_advantages.detach().float().cpu().contiguous(),
             returns=returns.detach().float().cpu().contiguous(),
-            response_sample_indices=(
-                view.response_sample_indices.detach().long().cpu().contiguous()
-            ),
-            response_ordinals=(
-                view.response_ordinals.detach().long().cpu().contiguous()
-            ),
-            response_counts=(
-                view.response_counts.detach().long().cpu().contiguous()
-            ),
-            valid_token_count=int(raw_advantages.numel()),
             cpu_rng_state=cpu_rng_state.detach().cpu().clone(),
             cuda_rng_state=(
                 cuda_rng_state.detach().cpu().clone()
@@ -1817,27 +1767,15 @@ class FSDPTrainWorker:
         view: PPOFlatTokenView,
         targets: FrozenPPOTargets,
     ) -> None:
-        token_count = int(view.current_values.numel())
-        if targets.valid_token_count != token_count:
+        expected_shape = view.current_values.shape
+        if (
+            targets.raw_advantages.shape != expected_shape
+            or targets.returns.shape != expected_shape
+        ):
             raise RuntimeError(
-                "Frozen PPO target token count does not match current view: "
-                f"{targets.valid_token_count} != {token_count}."
+                "Frozen PPO advantages and returns must match the current "
+                f"value shape {tuple(expected_shape)}."
             )
-        if targets.raw_advantages.numel() != targets.returns.numel():
-            raise RuntimeError(
-                "Frozen PPO advantages and returns must have equal length."
-            )
-        layout_fields = {
-            "response_counts": view.response_counts,
-            "response_sample_indices": view.response_sample_indices,
-            "response_ordinals": view.response_ordinals,
-        }
-        for name, current in layout_fields.items():
-            frozen = getattr(targets, name)
-            if not torch.equal(frozen, current.detach().long().cpu()):
-                raise RuntimeError(
-                    f"Frozen PPO target {name} does not match current view."
-                )
 
     def _compute_ppo_loss_from_targets(
         self,
@@ -2119,7 +2057,6 @@ class FSDPTrainWorker:
                         buffer_snapshots
                     )
                 frozen = self._freeze_ppo_targets(
-                    view,
                     raw_advantages,
                     returns,
                     cpu_rng_state=cpu_rng_state,
@@ -3796,7 +3733,7 @@ class TextWorldRolloutWorkerActor:
         prompt = format_textworld_prompt(obs, infos, tokenizer=self.tokenizer)
         return list(self.tokenizer.encode(prompt))
 
-    def _append_transcript_user_suffix(
+    def _append_transcript_user_content(
         self,
         transcript_ids: List[int],
         user_content: str,
@@ -3806,29 +3743,6 @@ class TextWorldRolloutWorkerActor:
                 user_content,
                 tokenizer=self.tokenizer,
             )
-        )
-
-    def _append_next_observation_to_transcript(
-        self,
-        transcript_ids: List[int],
-        obs: str,
-        infos: Dict,
-    ) -> None:
-        self._append_transcript_user_suffix(
-            transcript_ids,
-            format_textworld_user_content(obs, infos),
-        )
-
-    def _append_illegal_feedback_to_transcript(
-        self,
-        transcript_ids: List[int],
-        action: str,
-        obs: str,
-        infos: Dict,
-    ) -> None:
-        self._append_transcript_user_suffix(
-            transcript_ids,
-            format_textworld_illegal_action_feedback(action, obs, infos),
         )
 
     def _apply_textworld_action_result(
@@ -3867,10 +3781,9 @@ class TextWorldRolloutWorkerActor:
                     "environment_done_without_terminal_signal"
                 )
             if not state.done or state.termination_reason not in {"won", "lost"}:
-                self._append_next_observation_to_transcript(
+                self._append_transcript_user_content(
                     state.transcript_ids,
-                    state.obs,
-                    state.infos,
+                    format_textworld_user_content(state.obs, state.infos),
                 )
             reward = self._compute_step_reward(
                 pending.score_before,
@@ -3885,11 +3798,13 @@ class TextWorldRolloutWorkerActor:
                 if parsed_action.normalized
                 else raw_text.strip()
             )
-            self._append_illegal_feedback_to_transcript(
+            self._append_transcript_user_content(
                 state.transcript_ids,
-                invalid_action,
-                pending.prompt_obs,
-                pending.prompt_infos,
+                format_textworld_illegal_action_feedback(
+                    invalid_action,
+                    pending.prompt_obs,
+                    pending.prompt_infos,
+                ),
             )
             reward = (
                 0.0
@@ -3977,9 +3892,7 @@ class TextWorldRolloutWorkerActor:
         token_rewards: List[float] = []
         token_terminated: List[bool] = []
         token_truncated: List[bool] = []
-        response_indices: List[int] = []
         output_versions: List[int] = []
-        next_response_index = 0
 
         for record in state.step_records:
             prompt_ids = list(record.prompt_ids)
@@ -3995,7 +3908,6 @@ class TextWorldRolloutWorkerActor:
                 token_rewards.extend([0.0] * len(prompt_delta))
                 token_terminated.extend([False] * len(prompt_delta))
                 token_truncated.extend([False] * len(prompt_delta))
-                response_indices.extend([-1] * len(prompt_delta))
                 output_versions.extend([-1] * len(prompt_delta))
 
             result = record.training_result
@@ -4009,7 +3921,6 @@ class TextWorldRolloutWorkerActor:
                 token_rewards.extend([0.0] * len(output_tokens))
                 token_terminated.extend([False] * len(output_tokens))
                 token_truncated.extend([False] * len(output_tokens))
-                response_indices.extend([-1] * len(output_tokens))
                 output_versions.extend([-1] * len(output_tokens))
                 continue
             result_logprobs = list(result.output_logprobs)
@@ -4031,9 +3942,7 @@ class TextWorldRolloutWorkerActor:
             token_rewards.extend(response_token_rewards)
             token_terminated.extend([False] * len(output_tokens))
             token_truncated.extend([False] * len(output_tokens))
-            response_indices.extend([next_response_index] * len(output_tokens))
             output_versions.extend(result.output_versions)
-            next_response_index += 1
 
         bootstrap_prediction_position = None
         if algorithm == "ppo":
@@ -4052,7 +3961,6 @@ class TextWorldRolloutWorkerActor:
                 token_rewards.extend([0.0] * len(final_delta))
                 token_terminated.extend([False] * len(final_delta))
                 token_truncated.extend([False] * len(final_delta))
-                response_indices.extend([-1] * len(final_delta))
                 output_versions.extend([-1] * len(final_delta))
 
         if all(label == -100 for label in labels):
@@ -4064,7 +3972,6 @@ class TextWorldRolloutWorkerActor:
             or len(input_ids) != len(token_rewards)
             or len(input_ids) != len(token_terminated)
             or len(input_ids) != len(token_truncated)
-            or len(input_ids) != len(response_indices)
             or len(input_ids) != len(output_versions)
         ):
             return None
@@ -4086,17 +3993,14 @@ class TextWorldRolloutWorkerActor:
                     return None
                 bootstrap_prediction_position = len(input_ids) - 1
             sample = RawPPOSample(
-                algorithm="ppo",
                 input_ids=input_ids,
                 labels=labels,
                 old_logprobs=old_logprobs,
                 token_rewards=token_rewards,
                 token_terminated=token_terminated,
                 token_truncated=token_truncated,
-                response_indices=response_indices,
                 output_versions=output_versions,
                 bootstrap_prediction_position=bootstrap_prediction_position,
-                termination_reason=state.termination_reason,
             )
             try:
                 validate_raw_ppo_sample(sample)
@@ -4107,11 +4011,9 @@ class TextWorldRolloutWorkerActor:
             if sample_advantage is None:
                 raise ValueError("GRPO samples require a sample advantage.")
             return GRPOSample(
-                algorithm="grpo",
                 input_ids=input_ids,
                 labels=labels,
                 old_logprobs=old_logprobs,
-                response_indices=response_indices,
                 output_versions=output_versions,
                 advantage=float(sample_advantage),
             )
@@ -4134,93 +4036,21 @@ class TextWorldRolloutWorkerActor:
             for reward in rewards
         ]
 
-    async def _run_textworld_grpo_group(
-        self,
-        game_file: str,
-    ) -> None:
+    async def _run_textworld_batch(self, game_file: str) -> None:
+        algorithm = self.args.rl_algorithm
+        if algorithm == "ppo":
+            batch_size = int(self.args.rollout_batch_size)
+        elif algorithm == "grpo":
+            batch_size = int(self.args.grpo_group_size)
+        else:
+            raise ValueError(f"Unsupported rl_algorithm: {algorithm}")
+
         request_infos = make_textworld_request_infos()
         env_id = textworld.gym.register_game(
             game_file,
             request_infos=request_infos,
             max_episode_steps=self.args.tw_max_episode_steps,
         )
-        group_size = int(self.args.grpo_group_size)
-        states: List[TextWorldTrajectoryState] = []
-
-        try:
-            for _ in range(group_size):
-                env = textworld.gym.make(env_id)
-                obs, infos = env.reset()
-                transcript_ids = self._initial_transcript_ids(obs, infos)
-                states.append(
-                    TextWorldTrajectoryState(
-                        env=env,
-                        obs=obs,
-                        infos=dict(infos),
-                        latest_score=_textworld_score(0, infos),
-                        transcript_ids=transcript_ids,
-                        won=bool(infos.get("won", False)),
-                        lost=bool(infos.get("lost", False)),
-                    )
-                )
-
-            for _ in range(self.args.tw_max_episode_steps):
-                active_count = await self._run_textworld_step_batch(
-                    states=states,
-                )
-                if active_count == 0:
-                    break
-
-            raw_returns = [
-                sum(record.reward for record in state.step_records)
-                for state in states
-            ]
-            _, _, advantages = (
-                self._compute_grpo_group_advantages(raw_returns)
-            )
-
-            samples = []
-            for state, advantage in zip(
-                states,
-                advantages,
-            ):
-                sample = self._build_textworld_episode_rl_sample(
-                    state=state,
-                    algorithm="grpo",
-                    sample_advantage=advantage,
-                )
-                if sample is not None:
-                    samples.append(sample)
-
-            if samples:
-                self.replay_buffer.add_samples.remote(samples)
-
-            max_score = _textworld_max_score(states[0].infos) if states else 0.0
-            for state in states:
-                self.stats_actor.add_textworld_episode.remote(
-                    self.worker_id,
-                    state.latest_score,
-                    max_score,
-                    bool(state.won),
-                    len(state.step_records),
-                    state.invalid_actions,
-                )
-
-        finally:
-            for state in states:
-                state.env.close()
-
-    async def _run_textworld_ppo_batch(
-        self,
-        game_file: str,
-    ) -> None:
-        request_infos = make_textworld_request_infos()
-        env_id = textworld.gym.register_game(
-            game_file,
-            request_infos=request_infos,
-            max_episode_steps=self.args.tw_max_episode_steps,
-        )
-        batch_size = int(self.args.rollout_batch_size)
         states: List[TextWorldTrajectoryState] = []
 
         try:
@@ -4247,15 +4077,27 @@ class TextWorldRolloutWorkerActor:
                 if active_count == 0:
                     break
 
-            for state in states:
-                if state.termination_reason is None and state.step_records:
-                    state.done = True
-                    state.termination_reason = "step_limit"
+            if algorithm == "ppo":
+                for state in states:
+                    if state.termination_reason is None and state.step_records:
+                        state.done = True
+                        state.termination_reason = "step_limit"
+                advantages = [None] * len(states)
+            else:
+                raw_returns = [
+                    sum(record.reward for record in state.step_records)
+                    for state in states
+                ]
+                _, _, advantages = self._compute_grpo_group_advantages(
+                    raw_returns
+                )
 
             samples = []
-            for state in states:
+            for state, advantage in zip(states, advantages):
                 sample = self._build_textworld_episode_rl_sample(
                     state=state,
+                    algorithm=algorithm,
+                    sample_advantage=advantage,
                 )
                 if sample is not None:
                     samples.append(sample)
@@ -4284,14 +4126,7 @@ class TextWorldRolloutWorkerActor:
             game_file = self.game_files[
                 (self.worker_id + episode_index) % len(self.game_files)
             ]
-            if self.args.rl_algorithm == "ppo":
-                await self._run_textworld_ppo_batch(game_file)
-            elif self.args.rl_algorithm == "grpo":
-                await self._run_textworld_grpo_group(game_file)
-            else:
-                raise ValueError(
-                    f"Unsupported rl_algorithm: {self.args.rl_algorithm}"
-                )
+            await self._run_textworld_batch(game_file)
             episode_index += 1
 
         print(
@@ -5171,22 +5006,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ppo-advantage-normalization",
         choices=("none", "optimizer_window", "ema_rms", "ema_zscore"),
-        default=None,
+        default="optimizer_window",
         help=(
             "PPO actor-advantage normalization: exact full optimizer-window "
             "moments, historical EMA RMS/Z-score moments, or none. Defaults "
             "to optimizer_window."
-        ),
-    )
-    parser.add_argument(
-        "--ppo-normalize-advantages",
-        dest="ppo_normalize_advantages",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "Deprecated compatibility alias: true selects optimizer_window "
-            "and false selects none. Do not combine with "
-            "--ppo-advantage-normalization."
         ),
     )
     parser.add_argument(
@@ -5217,7 +5041,7 @@ def parse_args() -> argparse.Namespace:
         "--ppo-adv-norm-eps",
         type=float,
         default=1e-8,
-        help="Epsilon used by --ppo-normalize-advantages.",
+        help="Epsilon used by PPO advantage normalization.",
     )
     parser.add_argument(
         "--clip-eps",
@@ -5426,22 +5250,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional maximum number of trainable-only sync rounds in the demo.",
     )
     args = parser.parse_args()
-    if (
-        args.ppo_advantage_normalization is not None
-        and args.ppo_normalize_advantages is not None
-    ):
-        raise ValueError(
-            "Do not combine --ppo-advantage-normalization with "
-            "--ppo-normalize-advantages/--no-ppo-normalize-advantages."
-        )
-    if args.ppo_advantage_normalization is None:
-        if args.ppo_normalize_advantages is False:
-            args.ppo_advantage_normalization = "none"
-        else:
-            args.ppo_advantage_normalization = "optimizer_window"
-    args.ppo_normalize_advantages = (
-        args.ppo_advantage_normalization == "optimizer_window"
-    )
     if args.clip_eps <= 0:
         raise ValueError(f"--clip-eps must be > 0, got {args.clip_eps}")
     if args.old_new_kl_coef < 0:

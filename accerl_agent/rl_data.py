@@ -17,26 +17,21 @@ TerminationReason: TypeAlias = Literal[
 
 @dataclass
 class RawPPOSample:
-    algorithm: Literal["ppo"]
     input_ids: List[int]
     labels: List[int]  # 模型生成的response/action token:label 等于对应的 input_ids, prompt、observation token:label 等于 -100
     old_logprobs: List[float]  # rollout时模型生成的response/action token的logprob
     token_rewards: List[float]  # 每个 token 对应的奖励
     token_terminated: List[bool]  # 每个 token 是否是终止状态的标记,终止token的回来回报为0
     token_truncated: List[bool]  # 每个 token 是否是截断状态的标记,截断token回来回报可能不为0,需要用bootstrap_value来计算gae
-    response_indices: List[int]  # 标识每个生成 token 属于 trajectory 中的第几个 response/action
     output_versions: List[int]
     bootstrap_prediction_position: int | None  # 仅用于被截断的 PPO 样本，指出应该在哪个上下文位置预测最终状态价值 V(s_final)
-    termination_reason: TerminationReason
 
 
 @dataclass
 class GRPOSample:
-    algorithm: Literal["grpo"]
     input_ids: List[int]
     labels: List[int]
     old_logprobs: List[float]
-    response_indices: List[int]
     output_versions: List[int]
     advantage: float  # reward 在构造样本之前已经转换成了组内相对 advantage，所以训练样本不再需要保存原始 reward。
 
@@ -52,7 +47,6 @@ def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
         "token_rewards": sample.token_rewards,
         "token_terminated": sample.token_terminated,
         "token_truncated": sample.token_truncated,
-        "response_indices": sample.response_indices,
         "output_versions": sample.output_versions,
     }
     if length < 2:
@@ -76,10 +70,6 @@ def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
                 raise ValueError(
                     "PPO response labels must equal their input token ids."
                 )
-            if sample.response_indices[index] < 0:
-                raise ValueError(
-                    "Response targets require non-negative response indices."
-                )
             if sample.output_versions[index] < 0:
                 raise ValueError(
                     "Response targets require non-negative behavior versions."
@@ -91,8 +81,6 @@ def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
                 raise ValueError("Ignored tokens must have zero token reward.")
             if sample.token_terminated[index] or sample.token_truncated[index]:
                 raise ValueError("Ignored tokens cannot terminate or truncate.")
-            if sample.response_indices[index] != -1:
-                raise ValueError("Ignored tokens require response_index=-1.")
             if sample.output_versions[index] != -1:
                 raise ValueError("Ignored tokens require output_version=-1.")
 
@@ -122,10 +110,6 @@ def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
     if is_terminated:
         if sample.bootstrap_prediction_position is not None:
             raise ValueError("Terminated PPO samples cannot bootstrap.")
-        if sample.termination_reason not in {"won", "lost"}:
-            raise ValueError(
-                "Only won/lost termination reasons may be terminal."
-            )
     else:
         position = sample.bootstrap_prediction_position
         if position is None:
@@ -144,14 +128,6 @@ def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
             raise ValueError(
                 "PPO bootstrap position must point to ignored final-state context."
             )
-        if sample.termination_reason in {"won", "lost"}:
-            raise ValueError("won/lost PPO samples must be terminal.")
-        if sample.termination_reason not in {
-            "environment_done_without_terminal_signal",
-            "step_limit",
-            "history_limit",
-        }:
-            raise ValueError("Invalid PPO truncation reason.")
 
 
 def compute_token_gae(

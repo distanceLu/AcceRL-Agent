@@ -353,7 +353,6 @@ prediction position. PPO rollout never stores values, returns, or advantages.
 | `--ppo-advantage-normalization` | PPO advantage mode: `optimizer_window` (default), `ema_rms`, `ema_zscore`, or `none`. |
 | `--ppo-advantage-ema-beta` | Per-optimizer-step EMA decay for historical advantage moments; defaults to `0.9`. |
 | `--ppo-advantage-min-scale` | Positive scale floor for EMA normalization; defaults to `1e-3`. |
-| `--ppo-normalize-advantages` | Deprecated compatibility alias for `optimizer_window`; its `--no-...` form selects `none`. |
 | `--train-token-budget` | Maximum real tokens in a pack; required and must be at least `--max-length`. |
 | `--train-pack-candidate-pool-size` | Replay candidate pool used for length-aware packing; defaults to four times `--train-max-sequences-per-pack`. |
 | `--train-logprob-mode` | GRPO logprob mode. PPO always uses its native selected-position forward. |
