@@ -16,8 +16,8 @@ from vsi_qa_rlvr.replay import ReplayBufferActor
 from vsi_qa_rlvr.rollout import StatsActor, VSIQARolloutWorkerActor
 from vsi_qa_rlvr.synchronization import sync_weights_to_vllm
 from vsi_qa_rlvr.trainer import (
+    FSDPTrainWorker,
     TRAIN_ATTENTION_BACKENDS,
-    VSIQAFSDPTrainWorker,
     find_open_port,
     get_local_ip,
 )
@@ -61,6 +61,7 @@ def parse_args():
         choices=TRAIN_ATTENTION_BACKENDS,
         default="flash_attention_2",
     )
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument(
         "--clip-mode",
         choices=("none", "ppo", "gipo", "sapo"),
@@ -86,10 +87,7 @@ def parse_args():
         type=float,
         default=1800.0,
     )
-    parser.add_argument("--num-rollout-workers", type=int, default=40)
-    parser.add_argument("--rollout-data-batch-size", type=int, default=1)
-    parser.add_argument("--rollout-data-workers", type=int, default=1)
-    parser.add_argument("--rollout-prefetch-factor", type=int, default=2)
+    parser.add_argument("--num-rollout-workers", type=int, default=8)
     parser.add_argument("--rollout-batch-size", type=int, default=8)
     parser.add_argument("--rollout-stop-timeout", type=float, default=600.0)
 
@@ -98,16 +96,16 @@ def parse_args():
     parser.add_argument("--infer-top-p", type=float, default=1.0)
     parser.add_argument("--max-model-len", type=int, default=65536)
     parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=131072)
-    parser.add_argument("--vllm-max-num-seqs", type=int, default=64)
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=128)
     parser.add_argument(
         "--rollout-attention-backend",
         choices=ROLLOUT_ATTENTION_BACKENDS,
-        default="TRITON_ATTN",
+        default="FLASH_ATTN",
     )
     parser.add_argument(
         "--rollout-gpu-memory-utilization",
         type=float,
-        default=0.55,
+        default=0.80,
     )
     parser.add_argument("--max-sync-rounds", type=int, default=None)
     return parser.parse_args()
@@ -137,9 +135,6 @@ def validate_args(args):
         "metrics_window_size",
         "replay_capacity",
         "num_rollout_workers",
-        "rollout_data_batch_size",
-        "rollout_data_workers",
-        "rollout_prefetch_factor",
         "rollout_batch_size",
         "infer_max_tokens",
         "max_model_len",
@@ -241,10 +236,6 @@ async def run_vsi_qa(args):
     cluster_gpu_count = int(ray.cluster_resources().get("GPU", 0))
 
     os.makedirs(args.output_dir, exist_ok=True)
-    args.reward_history_path = os.path.join(
-        args.output_dir,
-        "reward_history.jsonl",
-    )
     save_run_config(args)
     writer = SummaryWriter(args.output_dir)
     print(f"[metrics] TensorBoard log dir: {args.output_dir}")
@@ -280,13 +271,14 @@ async def run_vsi_qa(args):
             active_timeout_seconds=args.metrics_active_timeout_seconds,
         )
         print(
-            f"[replay] Created {len(replay_buffers)} ReplayBufferActor "
-            f"instances (capacity={args.replay_capacity} samples each)."
+            "[replay] "
+            f"Created {len(replay_buffers)} ReplayBufferActor instances "
+            f"(capacity={args.replay_capacity} samples each)."
         )
 
         fsdp_master_address = get_local_ip()
         fsdp_master_port = find_open_port()
-        remote_train_worker = ray.remote(num_gpus=1)(VSIQAFSDPTrainWorker)
+        remote_train_worker = ray.remote(num_gpus=1)(FSDPTrainWorker)
         fsdp_workers = [
             remote_train_worker.remote(
                 args,
@@ -307,7 +299,7 @@ async def run_vsi_qa(args):
             f"max_num_seqs={args.vllm_max_num_seqs}, "
             f"max_num_batched_tokens={args.vllm_max_num_batched_tokens})..."
         )
-        remote_infer_actor = ray.remote(
+        remote_infer_actor = ray.remote(  # 创建初始化的 infer actor
             num_gpus=inference_gpu_count,
             max_concurrency=args.infer_actor_max_concurrency,
         )(VSIQAVLLMInferenceActor)
@@ -334,7 +326,7 @@ async def run_vsi_qa(args):
                 )
 
         print("[transfer] Setting up weight-transfer endpoint...")
-        transfer_address, transfer_port = ray.get(
+        transfer_address, transfer_port = ray.get(  # 准备传输地址
             fsdp_workers[0].setup_transfer_endpoint.remote()
         )
         print(
@@ -347,10 +339,8 @@ async def run_vsi_qa(args):
             f"(1 trainer + {inference_gpu_count} vLLM workers)"
         )
         print("[transfer] Initializing NCCL groups...")
-        trainer_transfer_ref = (
-            fsdp_workers[0].init_weight_transfer_group.remote(
-                transfer_world_size
-            )
+        train_handle = fsdp_workers[0].init_weight_transfer_group.remote(
+            transfer_world_size
         )
         ray.get(
             infer_actor.init_weight_transfer_engine.remote(
@@ -359,12 +349,12 @@ async def run_vsi_qa(args):
                 transfer_world_size=transfer_world_size,
             )
         )
-        ray.get(trainer_transfer_ref)
+        ray.get(train_handle)
         print("[transfer] NCCL groups initialized.")
 
         print("[sync] Initial full sync from FSDP to vLLM...")
         ray.get(infer_actor.pause_and_wait_idle.remote())
-        await sync_weights_to_vllm(
+        await sync_weights_to_vllm(  # 第一次完整权重传输
             infer_actor=infer_actor,
             fsdp_workers=fsdp_workers,
             scope="all",

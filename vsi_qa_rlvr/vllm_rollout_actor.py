@@ -28,7 +28,7 @@ from vsi_qa_rlvr.inference import (
 )
 
 
-ROLLOUT_ATTENTION_BACKENDS = ("TRITON_ATTN", "FLASH_ATTN")
+ROLLOUT_ATTENTION_BACKENDS = ("FLASH_ATTN", "TRITON_ATTN")
 INFER_LOG_EVERY_REQUESTS = 128
 
 
@@ -243,7 +243,7 @@ class VSIQAVLLMInferenceActor:
             model=args.model_path,
             trust_remote_code=True,
             dtype="bfloat16",
-            enforce_eager=True,
+            enforce_eager=False,
             tensor_parallel_size=args.infer_tp_size,
             data_parallel_size=args.infer_dp_size,
             distributed_executor_backend="mp",
@@ -254,7 +254,7 @@ class VSIQAVLLMInferenceActor:
             max_num_seqs=args.vllm_max_num_seqs,
             max_model_len=args.max_model_len,
             attention_backend=args.rollout_attention_backend,
-            mm_encoder_attn_backend="TORCH_SDPA",
+            mm_encoder_attn_backend=args.rollout_attention_backend,
             logprobs_mode="raw_logprobs",
             allowed_local_media_path="/",
             limit_mm_per_prompt={"video": 1},
@@ -295,7 +295,7 @@ class VSIQAVLLMInferenceActor:
         self,
         rollout_worker_id,
         batch_id,
-        llm_input,
+        vllm_prompt,
         infer_max_tokens,
         num_samples,
     ) -> List[InferenceResult]:
@@ -303,6 +303,11 @@ class VSIQAVLLMInferenceActor:
             raise RuntimeError("VSIQAVLLMInferenceActor is stopped.")
         if num_samples < 1:
             return []
+
+        engine_inputs = await self.engine.renderer.render_cmpl_async(
+            [vllm_prompt]
+        )
+        llm_input = engine_inputs[0]
 
         requests_to_process = []
         for sample_id in range(num_samples):

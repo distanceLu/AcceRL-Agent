@@ -4,20 +4,17 @@
 import os
 import random
 import socket
-import time
 from importlib import import_module
 
-import ray
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.distributed.fsdp import fully_shard
 from transformers import AutoModelForImageTextToText
-from vllm.distributed.weight_transfer.nccl_engine import (
-    NCCLTrainerSendWeightsArgs,
-    NCCLWeightTransferEngine,
-)
 
+from accerl_agent.vllm_fsdp import (
+    FSDPTrainWorker as AcceRLFSDPTrainWorker,
+    validate_weight_scope,
+)
 from vsi_qa_rlvr.dataloaders.qwen3vl_rl_collator import Qwen3VLRLDataCollator
 
 
@@ -93,12 +90,7 @@ def get_vllm_weight_metadata(named_parameters):
     return names, dtype_names, shapes
 
 
-def validate_weight_scope(scope):
-    if scope not in {"all", "trainable"}:
-        raise ValueError(f"Unsupported weight scope: {scope!r}")
-
-
-class VSIQAFSDPTrainWorker:
+class FSDPTrainWorker(AcceRLFSDPTrainWorker):
     """One Qwen3-VL FSDP2 training worker per training GPU."""
 
     def __init__(
@@ -141,6 +133,10 @@ class VSIQAFSDPTrainWorker:
             local_files_only=True,
         )
         model.config.use_cache = False
+        if args.gradient_checkpointing:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
         for parameter in model.parameters():
             parameter.requires_grad = True
         model.to(self.device)
@@ -208,18 +204,9 @@ class VSIQAFSDPTrainWorker:
         self.model_update_group = None
         print(
             f"[rank {self.rank}] FSDP worker ready: "
-            f"training_attention_backend={args.train_attention_backend}."
+            f"training_attention_backend={args.train_attention_backend} "
+            f"gradient_checkpointing={args.gradient_checkpointing}."
         )
-
-    def get_rank(self):
-        return self.rank
-
-    def get_replay_stats(self):
-        return ray.get(self.replay_buffer.get_stats.remote())
-
-    def close(self):
-        if dist.is_initialized():
-            dist.destroy_process_group()
 
     def _prepare_rl_sample(self, sample):
         if not sample.response_ids:
@@ -273,44 +260,6 @@ class VSIQAFSDPTrainWorker:
             ),
         }
         return batch, advantages, stats
-
-    def _next_rl_training_batch(self, trainer_version):
-        collected = []
-        replay_stats = self.get_replay_stats()
-        while len(collected) < self.args.batch_size:
-            need = self.args.batch_size - len(collected)
-            deadline = None
-            if self.args.replay_sample_timeout_seconds > 0:
-                deadline = (
-                    time.monotonic() + self.args.replay_sample_timeout_seconds
-                )
-
-            sampled = []
-            while not sampled:
-                sampled = ray.get(self.replay_buffer.sample.remote(need))
-                replay_stats = self.get_replay_stats()
-                if sampled:
-                    break
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "Timed out waiting for replay samples: "
-                        f"rank={self.rank} have={len(collected)} "
-                        f"need={self.args.batch_size} stats={replay_stats}"
-                    )
-                time.sleep(self.args.replay_wait_sleep_seconds)
-
-            for sample in sampled:
-                prepared_sample = self._prepare_rl_sample(sample)
-                if prepared_sample is not None:
-                    collected.append((sample, prepared_sample))
-                    if len(collected) >= self.args.batch_size:
-                        break
-
-        batch, advantages, train_stats = self._collate_prepared_rl_samples(
-            collected[: self.args.batch_size],
-            trainer_version,
-        )
-        return batch, advantages, train_stats, replay_stats
 
     def _compute_rl_loss(self, batch, advantages):
         labels = batch["labels"][:, 1:]
@@ -399,200 +348,9 @@ class VSIQAFSDPTrainWorker:
             )
         return loss, response_token_counts, loss_stats
 
-    def _valid_token_log_probs_from_full_logits(
-        self,
-        logits,
-        labels,
-        response_mask,
-    ):
-        valid_logits = logits[response_mask]
-        valid_labels = labels[response_mask]
-        if valid_logits.numel() == 0:
-            raise RuntimeError("No valid response logits found for RL loss.")
-        return -F.cross_entropy(
-            valid_logits,
-            valid_labels,
-            reduction="none",
-        )
-
-    def _aggregate_valid_objective(
-        self,
-        valid_objective,
-        valid_sample_indices,
-        response_token_counts,
-        batch_size,
-    ):
-        sample_objective_sum = torch.zeros(
-            batch_size,
-            device=valid_objective.device,
-            dtype=valid_objective.dtype,
-        )
-        sample_objective_sum.index_add_(
-            0,
-            valid_sample_indices,
-            valid_objective,
-        )
-        return sample_objective_sum / response_token_counts.to(
-            valid_objective.dtype
-        )
-
-    def train_until_next_sync(self, num_optimizer_steps=100):
-        if num_optimizer_steps < 1:
-            raise ValueError("num_optimizer_steps must be >= 1")
-
-        start_optimizer_step = self.optimizer_step
-        target_optimizer_step = min(
-            self.optimizer_step + num_optimizer_steps,
-            self.args.max_steps,
-        )
-        segment_losses = []
-        segment_version_lags = []
-
-        while self.optimizer_step < target_optimizer_step:
-            trainer_version = (
-                self.optimizer_step / self.args.sync_every_optimizer_steps
-            )
-            batch, advantages, train_stats, replay_stats = (
-                self._next_rl_training_batch(trainer_version)
-            )
-            raw_loss, response_token_counts, loss_stats = self._compute_rl_loss(
-                batch,
-                advantages,
-            )
-
-            loss = raw_loss / self.args.grad_accum_steps
-            loss.backward()
-            segment_losses.append(float(raw_loss.item()))
-            segment_version_lags.append(
-                float(train_stats["trainer_version_lag_mean"])
-            )
-
-            self.train_micro_step += 1
-            self.last_loss = float(raw_loss.item())
-            self.last_reward_mean = float(train_stats["reward_mean"])
-            self.last_advantage_mean = float(train_stats["advantage_mean"])
-            self.last_response_tokens = float(response_token_counts.sum().item())
-            self.last_replay_size = int(replay_stats["size"])
-            self.last_total_sampled = int(
-                replay_stats["total_samples_sampled"]
-            )
-            self.last_ppo_clip_frac = float(
-                loss_stats.get("ppo_clip_frac", 0.0)
-            )
-            should_step = (
-                self.train_micro_step % self.args.grad_accum_steps == 0
-            )
-            if not should_step:
-                continue
-
-            torch.nn.utils.clip_grad_norm_(
-                self.trainable_parameter_list,
-                max_norm=1.0,
-            )
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.optimizer_step += 1
-            if self.rank == 0 and self.optimizer_step % self.args.log_every == 0:
-                print(
-                    "[train] "
-                    f"optimizer_step={self.optimizer_step} "
-                    f"micro_step={self.train_micro_step} "
-                    f"rl_loss={self.last_loss:.6f} "
-                    f"reward_mean={self.last_reward_mean:.4f} "
-                    f"adv_mean={self.last_advantage_mean:.4f} "
-                    f"response_tokens={self.last_response_tokens:.0f} "
-                    f"replay_size={self.last_replay_size} "
-                    f"total_sampled={self.last_total_sampled} "
-                    f"ppo_clip_frac={self.last_ppo_clip_frac:.4f}"
-                )
-
-        dist.barrier()
-        optimizer_steps_run = self.optimizer_step - start_optimizer_step
-        current_learning_rate = self.optimizer.param_groups[0]["lr"]
-        return {
-            "rank": self.rank,
-            "optimizer_steps_run": optimizer_steps_run,
-            "optimizer_step": self.optimizer_step,
-            "micro_step": self.train_micro_step,
-            "reached_max_steps": self.optimizer_step >= self.args.max_steps,
-            "last_loss": self.last_loss,
-            "last_reward_mean": self.last_reward_mean,
-            "last_advantage_mean": self.last_advantage_mean,
-            "last_response_tokens": self.last_response_tokens,
-            "last_replay_size": self.last_replay_size,
-            "last_total_sampled": self.last_total_sampled,
-            "last_ppo_clip_frac": self.last_ppo_clip_frac,
-            "segment_loss_mean": (
-                sum(segment_losses) / len(segment_losses)
-                if segment_losses
-                else 0.0
-            ),
-            "train_sample_trainer_version_lag_mean": (
-                sum(segment_version_lags) / len(segment_version_lags)
-                if segment_version_lags
-                else 0.0
-            ),
-            "learning_rate": current_learning_rate,
-        }
-
-    def setup_transfer_endpoint(self):
-        assert self.rank == 0
-        self.transfer_port = find_open_port()
-        self.transfer_master_address = get_local_ip()
-        return self.transfer_master_address, self.transfer_port
-
-    def init_weight_transfer_group(self, transfer_world_size):
-        assert self.rank == 0
-        self.model_update_group = NCCLWeightTransferEngine.trainer_init(
-            {
-                "master_address": self.transfer_master_address,
-                "master_port": self.transfer_port,
-                "world_size": transfer_world_size,
-            }
-        )
-
-    def get_weight_metadata(self, scope="all"):
-        validate_weight_scope(scope)
-        names, dtype_names, shapes = self.weight_metadata_by_scope[scope]
-        return {
-            "names": names,
-            "dtype_names": dtype_names,
-            "shapes": shapes,
-            "is_checkpoint_format": self.vllm_is_checkpoint_format,
-        }
-
-    def gather_and_broadcast_weights(self, scope="all", packed=True):
-        started = time.perf_counter()
-        validate_weight_scope(scope)
-        parameters = self.params_by_scope[scope]
-        if self.rank == 0:
-
-            def full_parameter_iterator():
-                for name, parameter in parameters:
-                    full_parameter = parameter.full_tensor().detach()
-                    yield from iter_vllm_loadable_weights(name, full_parameter)
-
-            trainer_args = NCCLTrainerSendWeightsArgs(
-                group=self.model_update_group,
-                packed=packed,
-            )
-            NCCLWeightTransferEngine.trainer_send_weights(
-                iterator=full_parameter_iterator(),
-                trainer_args=trainer_args,
-            )
-        else:
-            for _, parameter in parameters:
-                parameter.full_tensor()
-        return {
-            "rank": self.rank,
-            "role": "sender" if self.rank == 0 else "gather_participant",
-            "elapsed_seconds": time.perf_counter() - started,
-        }
-
-
 __all__ = [
     "TRAIN_ATTENTION_BACKENDS",
-    "VSIQAFSDPTrainWorker",
+    "FSDPTrainWorker",
     "find_open_port",
     "get_local_ip",
     "get_vllm_weight_metadata",

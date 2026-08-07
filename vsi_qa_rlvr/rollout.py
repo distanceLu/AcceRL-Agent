@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """VSI-QA rollout worker and rollout statistics actor."""
 
+import random
 import time
 from collections import deque
 from typing import Dict, List
 
 import ray
 import torch
-from torch.utils.data import DataLoader, RandomSampler
 
 from vsi_qa_rlvr.dataloaders.qwen3vl_rollout_collator import (
     Qwen3VLRolloutDataCollator,
 )
 from vsi_qa_rlvr.dataloaders.vsi_qa_dataset import VSIQADataset
-from vsi_qa_rlvr.exp02_v4_reward import score_vsi_qa_group
+from vsi_qa_rlvr.scannet_incremental_counting.reward import (
+    IncrementalCountingReward,
+)
 from vsi_qa_rlvr.trajectory import VSIQARLSample
 
 
@@ -52,8 +54,7 @@ class StatsActor:
         now = time.time()
         active_cutoff = now - self.active_timeout_seconds
         active_workers = sum(
-            1
-            for last_active in self.worker_last_active.values()
+            1 for last_active in self.worker_last_active.values()
             if last_active >= active_cutoff
         )
         reward_count = len(self.reward_sums)
@@ -64,14 +65,11 @@ class StatsActor:
                 sum(self.reward_sums) / reward_count if reward_count else 0.0
             ),
             "response_length_mean": (
-                sum(self.response_lengths) / response_count
-                if response_count
-                else 0.0
+                sum(self.response_lengths) / response_count if response_count else 0.0
             ),
             "abort_rate": (
                 sum(1 for flag in self.abort_flags if flag) / abort_count
-                if abort_count
-                else 0.0
+                if abort_count else 0.0
             ),
             "active_workers": active_workers,
             "total_episodes": self.total_episodes,
@@ -95,44 +93,20 @@ class VSIQARolloutWorkerActor:
         self.stats_actor = stats_actor
         self.worker_id = int(worker_id)
         self.dataset = VSIQADataset(args.data_path)
-        self.collator = Qwen3VLRolloutDataCollator(
-            args.model_path,
-            max_model_len=args.max_model_len,
+        self.collator = Qwen3VLRolloutDataCollator(args.model_path)
+        self.reward = IncrementalCountingReward(
+            self.collator.processor.tokenizer
         )
-        self.sampler = RandomSampler(
-            self.dataset,
-            replacement=True,
-            num_samples=len(self.dataset),
-        )
-        self.data_loader = DataLoader(
-            self.dataset,
-            batch_size=args.rollout_data_batch_size,
-            sampler=self.sampler,
-            collate_fn=self.collator,
-            num_workers=args.rollout_data_workers,
-            prefetch_factor=args.rollout_prefetch_factor,
-            persistent_workers=True,
-            multiprocessing_context="spawn",
-        )
-        self.data_iterator = None
         self.batch_id = 0
         self.stopped = False
         print(
             "[rollout] "
             f"worker={self.worker_id} loaded VSI-QA examples: "
-            f"count={len(self.dataset)} path={args.data_path!r} "
-            f"data_workers={args.rollout_data_workers} "
-            f"prefetch_factor={args.rollout_prefetch_factor}"
+            f"count={len(self.dataset)} path={args.data_path!r}"
         )
 
-    def next_rollout_batch(self):
-        try:
-            if self.data_iterator is None:
-                self.data_iterator = iter(self.data_loader)
-            return next(self.data_iterator)
-        except StopIteration:
-            self.data_iterator = iter(self.data_loader)
-            return next(self.data_iterator)
+    def sample_rollout_prompt(self):
+        return self.collator([random.choice(self.dataset)])[0]
 
     async def stop(self):
         self.stopped = True
@@ -150,6 +124,7 @@ class VSIQARolloutWorkerActor:
             return [0.0 for _ in rewards]
 
         rewards_t = torch.tensor(rewards, dtype=torch.float64)
+
         mean = rewards_t.mean()
         std = rewards_t.std(unbiased=False)
         if std.item() < 1e-6:
@@ -166,28 +141,15 @@ class VSIQARolloutWorkerActor:
             )
             for result in results
         ]
-        valid_indices = [
-            index
-            for index, result in enumerate(results)
-            if result.stop_reason != "abort" and result.output_tokens
-        ]
-        reward_details = [None] * len(results)
-        if valid_indices:
-            valid_reward_details = score_vsi_qa_group(
-                [generated_texts[index] for index in valid_indices],
-                rollout_item["reward_model"]["ground_truth"],
-                rollout_item["extra_info"],
-                history_path=self.args.reward_history_path,
+        ground_truth = rollout_item["reward_model"]["ground_truth"]
+        reward_details = [
+            (
+                self.reward.score(result.output_tokens, ground_truth)
+                if result.stop_reason != "abort" and result.output_tokens
+                else self.reward.empty_score()
             )
-            for index, details in zip(valid_indices, valid_reward_details):
-                reward_details[index] = details
-        for index, details in enumerate(reward_details):
-            if details is None:
-                reward_details[index] = {
-                    "score": 0.0,
-                    "r_format": 0.0,
-                    "answer_exact_reward": 0.0,
-                }
+            for result in results
+        ]
 
         rewards = [float(details["score"]) for details in reward_details]
         advantages = self.compute_group_advantages(rewards)
@@ -206,7 +168,7 @@ class VSIQARolloutWorkerActor:
                 reward=float(reward),
                 advantage=float(advantage),
                 question=rollout_item["question"],
-                ground_truth=rollout_item["reward_model"]["ground_truth"],
+                ground_truth=ground_truth,
                 format_reward=float(details["r_format"]),
                 answer_reward=float(details["answer_exact_reward"]),
                 rollout_worker_id=self.worker_id,
@@ -228,59 +190,51 @@ class VSIQARolloutWorkerActor:
 
     async def run(self):
         while not self.stopped:
-            rollout_batch = self.next_rollout_batch()
-            for rollout_item in rollout_batch:
-                current_batch_id = self.batch_id
-                self.batch_id += 1
-                results = await self.infer_actor.request_batch.remote(
-                    self.worker_id,
-                    current_batch_id,
-                    rollout_item["llm_input"],
-                    self.args.infer_max_tokens,
-                    self.args.rollout_batch_size,
-                )
-                if not results:
-                    continue
-                rl_samples = self.build_rl_samples(rollout_item, results)
-                self.replay_buffer.add_samples.remote(rl_samples)
-                self.stats_actor.add_rollout_batch.remote(
-                    self.worker_id,
-                    [sample.reward for sample in rl_samples],
-                    [len(sample.response_ids) for sample in rl_samples],
-                    [sample.stop_reason == "abort" for sample in rl_samples],
-                )
+            rollout_item = self.sample_rollout_prompt()
+            current_batch_id = self.batch_id
+            self.batch_id += 1
+            results = await self.infer_actor.request_batch.remote(
+                self.worker_id,
+                current_batch_id,
+                rollout_item["vllm_prompt"],
+                self.args.infer_max_tokens,
+                self.args.rollout_batch_size,
+            )
+            if not results:
+                continue
+            rl_samples = self.build_rl_samples(rollout_item, results)
+            self.replay_buffer.add_samples.remote(rl_samples)
+            self.stats_actor.add_rollout_batch.remote(
+                self.worker_id,
+                [sample.reward for sample in rl_samples],
+                [len(sample.response_ids) for sample in rl_samples],
+                [sample.stop_reason == "abort" for sample in rl_samples],
+            )
 
-                rewards = [sample.reward for sample in rl_samples]
-                advantages = [sample.advantage for sample in rl_samples]
-                response_lengths = [
-                    len(sample.response_ids) for sample in rl_samples
-                ]
-                reward_t = torch.tensor(rewards, dtype=torch.float32)
-                advantage_t = torch.tensor(advantages, dtype=torch.float32)
-                response_length_t = torch.tensor(
-                    response_lengths,
-                    dtype=torch.float32,
-                )
-                version_ranges = sorted(
-                    {result.version_range for result in results}
-                )
-                stop_reasons = sorted(
-                    {str(sample.stop_reason) for sample in rl_samples}
-                )
-                print(
-                    "[rollout] "
-                    f"worker={self.worker_id} "
-                    f"batch={current_batch_id} "
-                    f"samples={len(rl_samples)} "
-                    f"reward_mean={reward_t.mean().item():.4f} "
-                    f"reward_std={reward_t.std(unbiased=False).item():.4f} "
-                    f"adv_mean={advantage_t.mean().item():.4f} "
-                    f"adv_std={advantage_t.std(unbiased=False).item():.4f} "
-                    f"response_len_mean="
-                    f"{response_length_t.mean().item():.1f} "
-                    f"versions={','.join(version_ranges)} "
-                    f"stops={','.join(stop_reasons)}"
-                )
+            rewards = [sample.reward for sample in rl_samples]
+            advantages = [sample.advantage for sample in rl_samples]
+            response_lengths = [len(sample.response_ids) for sample in rl_samples]
+            reward_t = torch.tensor(rewards, dtype=torch.float32)
+            advantage_t = torch.tensor(advantages, dtype=torch.float32)
+            response_length_t = torch.tensor(response_lengths, dtype=torch.float32)
+            version_ranges = sorted({result.version_range for result in results})
+            stop_reasons = sorted({
+                str(sample.stop_reason)
+                for sample in rl_samples
+            })
+            print(
+                "[rollout] "
+                f"worker={self.worker_id} "
+                f"batch={current_batch_id} "
+                f"samples={len(rl_samples)} "
+                f"reward_mean={reward_t.mean().item():.4f} "
+                f"reward_std={reward_t.std(unbiased=False).item():.4f} "
+                f"adv_mean={advantage_t.mean().item():.4f} "
+                f"adv_std={advantage_t.std(unbiased=False).item():.4f} "
+                f"response_len_mean={response_length_t.mean().item():.1f} "
+                f"versions={','.join(version_ranges)} "
+                f"stops={','.join(stop_reasons)}"
+            )
 
         print(f"[rollout] worker={self.worker_id} stopped.")
         return {"worker_id": self.worker_id, "batches": self.batch_id}
