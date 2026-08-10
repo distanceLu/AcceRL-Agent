@@ -49,6 +49,12 @@ from vllm.distributed.weight_transfer.nccl_engine import (
 )
 from vllm.v1.executor import Executor
 
+from accerl_agent.interval_diagnostics import (
+    IntervalDiagnostics,
+    TimeWeightedGauge,
+    distribution_scalar,
+    merge_interval_snapshots,
+)
 from accerl_agent.ppo_value import (
     TokenValueHead,
     load_value_head_checkpoint,
@@ -3019,6 +3025,8 @@ class OnlineGenerationState:
     output_logprobs: List[float] = field(default_factory=list)
     output_versions: List[int] = field(default_factory=list)
     stop_reason: Literal["length", "stop", "tool_calls", "abort"] | None = None
+    attempt_count: int = 0
+    sync_interrupted_attempts: int = 0
 
     @property
     def remaining_max_tokens(self) -> int:
@@ -3189,6 +3197,9 @@ class InterruptibleGenerationRunner:
         stop_sequences: List[str] | None = None,
         collect_logprobs: bool = False,
         max_resubmit_retries: int = 200,
+        diagnostics: IntervalDiagnostics | None = None,
+        active_attempts_gauge: TimeWeightedGauge | None = None,
+        clock=time.perf_counter,
     ):
         self.engine = engine
         self.temperature = temperature
@@ -3196,10 +3207,14 @@ class InterruptibleGenerationRunner:
         self.stop_sequences = stop_sequences or ["</answer>"]
         self.collect_logprobs = collect_logprobs
         self.max_resubmit_retries = max_resubmit_retries
+        self.diagnostics = diagnostics
+        self.active_attempts_gauge = active_attempts_gauge
+        self.clock = clock
         self.version = 0
         self.resume_event = asyncio.Event()
         self.resume_event.set()
         self._active_attempts = 0
+        self.total_sync_interrupted_attempts = 0
         self._active_changed = asyncio.Condition()
 
     def pause(self) -> None:
@@ -3212,12 +3227,16 @@ class InterruptibleGenerationRunner:
     async def _increment_active_attempts(self) -> None:
         async with self._active_changed:
             self._active_attempts += 1
+            if self.active_attempts_gauge is not None:
+                self.active_attempts_gauge.set(self._active_attempts)
             self._active_changed.notify_all()
 
     # 一个engine.generate() attempt 结束 -1
     async def _decrement_active_attempts(self) -> None:
         async with self._active_changed:
             self._active_attempts -= 1
+            if self.active_attempts_gauge is not None:
+                self.active_attempts_gauge.set(self._active_attempts)
             self._active_changed.notify_all()
 
     # 等待正在跑的 generate attempt 都结束,可能是正常结束，也可能是被abort打断
@@ -3251,6 +3270,11 @@ class InterruptibleGenerationRunner:
             )
             final_output = None
             request_finished = False
+            attempt_started_at = self.clock()
+            first_token_at = None
+            state.attempt_count += 1
+            if self.diagnostics is not None:
+                self.diagnostics.increment("attempt_count")
 
             await self._increment_active_attempts()
             try:
@@ -3261,6 +3285,11 @@ class InterruptibleGenerationRunner:
                     request_id=request_id,
                 ):
                     final_output = request_output
+                    if (
+                        first_token_at is None
+                        and _tokens_from_output(request_output)
+                    ):
+                        first_token_at = self.clock()
                     request_finished = bool(
                         getattr(request_output, "finished", False)
                     )
@@ -3275,9 +3304,34 @@ class InterruptibleGenerationRunner:
 
             if final_output is None:
                 state.stop_reason = "abort"
+                state.sync_interrupted_attempts += 1
+                self.total_sync_interrupted_attempts += 1
+                if self.diagnostics is not None:
+                    self.diagnostics.increment("sync_interrupted_attempt_count")
                 continue
 
             attempt_tokens = _tokens_from_output(final_output)[:remaining]
+            attempt_finished_at = self.clock()
+            stop_reason = _normalize_stop_reason(
+                _finish_reason_from_output(final_output)
+            )
+            sync_interrupted = stop_reason == "abort"
+            if sync_interrupted:
+                state.sync_interrupted_attempts += 1
+                self.total_sync_interrupted_attempts += 1
+                if self.diagnostics is not None:
+                    self.diagnostics.increment("sync_interrupted_attempt_count")
+            if self.diagnostics is not None and first_token_at is not None:
+                self.diagnostics.observe(
+                    "ttft_ms",
+                    (first_token_at - attempt_started_at) * 1000.0,
+                )
+                if not sync_interrupted and len(attempt_tokens) >= 2:
+                    decode_elapsed = attempt_finished_at - first_token_at
+                    self.diagnostics.observe(
+                        "tpot_ms",
+                        decode_elapsed * 1000.0 / (len(attempt_tokens) - 1),
+                    )
             if attempt_tokens:
                 attempt_logprobs = []
                 if self.collect_logprobs:
@@ -3294,9 +3348,6 @@ class InterruptibleGenerationRunner:
                     [attempt_version] * len(attempt_tokens)
                 )
 
-            stop_reason = _normalize_stop_reason(
-                _finish_reason_from_output(final_output)
-            )
             if len(state.output_tokens) >= state.requested_max_tokens:
                 stop_reason = "length"
 
@@ -3344,12 +3395,17 @@ class VLLMInferenceActor:
             load_format="dummy",
         )
         self.engine = create_async_engine(**engine_kwargs)
+        self.diagnostics = IntervalDiagnostics()
+        self.active_requests_gauge = TimeWeightedGauge()
+        self.active_attempts_gauge = TimeWeightedGauge()
         self.runner = InterruptibleGenerationRunner(
             self.engine,
             temperature=args.infer_temperature,
             top_p=args.infer_top_p,
             stop_sequences=["\n"],
             collect_logprobs=True,
+            diagnostics=self.diagnostics,
+            active_attempts_gauge=self.active_attempts_gauge,
         )
         self.active_generation_tasks = set()
         self.total_tokens = 0
@@ -3376,6 +3432,8 @@ class VLLMInferenceActor:
         self,
         state: OnlineGenerationState,
     ) -> InferenceResult:
+        request_started_at = time.perf_counter()
+        self.active_requests_gauge.increment()
         generation_task = asyncio.create_task(self.runner.generate(state))
         self.active_generation_tasks.add(generation_task)
         generation_task.add_done_callback(self.active_generation_tasks.discard)
@@ -3386,6 +3444,8 @@ class VLLMInferenceActor:
                 generation_task.cancel()
             await asyncio.gather(generation_task, return_exceptions=True)
             raise
+        finally:
+            self.active_requests_gauge.increment(-1.0)
 
         result = InferenceResult(
             output_tokens=list(completed_state.output_tokens),
@@ -3393,13 +3453,50 @@ class VLLMInferenceActor:
             output_versions=list(completed_state.output_versions),
             stop_reason=completed_state.stop_reason,
         )
+        request_latency_ms = (time.perf_counter() - request_started_at) * 1000.0
+        self.diagnostics.increment("request_count")
+        self.diagnostics.increment("output_token_count", len(result.output_tokens))
+        self.diagnostics.observe("prompt_tokens", len(state.input_ids))
+        self.diagnostics.observe("output_tokens_per_request", len(result.output_tokens))
+        self.diagnostics.observe("request_latency_ms", request_latency_ms)
+        self.diagnostics.observe("attempts_per_request", state.attempt_count)
+        if state.attempt_count > 1:
+            self.diagnostics.increment("resubmitted_request_count")
+        stop_reason = result.stop_reason or "abort"
+        if stop_reason == "tool_calls":
+            stop_reason = "stop"
+        self.diagnostics.increment(f"stop_reason_{stop_reason}_count")
         self.total_tokens += len(result.output_tokens)
         return result
 
+    def begin_diagnostics_interval(self) -> Dict[str, int]:
+        self.diagnostics.reset()
+        self.active_requests_gauge.reset_interval()
+        self.active_attempts_gauge.reset_interval()
+        return {"total_tokens": self.total_tokens}
+
+    def end_diagnostics_interval(self) -> Dict[str, object]:
+        result = self.diagnostics.snapshot_and_reset()
+        result["gauges"] = {
+            "active_requests": self.active_requests_gauge.snapshot(),
+            "active_attempts": self.active_attempts_gauge.snapshot(),
+        }
+        result["total_tokens"] = self.total_tokens
+        return result
+
     async def pause_and_wait_idle(self):
+        active_attempts_before_pause = self.runner._active_attempts
+        interrupted_before_pause = self.runner.total_sync_interrupted_attempts
         self.runner.pause()
         await self.engine.pause_generation(mode="abort", clear_cache=True)
         await self.runner.wait_for_idle()
+        return {
+            "active_attempts": active_attempts_before_pause,
+            "interrupted_attempts": (
+                self.runner.total_sync_interrupted_attempts
+                - interrupted_before_pause
+            ),
+        }
 
     async def resume_generation(self, increment_version: bool = False):
         if increment_version:
@@ -3700,6 +3797,8 @@ class TextWorldRolloutWorkerActor:
         self.tokenizer = build_tokenizer(args, log=False)
         self.game_files = load_textworld_game_files(args)
         self.stopped = False
+        self.diagnostics = IntervalDiagnostics()
+        self.diagnostics_interval_started_at = time.perf_counter()
         if self._log_detail:
             print(
                 "[tw-rollout] "
@@ -3714,6 +3813,18 @@ class TextWorldRolloutWorkerActor:
 
     async def stop(self):
         self.stopped = True
+
+    def begin_diagnostics_interval(self) -> None:
+        self.diagnostics.reset()
+        self.diagnostics_interval_started_at = time.perf_counter()
+
+    def end_diagnostics_interval(self) -> Dict[str, object]:
+        result = self.diagnostics.snapshot_and_reset()
+        result["counters"]["interval_elapsed_seconds"] = max(
+            0.0,
+            time.perf_counter() - self.diagnostics_interval_started_at,
+        )
+        return result
 
     def _compute_step_reward(
         self,
@@ -3750,6 +3861,8 @@ class TextWorldRolloutWorkerActor:
         pending: TextWorldPendingRequest,
         result: InferenceResult,
     ) -> None:
+        postprocess_started_at = time.perf_counter()
+        env_step_seconds = 0.0
         state = pending.state
         admissible_commands = state.infos.get("admissible_commands", []) or []
         raw_text = self.tokenizer.decode(
@@ -3765,7 +3878,10 @@ class TextWorldRolloutWorkerActor:
         state.transcript_ids.extend(result.output_tokens)
         if parsed_action.action is not None:
             selected_action = parsed_action.action
+            env_step_started_at = time.perf_counter()
             obs, step_score, done, infos = state.env.step(selected_action)
+            env_step_seconds = time.perf_counter() - env_step_started_at
+            self.diagnostics.observe("env_step_ms", env_step_seconds * 1000.0)
             state.obs = obs
             state.infos = dict(infos)
             state.latest_score = _textworld_score(step_score, infos)
@@ -3819,6 +3935,11 @@ class TextWorldRolloutWorkerActor:
                 reward=reward,
             )
         )
+        postprocess_seconds = time.perf_counter() - postprocess_started_at
+        self.diagnostics.observe(
+            "postprocess_ms",
+            max(0.0, postprocess_seconds - env_step_seconds) * 1000.0,
+        )
 
     async def _run_textworld_step_batch(
         self,
@@ -3870,7 +3991,12 @@ class TextWorldRolloutWorkerActor:
         if not request_refs:
             return len(active_states)
 
+        inference_wait_started_at = time.perf_counter()
         generation_results = await asyncio.gather(*request_refs)
+        self.diagnostics.increment(
+            "inference_wait_seconds",
+            time.perf_counter() - inference_wait_started_at,
+        )
         for pending_request, result in zip(pending, generation_results):
             self._apply_textworld_action_result(
                 pending_request,
@@ -4107,6 +4233,9 @@ class TextWorldRolloutWorkerActor:
 
             max_score = _textworld_max_score(states[0].infos) if states else 0.0
             for state in states:
+                self.diagnostics.increment("episode_count")
+                if state.termination_reason == "history_limit":
+                    self.diagnostics.increment("history_limit_count")
                 self.stats_actor.add_textworld_episode.remote(
                     self.worker_id,
                     state.latest_score,
@@ -4476,7 +4605,13 @@ async def run_textworld_train(args: argparse.Namespace):
                 "[train] Launching trainer segment: "
                 f"sync_every_optimizer_steps={args.sync_every_optimizer_steps}"
             )
-            infer_stats_start = ray.get(infer_actor.get_stats.remote())
+            ray.get([
+                worker.begin_diagnostics_interval.remote()
+                for worker in rollout_workers
+            ])
+            infer_stats_start = ray.get(
+                infer_actor.begin_diagnostics_interval.remote()
+            )
             infer_t0 = time.perf_counter()
             train_segment_start_time = time.perf_counter()
             train_handles = [
@@ -4491,7 +4626,16 @@ async def run_textworld_train(args: argparse.Namespace):
             summaries = await train_future
             train_segment_elapsed = time.perf_counter() - train_segment_start_time
             infer_elapsed = time.perf_counter() - infer_t0
-            infer_stats_end = ray.get(infer_actor.get_stats.remote())
+            infer_diagnostics = ray.get(
+                infer_actor.end_diagnostics_interval.remote()
+            )
+            infer_stats_end = infer_diagnostics
+            rollout_diagnostics = merge_interval_snapshots(
+                ray.get([
+                    worker.end_diagnostics_interval.remote()
+                    for worker in rollout_workers
+                ])
+            )
             check_rollout_workers()
             rank0_summary = next(item for item in summaries if item["rank"] == 0)
             training_reached_max = bool(rank0_summary["reached_max_steps"])
@@ -4504,6 +4648,24 @@ async def run_textworld_train(args: argparse.Namespace):
                 infer_stats_end["total_tokens"] - infer_stats_start["total_tokens"]
             )
             infer_tokens_per_sec = infer_delta_tokens / max(infer_elapsed, 1e-9)
+            infer_counters = infer_diagnostics["counters"]
+            infer_gauges = infer_diagnostics["gauges"]
+            infer_request_count = float(infer_counters.get("request_count", 0.0))
+            rollout_counters = rollout_diagnostics["counters"]
+            rollout_episode_count = float(
+                rollout_counters.get("episode_count", 0.0)
+            )
+            rollout_total_worker_seconds = float(
+                rollout_counters.get("interval_elapsed_seconds", 0.0)
+            )
+            infer_dropped_samples = sum(
+                int(distribution.get("dropped", 0))
+                for distribution in infer_diagnostics["distributions"].values()
+            )
+            rollout_dropped_samples = sum(
+                int(distribution.get("dropped", 0))
+                for distribution in rollout_diagnostics["distributions"].values()
+            )
             replay_stats = ray.get([
                 worker.get_replay_stats.remote()
                 for worker in fsdp_workers
@@ -4707,6 +4869,108 @@ async def run_textworld_train(args: argparse.Namespace):
                         tb_step,
                     )
             writer.add_scalar("Infer/TokensPerSec", infer_tokens_per_sec, tb_step)
+            infer_metric_values = {
+                "Infer/RequestsPerSec": (
+                    infer_request_count / max(infer_elapsed, 1e-9)
+                ),
+                "Infer/RequestCount": infer_request_count,
+                "Infer/OutputTokensPerRequest": distribution_scalar(
+                    infer_diagnostics, "output_tokens_per_request", "mean"
+                ),
+                "Infer/PromptTokensMean": distribution_scalar(
+                    infer_diagnostics, "prompt_tokens", "mean"
+                ),
+                "Infer/PromptTokensP50": distribution_scalar(
+                    infer_diagnostics, "prompt_tokens", "p50"
+                ),
+                "Infer/PromptTokensP95": distribution_scalar(
+                    infer_diagnostics, "prompt_tokens", "p95"
+                ),
+                "Infer/RequestLatencyMsMean": distribution_scalar(
+                    infer_diagnostics, "request_latency_ms", "mean"
+                ),
+                "Infer/RequestLatencyMsP50": distribution_scalar(
+                    infer_diagnostics, "request_latency_ms", "p50"
+                ),
+                "Infer/RequestLatencyMsP95": distribution_scalar(
+                    infer_diagnostics, "request_latency_ms", "p95"
+                ),
+                "Infer/TTFTMsMean": distribution_scalar(
+                    infer_diagnostics, "ttft_ms", "mean"
+                ),
+                "Infer/TTFTMsP95": distribution_scalar(
+                    infer_diagnostics, "ttft_ms", "p95"
+                ),
+                "Infer/TPOTMsMean": distribution_scalar(
+                    infer_diagnostics, "tpot_ms", "mean"
+                ),
+                "Infer/TPOTMsP95": distribution_scalar(
+                    infer_diagnostics, "tpot_ms", "p95"
+                ),
+                "Infer/ActiveRequestsMean": float(
+                    infer_gauges["active_requests"]["mean"]
+                ),
+                "Infer/ActiveRequestsMax": float(
+                    infer_gauges["active_requests"]["max"]
+                ),
+                "Infer/ActiveAttemptsMean": float(
+                    infer_gauges["active_attempts"]["mean"]
+                ),
+                "Infer/ActiveAttemptsMax": float(
+                    infer_gauges["active_attempts"]["max"]
+                ),
+                "Infer/AttemptsPerRequest": distribution_scalar(
+                    infer_diagnostics, "attempts_per_request", "mean"
+                ),
+                "Infer/ResubmittedRequestRate": (
+                    float(infer_counters.get("resubmitted_request_count", 0.0))
+                    / max(infer_request_count, 1.0)
+                ),
+                "Infer/StopRate": (
+                    float(infer_counters.get("stop_reason_stop_count", 0.0))
+                    / max(infer_request_count, 1.0)
+                ),
+                "Infer/LengthRate": (
+                    float(infer_counters.get("stop_reason_length_count", 0.0))
+                    / max(infer_request_count, 1.0)
+                ),
+                "Infer/AbortRate": (
+                    float(infer_counters.get("stop_reason_abort_count", 0.0))
+                    / max(infer_request_count, 1.0)
+                ),
+                "Infer/DiagnosticsDroppedSamples": infer_dropped_samples,
+            }
+            rollout_metric_values = {
+                "Rollout/EpisodesPerSec": (
+                    rollout_episode_count / max(infer_elapsed, 1e-9)
+                ),
+                "Rollout/InferenceWaitFraction": (
+                    float(rollout_counters.get("inference_wait_seconds", 0.0))
+                    / max(rollout_total_worker_seconds, 1e-9)
+                ),
+                "Rollout/EnvStepMsMean": distribution_scalar(
+                    rollout_diagnostics, "env_step_ms", "mean"
+                ),
+                "Rollout/EnvStepMsP95": distribution_scalar(
+                    rollout_diagnostics, "env_step_ms", "p95"
+                ),
+                "Rollout/PostprocessMsMean": distribution_scalar(
+                    rollout_diagnostics, "postprocess_ms", "mean"
+                ),
+                "Rollout/PostprocessMsP95": distribution_scalar(
+                    rollout_diagnostics, "postprocess_ms", "p95"
+                ),
+                "Rollout/HistoryLimitRate": (
+                    float(rollout_counters.get("history_limit_count", 0.0))
+                    / max(rollout_episode_count, 1.0)
+                ),
+                "Rollout/DiagnosticsDroppedSamples": rollout_dropped_samples,
+            }
+            for tag, value in {
+                **infer_metric_values,
+                **rollout_metric_values,
+            }.items():
+                writer.add_scalar(tag, float(value), tb_step)
             print(
                 "[metrics] "
                 f"step={tb_step} loss={train_loss_mean:.6f} "
@@ -4733,6 +4997,11 @@ async def run_textworld_train(args: argparse.Namespace):
                 args.max_sync_rounds is not None
                 and sync_rounds >= args.max_sync_rounds
             ):
+                writer.add_scalar(
+                    "Infer/SyncInterruptedAttemptRate", 0.0, tb_step
+                )
+                writer.add_scalar("Infer/PauseActiveAttempts", 0.0, tb_step)
+                writer.flush()
                 print(
                     "[sync] max_sync_rounds reached; letting inference finish "
                     "without more trainable updates."
@@ -4744,7 +5013,23 @@ async def run_textworld_train(args: argparse.Namespace):
                 f"[sync] Round {sync_rounds}: pausing generation for "
                 "trainable-only weight update..."
             )
-            ray.get(infer_actor.pause_and_wait_idle.remote())
+            pause_diagnostics = ray.get(
+                infer_actor.pause_and_wait_idle.remote()
+            )
+            pause_active_attempts = float(
+                pause_diagnostics["active_attempts"]
+            )
+            writer.add_scalar(
+                "Infer/SyncInterruptedAttemptRate",
+                float(pause_diagnostics["interrupted_attempts"])
+                / max(pause_active_attempts, 1.0),
+                tb_step,
+            )
+            writer.add_scalar(
+                "Infer/PauseActiveAttempts",
+                pause_active_attempts,
+                tb_step,
+            )
 
             sync_elapsed_seconds = await sync_weights_to_vllm(
                 infer_actor=infer_actor,

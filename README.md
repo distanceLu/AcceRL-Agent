@@ -402,6 +402,46 @@ Saved checkpoint contents include model weights, config, tokenizer files, and `t
 | `Infer/TokensPerSec` | vLLM generation throughput. |
 | `Sync/ElapsedSeconds` | Weight-sync latency. |
 
+### TextWorld inference throughput diagnostics
+
+`Infer/TokensPerSec` is the number of completed output tokens during a trainer
+segment divided by that segment's wall-clock duration. It is a system-level
+rollout rate, not a pure vLLM decode benchmark. TextWorld runs also report the
+following per-segment diagnostics:
+
+| Metric family | Meaning |
+| --- | --- |
+| `Infer/RequestsPerSec`, `Infer/RequestCount` | Logical request supply rate and count. |
+| `Infer/OutputTokensPerRequest` | Mean completed output length. |
+| `Infer/PromptTokensMean\|P50\|P95` | Logical-request prompt-length distribution. |
+| `Infer/RequestLatencyMsMean\|P50\|P95` | End-to-end logical-request latency, including resubmits. |
+| `Infer/TTFTMsMean\|P95` | Engine-attempt time to first generated token. |
+| `Infer/TPOTMsMean\|P95` | Time per output token for successful attempts with at least two tokens. |
+| `Infer/ActiveRequestsMean\|Max`, `Infer/ActiveAttemptsMean\|Max` | Time-weighted logical-request and engine-attempt concurrency. |
+| `Infer/AttemptsPerRequest`, `Infer/SyncInterruptedAttemptRate`, `Infer/ResubmittedRequestRate`, `Infer/PauseActiveAttempts` | Weight-sync interruption and retry pressure; the interruption rate is measured across attempts active when the following sync pause begins. |
+| `Infer/StopRate\|LengthRate\|AbortRate` | Final logical-request stop-reason fractions. |
+| `Rollout/EpisodesPerSec`, `Rollout/InferenceWaitFraction` | Episode production and fraction of aggregate worker time waiting for inference. |
+| `Rollout/EnvStepMsMean\|P95`, `Rollout/PostprocessMsMean\|P95` | TextWorld environment and decode/parse/history-update CPU costs. |
+| `Rollout/HistoryLimitRate` | Fraction of completed episodes stopped by the history-token limit. |
+
+Use the metrics together to classify a throughput drop:
+
+| Observation | Likely bottleneck |
+| --- | --- |
+| Requests/sec falls while request latency is stable | Rollout or environment request supply. |
+| Output tokens/request falls proportionally with tokens/sec | Shorter model outputs rather than slower inference. |
+| Prompt P95 and TTFT rise while TPOT stays stable | Longer-context prefill. |
+| TPOT rises at stable prompt lengths and concurrency | Decode throughput. |
+| Active requests fall while rollout CPU timings rise | Environment, parsing, or tokenization. |
+| Interrupted-attempt and resubmitted-request rates rise | Weight-sync interruption overhead. |
+| Request latency rises while TTFT and TPOT stay stable | Queueing or scheduling delay. |
+
+`Infer/DiagnosticsDroppedSamples` and
+`Rollout/DiagnosticsDroppedSamples` should remain zero. A non-zero value means
+that a segment exceeded the bounded 20,000-sample percentile buffer; counts,
+sums, means, and maxima remain exact, but percentiles cover only retained
+samples.
+
 ## Troubleshooting
 
 If the trainer keeps waiting for replay, check `--num-rollout-workers`, `--min-replay-size-per-rank`, `--replay-capacity`, the TextWorld game path, and `TextWorld/InvalidActionRate`.
