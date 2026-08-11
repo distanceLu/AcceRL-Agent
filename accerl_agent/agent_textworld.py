@@ -174,6 +174,7 @@ class PreparedVarlenPack:
     version_lag_sum: float
     sample_count: int
     cpu_milliseconds: float
+    valid_trajectory_count: int = 0
 
 
 @dataclass
@@ -252,17 +253,23 @@ class PackedTensorStats:
 
 
 @dataclass(frozen=True)
-class VarlenTokenStats(PackedTensorStats):
-    policy_token_sum: torch.Tensor
-    old_new_kl_k3_sum: torch.Tensor
+class GRPOReductionStats(PackedTensorStats):
+    policy_trajectory_sum: torch.Tensor
+    old_new_kl_k3_trajectory_sum: torch.Tensor
+    old_new_kl_k3_token_sum: torch.Tensor
     ppo_clip_count: torch.Tensor
+    valid_trajectory_count: torch.Tensor
 
 
 @dataclass(frozen=True)
-class PPOTokenStats(PackedTensorStats):
-    policy_sum: torch.Tensor
-    value_loss_sum: torch.Tensor
-    kl_sum: torch.Tensor
+class PPOReductionStats(PackedTensorStats):
+    policy_trajectory_sum: torch.Tensor
+    value_loss_trajectory_sum: torch.Tensor
+    kl_trajectory_sum: torch.Tensor
+    policy_token_sum: torch.Tensor
+    value_loss_token_sum: torch.Tensor
+    kl_token_sum: torch.Tensor
+    valid_trajectory_count: torch.Tensor
     clip_count: torch.Tensor
     value_sum: torch.Tensor
     value_sq_sum: torch.Tensor
@@ -292,6 +299,58 @@ def pick_dtype(dtype_name: str):
     if torch.cuda.is_available():
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return torch.float32
+
+
+def sum_token_values_by_trajectory(
+    token_values: torch.Tensor,
+    token_sample_indices: torch.Tensor,
+    sample_count: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return trajectory-mean sum, token sum, and valid trajectory count.
+
+    Importance ratios remain token-level. This reducer only changes how the
+    resulting PPO/GRPO token objectives contribute to optimization: every
+    trajectory with at least one valid response token contributes one
+    within-trajectory token mean.
+    """
+    if token_values.ndim != 1 or token_sample_indices.ndim != 1:
+        raise ValueError("RL token values and sample indices must be 1-D.")
+    if token_values.numel() != token_sample_indices.numel():
+        raise ValueError(
+            "RL token values and sample indices must have equal lengths."
+        )
+    if sample_count < 0:
+        raise ValueError("RL sample count must be non-negative.")
+    if token_sample_indices.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise TypeError("RL sample indices must use an integer dtype.")
+    if token_sample_indices.device != token_values.device:
+        raise ValueError(
+            "RL token values and sample indices must share a device."
+        )
+
+    response_counts = torch.bincount(
+        token_sample_indices.long(),
+        minlength=sample_count,
+    )
+    trajectory_sums = token_values.new_zeros(sample_count)
+    trajectory_sums.scatter_add_(
+        0,
+        token_sample_indices.long(),
+        token_values,
+    )
+    valid_trajectory_mask = response_counts > 0
+    trajectory_mean_sum = (
+        trajectory_sums
+        / response_counts.clamp_min(1).to(dtype=token_values.dtype)
+    )[valid_trajectory_mask].sum()
+    return (
+        trajectory_mean_sum,
+        token_values.sum(),
+        valid_trajectory_mask.sum(),
+    )
 
 
 def make_grpo_varlen_batch(
@@ -1301,6 +1360,26 @@ class FSDPTrainWorker:
         valid_token_count = int(batch["target_indices"].numel())
         if valid_token_count <= 0:
             raise RuntimeError("A Varlen pack must contain at least one target.")
+        if self.args.rl_algorithm == "grpo":
+            valid_sample_indices = batch["sequence_ids"][
+                batch["target_indices"]
+            ]
+            valid_trajectory_count = int(
+                torch.unique(valid_sample_indices).numel()
+            )
+            if valid_trajectory_count <= 0:
+                raise RuntimeError(
+                    "A GRPO Varlen pack must contain at least one valid "
+                    "trajectory."
+                )
+        else:
+            response_counts = batch["response_counts"]
+            valid_trajectory_count = int(response_counts.gt(0).sum().item())
+            if valid_trajectory_count <= 0:
+                raise RuntimeError(
+                    "A PPO Varlen pack must contain at least one valid "
+                    "trajectory."
+                )
         max_seqlen = max(len(sample.input_ids) for sample in collected)
         version_lag_sum, sample_count = self._version_lag_stats(
             collected,
@@ -1314,6 +1393,7 @@ class FSDPTrainWorker:
             version_lag_sum=version_lag_sum,
             sample_count=sample_count,
             cpu_milliseconds=cpu_milliseconds,
+            valid_trajectory_count=valid_trajectory_count,
         )
 
     def _compute_rl_loss(
@@ -1406,11 +1486,26 @@ class FSDPTrainWorker:
         else:
             raise ValueError(f"Unsupported clip_mode: {self.args.clip_mode}")
 
+        sample_count = int(batch["sample_advantages"].numel())
+        policy_trajectory_sum, _, valid_trajectory_count = (
+            sum_token_values_by_trajectory(
+                -valid_objective.float(),
+                valid_sample_indices,
+                sample_count,
+            )
+        )
         old_new_kl_k3 = valid_ratio - 1.0 - valid_log_ratio
-        policy_token_sum = -valid_objective.float().sum()
-        old_new_kl_k3_sum = old_new_kl_k3.float().sum()
-        loss = policy_token_sum + (
-            self.args.old_new_kl_coef * old_new_kl_k3_sum
+        (
+            old_new_kl_k3_trajectory_sum,
+            old_new_kl_k3_token_sum,
+            _,
+        ) = sum_token_values_by_trajectory(
+            old_new_kl_k3.float(),
+            valid_sample_indices,
+            sample_count,
+        )
+        loss = policy_trajectory_sum + (
+            self.args.old_new_kl_coef * old_new_kl_k3_trajectory_sum
         )
         with torch.no_grad():
             if self.args.clip_mode == "ppo":
@@ -1420,14 +1515,18 @@ class FSDPTrainWorker:
                 )
                 ppo_clip_count = clipped_mask.sum().float()
             else:
-                ppo_clip_count = policy_token_sum.new_zeros(())
+                ppo_clip_count = policy_trajectory_sum.new_zeros(())
 
-            token_stats = VarlenTokenStats(
-                policy_token_sum=policy_token_sum,
-                old_new_kl_k3_sum=old_new_kl_k3_sum,
+            reduction_stats = GRPOReductionStats(
+                policy_trajectory_sum=policy_trajectory_sum,
+                old_new_kl_k3_trajectory_sum=(
+                    old_new_kl_k3_trajectory_sum
+                ),
+                old_new_kl_k3_token_sum=old_new_kl_k3_token_sum,
                 ppo_clip_count=ppo_clip_count,
+                valid_trajectory_count=valid_trajectory_count,
             ).pack()
-        return loss, {"token_stats": token_stats}
+        return loss, {"reduction_stats": reduction_stats}
 
     def _forward_ppo_token_view(
         self,
@@ -1791,7 +1890,7 @@ class FSDPTrainWorker:
         actor_advantages: torch.Tensor,
         returns: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute PPO token sums from already detached actor/critic targets."""
+        """Compute trajectory-equal PPO loss and dual-reduction statistics."""
         self._validate_ppo_flat_token_view(view)
         expected_shape = view.current_values.shape
         target_fields = {
@@ -1848,25 +1947,51 @@ class FSDPTrainWorker:
         else:
             raise ValueError(f"Unsupported clip_mode: {self.args.clip_mode}")
 
-        policy_sum = -valid_objective.float().sum()
+        sample_count = int(view.response_counts.numel())
+        (
+            policy_trajectory_sum,
+            policy_token_sum,
+            valid_trajectory_count,
+        ) = sum_token_values_by_trajectory(
+            -valid_objective.float(),
+            view.response_sample_indices,
+            sample_count,
+        )
         residuals = returns.detach().float() - view.current_values.float()
-        value_loss_sum = 0.5 * residuals.float().square().sum()
+        value_loss_tokens = 0.5 * residuals.float().square()
+        value_loss_trajectory_sum, value_loss_token_sum, _ = (
+            sum_token_values_by_trajectory(
+                value_loss_tokens,
+                view.response_sample_indices,
+                sample_count,
+            )
+        )
         old_new_kl = valid_ratio - 1.0 - valid_log_ratio
-        kl_sum = old_new_kl.float().sum()
-        token_loss_sum = (
-            policy_sum
-            + self.args.value_loss_coef * value_loss_sum
-            + self.args.old_new_kl_coef * kl_sum
+        kl_trajectory_sum, kl_token_sum, _ = (
+            sum_token_values_by_trajectory(
+                old_new_kl.float(),
+                view.response_sample_indices,
+                sample_count,
+            )
+        )
+        trajectory_loss_sum = (
+            policy_trajectory_sum
+            + self.args.value_loss_coef * value_loss_trajectory_sum
+            + self.args.old_new_kl_coef * kl_trajectory_sum
         )
 
         with torch.no_grad():
             values_detached = view.current_values.detach().float()
             returns_float = returns.float()
             raw_advantages64 = raw_advantages.double()
-            stats = PPOTokenStats(
-                policy_sum=policy_sum,
-                value_loss_sum=value_loss_sum,
-                kl_sum=kl_sum,
+            stats = PPOReductionStats(
+                policy_trajectory_sum=policy_trajectory_sum,
+                value_loss_trajectory_sum=value_loss_trajectory_sum,
+                kl_trajectory_sum=kl_trajectory_sum,
+                policy_token_sum=policy_token_sum,
+                value_loss_token_sum=value_loss_token_sum,
+                kl_token_sum=kl_token_sum,
+                valid_trajectory_count=valid_trajectory_count,
                 clip_count=clipped_mask.sum(),
                 value_sum=values_detached.sum(),
                 value_sq_sum=values_detached.square().sum(),
@@ -1880,16 +2005,16 @@ class FSDPTrainWorker:
                 terminated_count=view.terminated.sum(),
                 truncated_count=view.truncated.sum(),
             ).pack()
-        return token_loss_sum, stats
+        return trajectory_loss_sum, stats
 
-    def _compute_ppo_token_sums(
+    def _compute_ppo_reduction_sums(
         self,
         view: PPOFlatTokenView,
         *,
         ema_mean: float | None = None,
         ema_scale: float | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute a single-forward PPO objective from current raw targets."""
+        """Compute a single-forward trajectory-equal PPO objective."""
         mode = self.args.ppo_advantage_normalization
         if mode == "optimizer_window":
             raise RuntimeError(
@@ -1925,7 +2050,7 @@ class FSDPTrainWorker:
             returns=returns,
         )
 
-    def _compute_packed_ppo_token_sums(
+    def _compute_packed_ppo_reduction_sums(
         self,
         batch: Dict[str, torch.Tensor],
         *,
@@ -1933,7 +2058,7 @@ class FSDPTrainWorker:
         ema_mean: float | None = None,
         ema_scale: float | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._compute_ppo_token_sums(
+        return self._compute_ppo_reduction_sums(
             self._forward_ppo_token_view(
                 batch,
                 max_seqlen=max_seqlen,
@@ -1956,6 +2081,15 @@ class FSDPTrainWorker:
                 f"{prepared.valid_token_count} != {valid_token_count}."
             )
         sample_count = int(batch["response_counts"].numel())
+        valid_trajectory_count = int(
+            batch["response_counts"].gt(0).sum().item()
+        )
+        if valid_trajectory_count != prepared.valid_trajectory_count:
+            raise RuntimeError(
+                "Prepared PPO valid-trajectory count does not match response "
+                f"counts: {prepared.valid_trajectory_count} != "
+                f"{valid_trajectory_count}."
+            )
         bootstrap_mask = torch.zeros(sample_count, dtype=torch.bool)
         bootstrap_sample_indices = batch["bootstrap_sample_indices"].long()
         if bootstrap_sample_indices.numel() > 0:
@@ -2192,27 +2326,37 @@ class FSDPTrainWorker:
         self,
         trainer_version: float,
     ) -> Dict[str, object]:
-        """Run one globally token-normalized packed PPO optimizer step."""
+        """Run one globally trajectory-normalized packed PPO optimizer step."""
         window = self._prepare_varlen_optimizer_window(trainer_version)
         pack_stats = self._reduce_varlen_pack_stats(window)
         local_valid_token_count = sum(
             prepared.valid_token_count for prepared in window
         )
-        global_valid_token_count_tensor = torch.tensor(
-            local_valid_token_count,
+        local_valid_trajectory_count = sum(
+            prepared.valid_trajectory_count for prepared in window
+        )
+        global_reduction_counts = torch.tensor(
+            [local_valid_token_count, local_valid_trajectory_count],
             device=self.device,
             dtype=torch.int64,
         )
-        # 聚合所有有效的 token 数
         dist.all_reduce(
-            global_valid_token_count_tensor,
+            global_reduction_counts,
             op=dist.ReduceOp.SUM,
         )
-        global_valid_token_count = int(global_valid_token_count_tensor.item())
+        (
+            global_valid_token_count,
+            global_valid_trajectory_count,
+        ) = (int(value) for value in global_reduction_counts.tolist())
         if global_valid_token_count <= 0:
             raise RuntimeError(
                 "Global packed PPO optimizer window contains no valid "
                 "response tokens."
+            )
+        if global_valid_trajectory_count <= 0:
+            raise RuntimeError(
+                "Global packed PPO optimizer window contains no valid "
+                "trajectories."
             )
 
         normalization_mode = self.args.ppo_advantage_normalization
@@ -2267,7 +2411,7 @@ class FSDPTrainWorker:
                 global_valid_token_count=global_valid_token_count,
             )
 
-        local_token_stats = PPOTokenStats.zeros(self.device)
+        local_reduction_stats = PPOReductionStats.zeros(self.device)
         local_version_stats = torch.zeros(
             2,
             device=self.device,
@@ -2303,7 +2447,7 @@ class FSDPTrainWorker:
                     std=advantage_std,
                     eps=self.args.ppo_adv_norm_eps,
                 )
-                token_loss_sum, token_stats = (
+                trajectory_loss_sum, reduction_stats = (
                     self._compute_ppo_loss_from_targets(
                         view,
                         raw_advantages=raw_advantages,
@@ -2312,37 +2456,48 @@ class FSDPTrainWorker:
                     )
                 )
             else:
-                token_loss_sum, token_stats = (
-                    self._compute_packed_ppo_token_sums(
+                trajectory_loss_sum, reduction_stats = (
+                    self._compute_packed_ppo_reduction_sums(
                         batch,
                         max_seqlen=prepared.max_seqlen,
                         ema_mean=ema_mean,
                         ema_scale=ema_scale,
                     )
                 )
-            backward_loss = token_loss_sum * (
+            backward_loss = trajectory_loss_sum * (
                 float(self.fsdp_world_size)
-                / float(global_valid_token_count)
+                / float(global_valid_trajectory_count)
             )
             backward_loss.backward()
-            if token_stats.shape != local_token_stats.shape:
+            if reduction_stats.shape != local_reduction_stats.shape:
                 raise RuntimeError(
                     "Unexpected packed PPO statistics shape: "
-                    f"{tuple(token_stats.shape)} != "
-                    f"{tuple(local_token_stats.shape)}"
+                    f"{tuple(reduction_stats.shape)} != "
+                    f"{tuple(local_reduction_stats.shape)}"
                 )
-            local_token_stats.add_(token_stats)
+            local_reduction_stats.add_(reduction_stats)
             local_version_stats[0] += prepared.version_lag_sum
             local_version_stats[1] += prepared.sample_count
             self.train_micro_step += 1
-            del batch, token_loss_sum, token_stats, backward_loss
+            del batch, trajectory_loss_sum, reduction_stats, backward_loss
             if frozen_window is not None:
                 del view, raw_advantages, actor_advantages, returns, frozen
 
-        dist.all_reduce(local_token_stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_reduction_stats, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_version_stats, op=dist.ReduceOp.SUM)
 
-        stats = PPOTokenStats.unpack(local_token_stats).to_float_dict()
+        stats = PPOReductionStats.unpack(
+            local_reduction_stats
+        ).to_float_dict()
+        stats_valid_trajectory_count = int(
+            stats["valid_trajectory_count"]
+        )
+        if stats_valid_trajectory_count != global_valid_trajectory_count:
+            raise RuntimeError(
+                "Prepared and forward PPO valid-trajectory counts differ: "
+                f"{global_valid_trajectory_count} != "
+                f"{stats_valid_trajectory_count}."
+            )
         raw_advantage_count = stats["raw_advantage_count"]
         if raw_advantage_count != float(global_valid_token_count):
             raise RuntimeError(
@@ -2418,9 +2573,21 @@ class FSDPTrainWorker:
         self.optimizer_step += 1
 
         token_count = float(global_valid_token_count)
-        policy_loss_mean = stats["policy_sum"] / token_count
-        value_loss_mean = stats["value_loss_sum"] / token_count
-        kl_mean = stats["kl_sum"] / token_count
+        trajectory_count = float(global_valid_trajectory_count)
+        policy_loss_mean = (
+            stats["policy_trajectory_sum"] / trajectory_count
+        )
+        value_loss_mean = (
+            stats["value_loss_trajectory_sum"] / trajectory_count
+        )
+        kl_trajectory_mean = (
+            stats["kl_trajectory_sum"] / trajectory_count
+        )
+        policy_loss_token_mean = stats["policy_token_sum"] / token_count
+        value_loss_token_mean = (
+            stats["value_loss_token_sum"] / token_count
+        )
+        kl_token_mean = stats["kl_token_sum"] / token_count
         global_version_lag_sum, global_sample_count = (
             local_version_stats.tolist()
         )
@@ -2428,6 +2595,7 @@ class FSDPTrainWorker:
             **pack_stats,
             "global_ppo_stats": stats,
             "global_valid_token_count": token_count,
+            "global_valid_trajectory_count": trajectory_count,
             "global_version_lag_sum": global_version_lag_sum,
             "global_sample_count": global_sample_count,
             "policy_loss_mean": policy_loss_mean,
@@ -2435,9 +2603,12 @@ class FSDPTrainWorker:
             "loss_mean": (
                 policy_loss_mean
                 + self.args.value_loss_coef * value_loss_mean
-                + self.args.old_new_kl_coef * kl_mean
+                + self.args.old_new_kl_coef * kl_trajectory_mean
             ),
-            "kl_token_mean": kl_mean,
+            "policy_loss_token_mean": policy_loss_token_mean,
+            "value_loss_token_mean": value_loss_token_mean,
+            "kl_trajectory_mean": kl_trajectory_mean,
+            "kl_token_mean": kl_token_mean,
             "clip_fraction": stats["clip_count"] / token_count,
             "current_lr": current_lr,
             "ppo_target_prepass_milliseconds": target_prepass_milliseconds,
@@ -2455,29 +2626,40 @@ class FSDPTrainWorker:
         self,
         trainer_version: float,
     ) -> Dict[str, float]:
-        """Run one globally token-normalized packed GRPO optimizer step."""
+        """Run one globally trajectory-normalized packed GRPO step."""
         window = self._prepare_varlen_optimizer_window(trainer_version)
         pack_stats = self._reduce_varlen_pack_stats(window)
         local_valid_token_count = sum(
             pack.valid_token_count for pack in window
         )
-        global_valid_token_count_tensor = torch.tensor(
-            local_valid_token_count,
+        local_valid_trajectory_count = sum(
+            pack.valid_trajectory_count for pack in window
+        )
+        global_reduction_counts = torch.tensor(
+            [local_valid_token_count, local_valid_trajectory_count],
             device=self.device,
             dtype=torch.int64,
         )
         dist.all_reduce(
-            global_valid_token_count_tensor,
+            global_reduction_counts,
             op=dist.ReduceOp.SUM,
         )
-        global_valid_token_count = int(global_valid_token_count_tensor.item())
+        (
+            global_valid_token_count,
+            global_valid_trajectory_count,
+        ) = (int(value) for value in global_reduction_counts.tolist())
         if global_valid_token_count <= 0:
             raise RuntimeError(
                 "Global Varlen optimizer window contains no valid "
                 "response tokens."
             )
+        if global_valid_trajectory_count <= 0:
+            raise RuntimeError(
+                "Global GRPO optimizer window contains no valid "
+                "trajectories."
+            )
 
-        local_token_stats = VarlenTokenStats.zeros(self.device)
+        local_reduction_stats = GRPOReductionStats.zeros(self.device)
         local_version_stats = torch.zeros(
             2,
             device=self.device,
@@ -2485,41 +2667,57 @@ class FSDPTrainWorker:
         )
         for prepared_pack in window:
             batch = move_batch_to_device(prepared_pack.batch, self.device)
-            token_loss_sum, loss_stats = self._compute_rl_loss(
+            trajectory_loss_sum, loss_stats = self._compute_rl_loss(
                 batch,
                 max_seqlen=prepared_pack.max_seqlen,
             )
-            backward_loss = token_loss_sum * (
+            backward_loss = trajectory_loss_sum * (
                 float(self.fsdp_world_size)
-                / float(global_valid_token_count)
+                / float(global_valid_trajectory_count)
             )
             backward_loss.backward()
 
-            token_stats = loss_stats["token_stats"]
-            if not isinstance(token_stats, torch.Tensor):
+            reduction_stats = loss_stats["reduction_stats"]
+            if not isinstance(reduction_stats, torch.Tensor):
                 raise TypeError(
                     "Packed loss statistics must remain an accelerator tensor."
                 )
-            if token_stats.shape != local_token_stats.shape:
+            if reduction_stats.shape != local_reduction_stats.shape:
                 raise RuntimeError(
                     "Unexpected packed loss statistics shape: "
-                    f"{tuple(token_stats.shape)} != "
-                    f"{tuple(local_token_stats.shape)}"
+                    f"{tuple(reduction_stats.shape)} != "
+                    f"{tuple(local_reduction_stats.shape)}"
                 )
-            local_token_stats.add_(token_stats)
+            local_reduction_stats.add_(reduction_stats)
             local_version_stats[0] += prepared_pack.version_lag_sum
             local_version_stats[1] += prepared_pack.sample_count
             self.train_micro_step += 1
-            del batch, token_loss_sum, backward_loss, token_stats
+            del batch, trajectory_loss_sum, backward_loss, reduction_stats
 
-        dist.all_reduce(local_token_stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_reduction_stats, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_version_stats, op=dist.ReduceOp.SUM)
         reduced_stats = (
-            VarlenTokenStats.unpack(local_token_stats).to_float_dict()
+            GRPOReductionStats.unpack(
+                local_reduction_stats
+            ).to_float_dict()
         )
-        global_policy_sum = reduced_stats["policy_token_sum"]
-        global_kl_sum = reduced_stats["old_new_kl_k3_sum"]
+        global_policy_trajectory_sum = reduced_stats[
+            "policy_trajectory_sum"
+        ]
+        global_kl_trajectory_sum = reduced_stats[
+            "old_new_kl_k3_trajectory_sum"
+        ]
+        global_kl_token_sum = reduced_stats["old_new_kl_k3_token_sum"]
         global_clip_count = reduced_stats["ppo_clip_count"]
+        stats_valid_trajectory_count = int(
+            reduced_stats["valid_trajectory_count"]
+        )
+        if stats_valid_trajectory_count != global_valid_trajectory_count:
+            raise RuntimeError(
+                "Prepared and forward GRPO valid-trajectory counts differ: "
+                f"{global_valid_trajectory_count} != "
+                f"{stats_valid_trajectory_count}."
+            )
         global_version_lag_sum, global_sample_count = local_version_stats.tolist()
 
         torch.nn.utils.clip_grad_norm_(
@@ -2539,22 +2737,31 @@ class FSDPTrainWorker:
         self.optimizer_step += 1
 
         token_count = float(global_valid_token_count)
-        policy_loss_token_mean = global_policy_sum / token_count
-        kl_token_mean = global_kl_sum / token_count
+        trajectory_count = float(global_valid_trajectory_count)
+        policy_loss_trajectory_mean = (
+            global_policy_trajectory_sum / trajectory_count
+        )
+        kl_trajectory_mean = global_kl_trajectory_sum / trajectory_count
+        kl_token_mean = global_kl_token_sum / token_count
 
         return {
             **pack_stats,
-            "policy_metric_sum": global_policy_sum,
-            "kl_metric_sum": global_kl_sum,
+            "policy_trajectory_metric_sum": global_policy_trajectory_sum,
+            "kl_trajectory_metric_sum": global_kl_trajectory_sum,
+            "kl_token_metric_sum": global_kl_token_sum,
             "clip_metric_sum": global_clip_count,
-            "metric_weight": token_count,
+            "trajectory_metric_weight": trajectory_count,
+            "token_metric_weight": token_count,
             "global_valid_token_count": token_count,
+            "global_valid_trajectory_count": trajectory_count,
             "global_version_lag_sum": global_version_lag_sum,
             "global_sample_count": global_sample_count,
             "loss_mean": (
-                policy_loss_token_mean
-                + self.args.old_new_kl_coef * kl_token_mean
+                policy_loss_trajectory_mean
+                + self.args.old_new_kl_coef * kl_trajectory_mean
             ),
+            "policy_loss_mean": policy_loss_trajectory_mean,
+            "kl_trajectory_mean": kl_trajectory_mean,
             "kl_token_mean": kl_token_mean,
             "clip_fraction": global_clip_count / token_count,
             "current_lr": current_lr,
@@ -2575,7 +2782,7 @@ class FSDPTrainWorker:
 
         global_steps = []
         aggregate_ppo_stats = {
-            name: 0.0 for name in PPOTokenStats.names()
+            name: 0.0 for name in PPOReductionStats.names()
         }
         while self.optimizer_step < target_optimizer_step:
             trainer_version = (
@@ -2597,11 +2804,16 @@ class FSDPTrainWorker:
                     if self.args.rl_algorithm == "ppo"
                     else ""
                 )
+                trajectory_kl_text = (
+                    " kl_trajectory_mean="
+                    f"{step_stats['kl_trajectory_mean']:.6f}"
+                )
                 print(
                     "[train] "
                     f"optimizer_step={self.optimizer_step} "
                     f"loss={step_stats['loss_mean']:.6f}"
                     f"{value_text} "
+                    f"{trajectory_kl_text} "
                     f"kl_token_mean={step_stats['kl_token_mean']:.6f} "
                     f"clip_frac={step_stats['clip_fraction']:.4f} "
                     f"tokens={step_stats['global_valid_token_count']:.0f} "
@@ -2677,47 +2889,94 @@ class FSDPTrainWorker:
         )
 
         if self.args.rl_algorithm == "grpo":
-            metric_weight = sum(
-                float(step["metric_weight"]) for step in global_steps
+            trajectory_metric_weight = sum(
+                float(step["trajectory_metric_weight"])
+                for step in global_steps
             )
-            policy_metric_sum = sum(
-                float(step["policy_metric_sum"]) for step in global_steps
+            token_metric_weight = sum(
+                float(step["token_metric_weight"])
+                for step in global_steps
             )
-            kl_metric_sum = sum(
-                float(step["kl_metric_sum"]) for step in global_steps
+            policy_trajectory_metric_sum = sum(
+                float(step["policy_trajectory_metric_sum"])
+                for step in global_steps
+            )
+            kl_trajectory_metric_sum = sum(
+                float(step["kl_trajectory_metric_sum"])
+                for step in global_steps
+            )
+            kl_token_metric_sum = sum(
+                float(step["kl_token_metric_sum"])
+                for step in global_steps
             )
             clip_metric_sum = sum(
                 float(step["clip_metric_sum"]) for step in global_steps
             )
-            denominator = max(metric_weight, 1.0)
-            policy_mean = policy_metric_sum / denominator
-            kl_mean = kl_metric_sum / denominator
+            trajectory_denominator = max(trajectory_metric_weight, 1.0)
+            token_denominator = max(token_metric_weight, 1.0)
+            policy_mean = (
+                policy_trajectory_metric_sum / trajectory_denominator
+            )
+            kl_trajectory_mean = (
+                kl_trajectory_metric_sum / trajectory_denominator
+            )
+            kl_token_mean = kl_token_metric_sum / token_denominator
             result.update(
                 {
                     "segment_loss_mean": (
                         policy_mean
-                        + self.args.old_new_kl_coef * kl_mean
+                        + self.args.old_new_kl_coef * kl_trajectory_mean
                     ),
                     "segment_policy_loss_mean": policy_mean,
                     "segment_value_loss_mean": 0.0,
-                    "segment_kl_mean": kl_mean,
-                    "segment_clip_frac": clip_metric_sum / denominator,
+                    "segment_kl_mean": kl_trajectory_mean,
+                    "segment_kl_trajectory_mean": kl_trajectory_mean,
+                    "segment_kl_token_mean": kl_token_mean,
+                    "segment_clip_frac": (
+                        clip_metric_sum / token_denominator
+                    ),
+                    "segment_valid_trajectories": trajectory_metric_weight,
                 }
             )
             dist.barrier()
             return result
 
-        denominator = max(valid_tokens, 1.0)
-        policy_mean = aggregate_ppo_stats["policy_sum"] / denominator
-        value_loss_mean = (
-            aggregate_ppo_stats["value_loss_sum"] / denominator
+        token_denominator = max(valid_tokens, 1.0)
+        valid_trajectories = sum(
+            float(step["global_valid_trajectory_count"])
+            for step in global_steps
         )
-        kl_mean = aggregate_ppo_stats["kl_sum"] / denominator
+        trajectory_denominator = max(valid_trajectories, 1.0)
+        policy_mean = (
+            aggregate_ppo_stats["policy_trajectory_sum"]
+            / trajectory_denominator
+        )
+        value_loss_mean = (
+            aggregate_ppo_stats["value_loss_trajectory_sum"]
+            / trajectory_denominator
+        )
+        kl_trajectory_mean = (
+            aggregate_ppo_stats["kl_trajectory_sum"]
+            / trajectory_denominator
+        )
+        policy_token_mean = (
+            aggregate_ppo_stats["policy_token_sum"] / token_denominator
+        )
+        value_loss_token_mean = (
+            aggregate_ppo_stats["value_loss_token_sum"]
+            / token_denominator
+        )
+        kl_token_mean = (
+            aggregate_ppo_stats["kl_token_sum"] / token_denominator
+        )
 
         def moments(prefix):
-            mean = aggregate_ppo_stats[f"{prefix}_sum"] / denominator
+            mean = (
+                aggregate_ppo_stats[f"{prefix}_sum"] / token_denominator
+            )
             variance = max(
-                aggregate_ppo_stats[f"{prefix}_sq_sum"] / denominator
+                aggregate_ppo_stats[f"{prefix}_sq_sum"]
+                / token_denominator
                 - mean * mean,
                 0.0,
             )
@@ -2728,7 +2987,8 @@ class FSDPTrainWorker:
         raw_advantage_mean, raw_advantage_std = moments("raw_advantage")
         raw_advantage_rms = math.sqrt(
             max(
-                aggregate_ppo_stats["raw_advantage_sq_sum"] / denominator,
+                aggregate_ppo_stats["raw_advantage_sq_sum"]
+                / token_denominator,
                 0.0,
             )
         )
@@ -2742,7 +3002,7 @@ class FSDPTrainWorker:
         )
         residual_mean = return_mean - value_mean
         residual_variance = max(
-            2.0 * value_loss_mean - residual_mean * residual_mean,
+            2.0 * value_loss_token_mean - residual_mean * residual_mean,
             0.0,
         )
         return_variance = return_std * return_std
@@ -2760,14 +3020,19 @@ class FSDPTrainWorker:
                 "segment_loss_mean": (
                     policy_mean
                     + self.args.value_loss_coef * value_loss_mean
-                    + self.args.old_new_kl_coef * kl_mean
+                    + self.args.old_new_kl_coef * kl_trajectory_mean
                 ),
                 "segment_policy_loss_mean": policy_mean,
                 "segment_value_loss_mean": value_loss_mean,
-                "segment_kl_mean": kl_mean,
+                "segment_policy_loss_token_mean": policy_token_mean,
+                "segment_value_loss_token_mean": value_loss_token_mean,
+                "segment_kl_mean": kl_trajectory_mean,
+                "segment_kl_trajectory_mean": kl_trajectory_mean,
+                "segment_kl_token_mean": kl_token_mean,
                 "segment_clip_frac": (
-                    aggregate_ppo_stats["clip_count"] / denominator
+                    aggregate_ppo_stats["clip_count"] / token_denominator
                 ),
+                "segment_valid_trajectories": valid_trajectories,
                 "segment_value_prediction_mean": value_mean,
                 "segment_value_prediction_std": value_std,
                 "segment_return_mean": return_mean,
@@ -2799,8 +3064,8 @@ class FSDPTrainWorker:
                 ),
                 "segment_value_mse": (
                     2.0
-                    * aggregate_ppo_stats["value_loss_sum"]
-                    / denominator
+                    * aggregate_ppo_stats["value_loss_token_sum"]
+                    / token_denominator
                 ),
                 "segment_explained_variance": explained_variance,
                 "segment_terminated_token_count": (
@@ -4697,11 +4962,35 @@ async def run_textworld_train(args: argparse.Namespace):
             )
             kl_token_mean = (
                 sum(
-                    float(summary["segment_kl_mean"])
+                    float(summary["segment_kl_token_mean"])
                     for summary in summaries
                 )
                 / len(summaries)
             )
+            kl_trajectory_mean = (
+                sum(
+                    float(summary["segment_kl_trajectory_mean"])
+                    for summary in summaries
+                )
+                / len(summaries)
+            )
+            policy_loss_token_mean = None
+            value_loss_token_mean = None
+            if args.rl_algorithm == "ppo":
+                policy_loss_token_mean = (
+                    sum(
+                        float(summary["segment_policy_loss_token_mean"])
+                        for summary in summaries
+                    )
+                    / len(summaries)
+                )
+                value_loss_token_mean = (
+                    sum(
+                        float(summary["segment_value_loss_token_mean"])
+                        for summary in summaries
+                    )
+                    / len(summaries)
+                )
             clip_fraction = (
                 sum(
                     float(summary["segment_clip_frac"])
@@ -4781,9 +5070,26 @@ async def run_textworld_train(args: argparse.Namespace):
                 value_loss_mean,
                 tb_step,
             )
+            if policy_loss_token_mean is not None:
+                writer.add_scalar(
+                    "Train/PolicyLossTokenMean",
+                    policy_loss_token_mean,
+                    tb_step,
+                )
+            if value_loss_token_mean is not None:
+                writer.add_scalar(
+                    "Train/ValueLossTokenMean",
+                    value_loss_token_mean,
+                    tb_step,
+                )
             writer.add_scalar(
                 "KL/OldNewK3TokenMean",
                 kl_token_mean,
+                tb_step,
+            )
+            writer.add_scalar(
+                "KL/OldNewK3TrajectoryMean",
+                kl_trajectory_mean,
                 tb_step,
             )
             writer.add_scalar(
@@ -4974,7 +5280,13 @@ async def run_textworld_train(args: argparse.Namespace):
             print(
                 "[metrics] "
                 f"step={tb_step} loss={train_loss_mean:.6f} "
-                f"kl={kl_token_mean:.6f} clip={clip_fraction:.4f} "
+                f"kl_token={kl_token_mean:.6f} "
+                + (
+                    f"kl_trajectory={kl_trajectory_mean:.6f} "
+                    if kl_trajectory_mean is not None
+                    else ""
+                )
+                + f"clip={clip_fraction:.4f} "
                 f"train_tokens_per_sec={train_tokens_per_sec:.2f} "
                 f"infer_tokens_per_sec={infer_tokens_per_sec:.2f} "
                 f"score={rollout_stats['tw_normalized_score']:.4f}"
@@ -5320,7 +5632,10 @@ def parse_args() -> argparse.Namespace:
         "--value-loss-coef",
         type=float,
         default=0.5,
-        help="Coefficient for the unclipped token Value MSE loss.",
+        help=(
+            "Coefficient for unclipped per-token Value MSE, reduced equally "
+            "over valid PPO trajectories."
+        ),
     )
     parser.add_argument(
         "--ppo-adv-norm-eps",
@@ -5339,8 +5654,10 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help=(
-            "Coefficient for the KL(old || new) k3 token-mean penalty. "
-            "0 disables the penalty while keeping KL metrics."
+            "Coefficient for the KL(old || new) k3 penalty. PPO and GRPO "
+            "reduce it equally over valid trajectories while retaining a "
+            "global-token diagnostic. 0 disables the penalty while keeping "
+            "KL metrics."
         ),
     )
     parser.add_argument(

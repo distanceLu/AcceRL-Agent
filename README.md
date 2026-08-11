@@ -204,8 +204,18 @@ python -m accerl_agent.run_agent_textworld \
 
 Packed training selects at most `--train-max-sequences-per-pack` samples and packs no more than
 `--train-token-budget` real tokens into one microbatch. PPO and GRPO prepare
-`--grad-accum-steps` CPU packs before each optimizer step and normalize losses
-by the global valid response-token count of that complete window.
+`--grad-accum-steps` CPU packs before each optimizer step. Both algorithms use
+trajectory-equal optimization reduction: PPO first averages policy, unclipped
+Value MSE, and KL token objectives within each complete `RawPPOSample`; GRPO
+does the same for policy and KL within each complete `GRPOSample`. They then
+average trajectories with at least one valid response token across the complete
+distributed optimizer window. PPO ratios, clipping, GAE, returns, value
+predictions, and advantage-normalization moments remain token-level. A
+trajectory is one replay sample, not one turn/action, and this reduction is not
+sequence-level importance sampling or prompt/group-equal weighting. Unlike
+slime's default per-sample metric reducer, AcceRL intentionally keeps PPO clip
+fraction as a global valid-token ratio so that it continues to answer how many
+token ratios crossed the clip boundary.
 
 GPU requirement for full training:
 
@@ -254,7 +264,7 @@ flowchart LR
     Trainer -->|"NCCL trainable weights"| Infer
 ```
 
-`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, trains the full policy model, and samples independent replay objects. It also owns a separately sharded FP32 Value Head. PPO uses packed FlashAttention 2 boundaries, native tensor `logits_to_keep`, and a temporary model-native LM-head hook, so only response/bootstrap logits and final hidden states are retained. It computes current values and batched detached TD(λ) targets when replay is sampled, then optimizes policy and Value losses over the same global response-token denominator. GRPO uses the same token-budget packing pipeline. Weight synchronization to vLLM remains policy-only.
+`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, trains the full policy model, and samples independent replay objects. It also owns a separately sharded FP32 Value Head. PPO uses packed FlashAttention 2 boundaries, native tensor `logits_to_keep`, and a temporary model-native LM-head hook, so only response/bootstrap logits and final hidden states are retained. It computes current values and batched detached TD(λ) targets when replay is sampled, then optimizes policy and Value losses with trajectory-equal reduction while retaining token-weighted advantage normalization and diagnostics. GRPO uses the same token-budget packing and trajectory-equal reduction pipeline. Weight synchronization to vLLM remains policy-only.
 
 `VLLMInferenceActor` handles rollout inference. It starts vLLM with dummy weights, waits for the initial full weight sync, pauses generation during later syncs, aborts requests when needed, updates weights, and then resumes generation.
 
@@ -349,7 +359,7 @@ prediction position. PPO rollout never stores values, returns, or advantages.
 | `--rollout-batch-size` | Episode batch size per rollout worker in PPO mode; also the default GRPO group size. |
 | `--train-max-sequences-per-pack` | Maximum number of independent `RLSample` objects in one packed microbatch, per FSDP rank. |
 | `--gae-lambda` | PPO token TD(λ) trace parameter; defaults to `0.95`. |
-| `--value-loss-coef` | Coefficient for the unclipped token Value MSE; defaults to `0.5`. |
+| `--value-loss-coef` | Coefficient for unclipped per-token Value MSE with trajectory-equal PPO reduction; defaults to `0.5`. |
 | `--ppo-advantage-normalization` | PPO advantage mode: `optimizer_window` (default), `ema_rms`, `ema_zscore`, or `none`. |
 | `--ppo-advantage-ema-beta` | Per-optimizer-step EMA decay for historical advantage moments; defaults to `0.9`. |
 | `--ppo-advantage-min-scale` | Positive scale floor for EMA normalization; defaults to `1e-3`. |
@@ -398,7 +408,11 @@ Saved checkpoint contents include model weights, config, tokenizer files, and `t
 | `Train/PackSampleCount` | Number of independent samples in a pack. |
 | `Train/PackMaxSequenceLength` | Longest sequence in the current pack. |
 | `Train/PackCpuMilliseconds` | CPU time spent selecting and constructing a pack. |
-| `KL/OldNewK3TokenMean` | Token-level KL-style metric between old and new policies. |
+| `Train/PolicyLossTokenMean` | PPO global valid-token policy-loss diagnostic; `Train/PolicyLoss` is the trajectory mean used by optimization. |
+| `Train/ValueLossTokenMean` | PPO global valid-token Value-loss diagnostic; `Train/ValueLoss` is the trajectory mean used by optimization. |
+| `KL/OldNewK3TrajectoryMean` | PPO/GRPO KL penalty used by optimization: valid-token mean within each trajectory, then an equal mean across valid trajectories. |
+| `KL/OldNewK3TokenMean` | Global valid-token KL diagnostic reported alongside the trajectory-mean KL. |
+| `Clip/PPOClipFrac` | Fraction of global valid response tokens outside the PPO ratio clip interval; intentionally remains token-level for both algorithms. |
 | `Infer/TokensPerSec` | vLLM generation throughput. |
 | `Sync/ElapsedSeconds` | Weight-sync latency. |
 
