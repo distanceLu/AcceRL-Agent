@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inference request, state, result, and statistics contracts for VSI-QA."""
 
+"""vsiqa"""
 import time
+"""vsiqa"""
 from dataclasses import dataclass, field
 from typing import List, Literal
 
@@ -11,7 +13,9 @@ class OnlineGenerationState:
     """Token-level state for one request across weight-update interruptions."""
 
     index: int
+    """vsiqa"""
     llm_input: dict
+    """vsiqa"""
     requested_max_tokens: int
     output_tokens: List[int] = field(default_factory=list)
     output_logprobs: List[float] = field(default_factory=list)
@@ -23,6 +27,7 @@ class OnlineGenerationState:
     def remaining_max_tokens(self) -> int:
         return max(0, self.requested_max_tokens - len(self.output_tokens))
 
+    """vsiqa"""
     @property
     def restart_engine_input(self) -> dict:
         engine_input = dict(self.llm_input)
@@ -32,6 +37,7 @@ class OnlineGenerationState:
         )
         engine_input["arrival_time"] = time.time()
         return engine_input
+    """vsiqa"""
 
 
 @dataclass
@@ -46,7 +52,9 @@ class InferenceRequestItem:
     rollout_worker_id: int
     batch_id: int
     sample_id: int
+    """vsiqa"""
     llm_input: dict
+    """vsiqa"""
     requested_max_tokens: int
 
 

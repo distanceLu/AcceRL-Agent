@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run the ScanNet task on AcceRL's unchanged async main loop."""
 
+"""vsiqa"""
 import asyncio
 
 from vsi_qa_rlvr import main as accerl_main
@@ -21,14 +22,15 @@ def main():
     accerl_main.FSDPTrainWorker = (
         ScanNetIncrementalCountingFSDPTrainWorker
     )
-    accerl_main.VSIQAVLLMInferenceActor = (
+    accerl_main.VLLMInferenceActor = (
         ScanNetIncrementalCountingVLLMInferenceActor
     )
-    accerl_main.VSIQARolloutWorkerActor = (
+    accerl_main.RolloutWorkerActor = (
         ScanNetIncrementalCountingRolloutWorkerActor
     )
-    asyncio.run(accerl_main.run_vsi_qa(args))
+    asyncio.run(accerl_main.run_weight_sync_demo(args))
 
 
 if __name__ == "__main__":
     main()
+"""vsiqa"""

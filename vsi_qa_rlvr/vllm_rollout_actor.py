@@ -2,10 +2,10 @@
 """Qwen3-VL vLLM actor following AcceRL's interruptible inference workflow."""
 
 import asyncio
-import time
+import argparse
 import uuid
 from dataclasses import asdict
-from typing import List
+from typing import List, Literal
 
 import vllm
 from vllm import SamplingParams
@@ -28,8 +28,12 @@ from vsi_qa_rlvr.inference import (
 )
 
 
-ROLLOUT_ATTENTION_BACKENDS = ("FLASH_ATTN", "TRITON_ATTN")
+INFERENCE_TP_SIZE = 1
+INFERENCE_DP_SIZE = 2
 INFER_LOG_EVERY_REQUESTS = 128
+"""vsiqa"""
+ROLLOUT_ATTENTION_BACKENDS = ("FLASH_ATTN", "TRITON_ATTN")
+"""vsiqa"""
 
 
 def create_async_engine(**kwargs):
@@ -83,7 +87,9 @@ def _finish_reason_from_output(request_output):
     return getattr(request_output.outputs[0], "finish_reason", None)
 
 
-def _normalize_stop_reason(stop_reason):
+def _normalize_stop_reason(
+    stop_reason,
+) -> Literal["length", "stop", "tool_calls", "abort"]:
     if stop_reason in ("length", "stop", "tool_calls", "abort"):
         return stop_reason
     if stop_reason in ("eos", "stop_token", "stop_sequence"):
@@ -97,10 +103,10 @@ class InterruptibleGenerationRunner:
     def __init__(
         self,
         engine,
-        temperature=0.7,
-        top_p=0.9,
-        collect_logprobs=False,
-        max_resubmit_retries=200,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        collect_logprobs: bool = False,
+        max_resubmit_retries: int = 200,
     ):
         self.engine = engine
         self.temperature = temperature
@@ -113,34 +119,40 @@ class InterruptibleGenerationRunner:
         self._active_attempts = 0
         self._active_changed = asyncio.Condition()
 
-    def pause(self):
+    def pause(self) -> None:
         self.resume_event.clear()
 
-    def resume(self):
+    def resume(self) -> None:
         self.resume_event.set()
 
     @property
-    def is_resumed(self):
+    def is_resumed(self) -> bool:
         return self.resume_event.is_set()
 
-    async def _increment_active_attempts(self):
+    # 新的engine.generate() attempt开始 +1
+    async def _increment_active_attempts(self) -> None:
         async with self._active_changed:
             self._active_attempts += 1
             self._active_changed.notify_all()
 
-    async def _decrement_active_attempts(self):
+    # 一个engine.generate() attempt 结束 -1
+    async def _decrement_active_attempts(self) -> None:
         async with self._active_changed:
             self._active_attempts -= 1
             self._active_changed.notify_all()
 
-    async def wait_for_idle(self):
+    # 等待正在跑的 generate attempt 都结束,可能是正常结束，也可能是被abort打断
+    async def wait_for_idle(self) -> None:
         async with self._active_changed:
-            await self._active_changed.wait_for(
-                lambda: self._active_attempts == 0
-            )
+            await self._active_changed.wait_for(lambda: self._active_attempts == 0)
 
-    async def generate(self, state):
+    """vsiqa"""
+    async def generate(
+        self,
+        state: OnlineGenerationState,
+    ) -> OnlineGenerationState:
         for attempt in range(1, self.max_resubmit_retries + 1):
+            # 如果当前正在weight update的attempt还没结束，就等着，不要开始新的generate attempt
             await self.resume_event.wait()
 
             remaining = state.remaining_max_tokens
@@ -168,8 +180,10 @@ class InterruptibleGenerationRunner:
 
             await self._increment_active_attempts()
             try:
+                engine_input = state.restart_engine_input
+                # 调用vllm生成接口，拿到输出后更新state，如果生成过程中被weight update打断了，engine.generate()会抛出异常，直接进入finally块结束这个attempt
                 async for request_output in self.engine.generate(
-                    state.restart_engine_input,
+                    engine_input,
                     sampling_params,
                     request_id=request_id,
                 ):
@@ -232,20 +246,22 @@ class InterruptibleGenerationRunner:
             f"{self.max_resubmit_retries}; keeping partial output."
         )
         return state
+    """vsiqa"""
 
 
-class VSIQAVLLMInferenceActor:
-    """GPU Ray actor that owns Qwen3-VL vLLM inference."""
+class VLLMInferenceActor:
+    """GPU Ray actor that owns vLLM and consumes tokenized rollout requests."""
 
-    def __init__(self, args):
+    def __init__(self, args: argparse.Namespace):
         self.args = args
+        """vsiqa"""
         self.engine = create_async_engine(
             model=args.model_path,
             trust_remote_code=True,
             dtype="bfloat16",
             enforce_eager=False,
-            tensor_parallel_size=args.infer_tp_size,
-            data_parallel_size=args.infer_dp_size,
+            tensor_parallel_size=INFERENCE_TP_SIZE,
+            data_parallel_size=INFERENCE_DP_SIZE,
             distributed_executor_backend="mp",
             data_parallel_backend="mp",
             load_format="dummy",
@@ -260,6 +276,7 @@ class VSIQAVLLMInferenceActor:
             limit_mm_per_prompt={"video": 1},
             weight_transfer_config=WeightTransferConfig(backend="nccl"),
         )
+        """vsiqa"""
         self.runner = InterruptibleGenerationRunner(
             self.engine,
             temperature=args.infer_temperature,
@@ -271,9 +288,10 @@ class VSIQAVLLMInferenceActor:
         self.next_request_index = 0
         self.pending_futures = set()
         self.stopped = False
+        """vsiqa"""
         print(
             "[infer-actor] AsyncLLMEngine ready: "
-            f"tp={args.infer_tp_size} dp={args.infer_dp_size} "
+            f"tp={INFERENCE_TP_SIZE} dp={INFERENCE_DP_SIZE} "
             "continuous_submit=True "
             f"vllm_max_num_seqs={args.vllm_max_num_seqs} "
             f"vllm_max_num_batched_tokens="
@@ -282,6 +300,7 @@ class VSIQAVLLMInferenceActor:
             f"infer_temperature={args.infer_temperature} "
             f"infer_top_p={args.infer_top_p}"
         )
+        """vsiqa"""
 
     async def start(self):
         self.stopped = False
@@ -291,16 +310,17 @@ class VSIQAVLLMInferenceActor:
         )
         return {"continuous_submit": True, "inference_loop_task": 0}
 
+    """vsiqa"""
     async def request_batch(
         self,
-        rollout_worker_id,
-        batch_id,
+        rollout_worker_id: int,
+        batch_id: int,
         vllm_prompt,
-        infer_max_tokens,
-        num_samples,
+        infer_max_tokens: int,
+        num_samples: int,
     ) -> List[InferenceResult]:
         if self.stopped:
-            raise RuntimeError("VSIQAVLLMInferenceActor is stopped.")
+            raise RuntimeError("VLLMInferenceActor is stopped.")
         if num_samples < 1:
             return []
 
@@ -324,6 +344,7 @@ class VSIQAVLLMInferenceActor:
             requests_to_process.append(item)
 
         return await self._run_generation_items(requests_to_process)
+    """vsiqa"""
 
     async def _run_generation_items(
         self,
@@ -336,11 +357,13 @@ class VSIQAVLLMInferenceActor:
         generation_tasks = []
         try:
             for item in requests_to_process:
+                """vsiqa"""
                 state = OnlineGenerationState(
                     index=item.request_index,
                     llm_input=item.llm_input,
                     requested_max_tokens=item.requested_max_tokens,
                 )
+                """vsiqa"""
                 task = asyncio.create_task(self.runner.generate(state))
                 self.active_generation_tasks.add(task)
                 task.add_done_callback(self.active_generation_tasks.discard)
@@ -355,18 +378,12 @@ class VSIQAVLLMInferenceActor:
                 for task in generation_tasks:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(
-                    *generation_tasks,
-                    return_exceptions=True,
-                )
+                await asyncio.gather(*generation_tasks, return_exceptions=True)
                 raise
 
             results = []
             first_exception = None
-            for item, completed_state in zip(
-                requests_to_process,
-                completed_states,
-            ):
+            for item, completed_state in zip(requests_to_process, completed_states):
                 if isinstance(completed_state, BaseException):
                     if first_exception is None:
                         first_exception = completed_state
@@ -393,7 +410,10 @@ class VSIQAVLLMInferenceActor:
             if current_call is not None:
                 self.pending_futures.discard(current_call)
 
-    async def _record_completed_state(self, result):
+    async def _record_completed_state(
+        self,
+        result: InferenceResult,
+    ) -> None:
         self.stats.total_requests += 1
         self.stats.total_tokens += len(result.output_tokens)
 
@@ -418,7 +438,7 @@ class VSIQAVLLMInferenceActor:
         await self.runner.wait_for_idle()
         print("[infer-actor] Generation paused and in-flight attempts drained.")
 
-    async def resume_generation(self, increment_version=False):
+    async def resume_generation(self, increment_version: bool = False):
         if increment_version:
             self.runner.version += 1
         await self.engine.resume_generation()
@@ -431,9 +451,9 @@ class VSIQAVLLMInferenceActor:
 
     async def init_weight_transfer_engine(
         self,
-        master_address,
-        master_port,
-        transfer_world_size,
+        master_address: str,
+        master_port: int,
+        transfer_world_size: int,
     ):
         await self.engine.init_weight_transfer_engine(
             WeightTransferInitRequest(
@@ -453,12 +473,11 @@ class VSIQAVLLMInferenceActor:
 
     async def update_weights(
         self,
-        names,
-        dtype_names,
-        shapes,
-        packed=True,
+        names: List[str],
+        dtype_names: List[str],
+        shapes: List[List[int]],
+        packed: bool = True,
     ):
-        started = time.perf_counter()
         await self.engine.update_weights(
             WeightTransferUpdateRequest(
                 update_info=asdict(
@@ -471,12 +490,9 @@ class VSIQAVLLMInferenceActor:
                 )
             )
         )
-        return {"elapsed_seconds": time.perf_counter() - started}
 
     async def finish_weight_update(self):
-        started = time.perf_counter()
         await self.engine.finish_weight_update()
-        return {"elapsed_seconds": time.perf_counter() - started}
 
     def get_stats(self):
         return {
@@ -498,15 +514,12 @@ class VSIQAVLLMInferenceActor:
             if not task.done():
                 task.cancel()
         if self.active_generation_tasks:
-            await asyncio.gather(
-                *self.active_generation_tasks,
-                return_exceptions=True,
-            )
+            await asyncio.gather(*self.active_generation_tasks, return_exceptions=True)
         await shutdown_vllm_engine(self.engine)
         return self.get_stats()
 
 
-async def shutdown_vllm_engine(engine):
+async def shutdown_vllm_engine(engine) -> None:
     """Shut down vLLM workers before Ray is torn down."""
     if engine is None:
         return
@@ -520,5 +533,5 @@ async def shutdown_vllm_engine(engine):
         if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
             await result
         print("[cleanup] vLLM engine shut down.")
-    except Exception as error:
-        print(f"[cleanup] Ignoring vLLM engine shutdown error: {error!r}")
+    except Exception as exc:
+        print(f"[cleanup] Ignoring vLLM engine shutdown error: {exc!r}")

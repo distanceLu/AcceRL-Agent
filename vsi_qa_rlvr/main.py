@@ -8,12 +8,13 @@ import os
 import shlex
 import sys
 import time
+from typing import List
 
 import ray
 from torch.utils.tensorboard import SummaryWriter
 
 from vsi_qa_rlvr.replay import ReplayBufferActor
-from vsi_qa_rlvr.rollout import StatsActor, VSIQARolloutWorkerActor
+from vsi_qa_rlvr.rollout import RolloutWorkerActor, StatsActor
 from vsi_qa_rlvr.synchronization import sync_weights_to_vllm
 from vsi_qa_rlvr.trainer import (
     FSDPTrainWorker,
@@ -22,81 +23,221 @@ from vsi_qa_rlvr.trainer import (
     get_local_ip,
 )
 from vsi_qa_rlvr.vllm_rollout_actor import (
+    INFERENCE_DP_SIZE,
+    INFERENCE_TP_SIZE,
     ROLLOUT_ATTENTION_BACKENDS,
-    VSIQAVLLMInferenceActor,
+    VLLMInferenceActor,
 )
 
 
-def parse_args():
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+FSDP_WORLD_SIZE = 6
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run VSI-QA with AcceRL's original asynchronous workflow."
+        description=(
+            "Run a minimal Ray FSDP trainer + vLLM interruptible inference "
+            "NCCL weight-sync demo."
+        )
     )
+    """vsiqa"""
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--data-path", required=True)
+    """vsiqa"""
     parser.add_argument(
-        "--output-dir",
-        default=(
-            "/data/all/luck/runs/AcceRL-Agent/"
-            f"vsi_qa_async_rlvr/{timestamp}"
+        "--dtype",
+        default="auto",
+        choices=("auto", "bfloat16", "float16", "float32"),
+    )
+    parser.add_argument(
+        "--train-mode",
+        default="lm_head",
+        choices=("lm_head", "last_layer", "full"),
+        help="Default lm_head mode is intended to validate the training loop.",
+    )
+    parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=5000,
+        help="Maximum optimizer steps to run before stopping the demo.",
+    )
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--grad-accum-steps", type=int, default=8)
+    parser.add_argument(
+        "--train-logprob-mode",
+        type=str,
+        default="full_logits_ce",
+        choices=["full_logits_ce", "response_only_lm_head"],
+        help=(
+            "How the trainer computes per-token logprobs. "
+            "'full_logits_ce' keeps the standard model forward but avoids "
+            "materializing full log_softmax; "
+
+            "TODO: It hasn't been correctly implemented yet."
+            "'response_only_lm_head' is an "
+            "experimental path that applies the LM head only to response tokens."
         ),
     )
-    parser.add_argument("--ray-address", default=None)
-    parser.add_argument("--ray-num-cpus", type=int, default=16)
-
-    parser.add_argument("--fsdp-world-size", type=int, default=4)
-    parser.add_argument("--infer-tp-size", type=int, default=1)
-    parser.add_argument("--infer-dp-size", type=int, default=4)
-    parser.add_argument("--infer-actor-max-concurrency", type=int, default=1024)
-
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--grad-accum-steps", type=int, default=8)
-    parser.add_argument("--max-steps", type=int, default=3000)
-    parser.add_argument("--sync-every-optimizer-steps", type=int, default=32)
-    parser.add_argument("--learning-rate", type=float, default=1e-6)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--max-length", type=int, default=65536)
+    parser.add_argument(
+        "--clip-mode",
+        type=str,
+        default="none",
+        choices=["none", "ppo", "gipo", "sapo"],
+        help="Policy objective clipping mode. 'none' keeps the original loss.",
+    )
+    parser.add_argument(
+        "--clip-eps",
+        type=float,
+        default=0.2,
+        help="PPO clipping epsilon and diagnostic outside-clip threshold.",
+    )
+    parser.add_argument(
+        "--gipo-sigma",
+        type=float,
+        default=1.0,
+        help="Sigma for GIPO log-Gaussian soft clipping.",
+    )
+    parser.add_argument(
+        "--sapo-tau-pos",
+        type=float,
+        default=1.0,
+        help="SAPO gate temperature for positive advantages.",
+    )
+    parser.add_argument(
+        "--sapo-tau-neg",
+        type=float,
+        default=2.0,
+        help="SAPO gate temperature for negative advantages.",
+    )
+    parser.add_argument(
+        "--replay-capacity",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of RL samples kept in each ReplayBufferActor. "
+            "Defaults to batch_size * grad_accum_steps * 4."
+        ),
+    )
+    parser.add_argument(
+        "--replay-wait-sleep-seconds",
+        type=float,
+        default=0.2,
+        help="Seconds a trainer waits between ReplayBufferActor sample polls.",
+    )
+    parser.add_argument(
+        "--replay-sample-timeout-seconds",
+        type=float,
+        default=None,
+        help="Maximum seconds to wait for replay samples; 0 means wait forever.",
+    )
+    parser.add_argument("--log-every", type=int, default=1)
+    parser.add_argument(
+        "--metrics-window-size",
+        type=int,
+        default=1000,
+        help="Sliding window size for rollout metrics.",
+    )
+    parser.add_argument(
+        "--metrics-active-timeout-seconds",
+        type=float,
+        default=600.0,
+        help="Seconds before a rollout worker is considered inactive.",
+    )
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="TensorBoard log directory. Defaults to runs/VLLM_FSDP/<timestamp>.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--fsdp-world-size", type=int, default=FSDP_WORLD_SIZE)
+    parser.add_argument("--fsdp-master-addr", default=None)
+    parser.add_argument("--fsdp-master-port", type=int, default=None)
+    parser.add_argument(
+        "--ray-address",
+        default=None,
+        help="Optional Ray cluster address. Defaults to local ray.init().",
+    )
+    parser.add_argument(
+        "--sync-every-optimizer-steps",
+        type=int,
+        default=8,
+        help="Sync trainable weights after this many optimizer steps.",
+    )
+    parser.add_argument(
+        "--infer-max-tokens",
+        type=int,
+        default=512,
+        help="Maximum generated tokens per prompt in the weight-sync demo.",
+    )
+    parser.add_argument(
+        "--infer-temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for rollout generation.",
+    )
+    parser.add_argument(
+        "--infer-top-p",
+        type=float,
+        default=0.9,
+        help="Nucleus sampling top-p for rollout generation.",
+    )
+    parser.add_argument(
+        "--infer-actor-max-concurrency",
+        type=int,
+        default=1024,
+        help="Maximum concurrent async method calls allowed on InferActor.",
+    )
+    parser.add_argument(
+        "--num-rollout-workers",
+        type=int,
+        default=8,
+        help="Number of CPU RolloutWorkerActor instances to launch.",
+    )
+    parser.add_argument(
+        "--rollout-batch-size",
+        type=int,
+        default=8,
+        help="Number of duplicate prompts each RolloutWorker submits per batch.",
+    )
+    parser.add_argument(
+        "--rollout-stop-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for RolloutWorkerActor run loops to stop cleanly.",
+    )
+    # vllm 最多同时调度多少条sequence，也就是最多256个active请求
+    parser.add_argument(
+        "--vllm-max-num-seqs",
+        type=int,
+        default=128,
+        help="Maximum number of sequences vLLM may schedule concurrently.",
+    )
+    # vllm 最多同时调度多少个batched tokens，也就是最多16384个batched tokens
+    parser.add_argument(
+        "--vllm-max-num-batched-tokens",
+        type=int,
+        default=8192,
+        help="Maximum number of batched tokens vLLM may schedule.",
+    )
+    # 可选的最大同步轮数，超过这个轮数后即使训练还没结束也停止同步，让推理继续跑下去，适合验证推理在不同版本权重下的表现差异
+    parser.add_argument(
+        "--max-sync-rounds",
+        type=int,
+        default=None,
+        help="Optional maximum number of trainable-only sync rounds in the demo.",
+    )
+    """vsiqa"""
     parser.add_argument(
         "--train-attention-backend",
         choices=TRAIN_ATTENTION_BACKENDS,
         default="flash_attention_2",
     )
-    parser.add_argument("--gradient-checkpointing", action="store_true")
-    parser.add_argument(
-        "--clip-mode",
-        choices=("none", "ppo", "gipo", "sapo"),
-        default="ppo",
-    )
-    parser.add_argument("--clip-eps", type=float, default=0.2)
-    parser.add_argument("--gipo-sigma", type=float, default=1.0)
-    parser.add_argument("--sapo-tau-pos", type=float, default=1.0)
-    parser.add_argument("--sapo-tau-neg", type=float, default=2.0)
-    parser.add_argument("--log-every", type=int, default=1)
-    parser.add_argument("--metrics-window-size", type=int, default=1000)
-    parser.add_argument(
-        "--metrics-active-timeout-seconds",
-        type=float,
-        default=600.0,
-    )
-    parser.add_argument("--seed", type=int, default=7)
-
-    parser.add_argument("--replay-capacity", type=int, default=8192)
-    parser.add_argument("--replay-wait-sleep-seconds", type=float, default=0.01)
-    parser.add_argument(
-        "--replay-sample-timeout-seconds",
-        type=float,
-        default=1800.0,
-    )
-    parser.add_argument("--num-rollout-workers", type=int, default=8)
-    parser.add_argument("--rollout-batch-size", type=int, default=8)
-    parser.add_argument("--rollout-stop-timeout", type=float, default=600.0)
-
-    parser.add_argument("--infer-max-tokens", type=int, default=512)
-    parser.add_argument("--infer-temperature", type=float, default=1.0)
-    parser.add_argument("--infer-top-p", type=float, default=1.0)
     parser.add_argument("--max-model-len", type=int, default=65536)
-    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=131072)
-    parser.add_argument("--vllm-max-num-seqs", type=int, default=128)
     parser.add_argument(
         "--rollout-attention-backend",
         choices=ROLLOUT_ATTENTION_BACKENDS,
@@ -107,11 +248,30 @@ def parse_args():
         type=float,
         default=0.80,
     )
-    parser.add_argument("--max-sync-rounds", type=int, default=None)
-    return parser.parse_args()
+    """vsiqa"""
+    args = parser.parse_args()
+    if args.clip_eps <= 0:
+        raise ValueError(f"--clip-eps must be > 0, got {args.clip_eps}")
+    if args.gipo_sigma <= 0:
+        raise ValueError(f"--gipo-sigma must be > 0, got {args.gipo_sigma}")
+    if args.sapo_tau_pos <= 0 or args.sapo_tau_neg <= 0:
+        raise ValueError(
+            "--sapo-tau-pos and --sapo-tau-neg must be > 0, got "
+            f"{args.sapo_tau_pos}, {args.sapo_tau_neg}"
+        )
+    if args.replay_capacity is None:
+        # args.replay_capacity = args.batch_size * 4
+        args.replay_capacity = args.batch_size * args.grad_accum_steps * 4
+    if args.replay_sample_timeout_seconds is None:
+        args.replay_sample_timeout_seconds = 0.0
+    if args.log_dir is None:
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        args.log_dir = os.path.join("runs", "VLLM_FSDP", timestamp)
+    return args
 
 
-def validate_args(args):
+def validate_args(args: argparse.Namespace) -> None:
+    """vsiqa"""
     if not os.path.isdir(args.model_path):
         raise ValueError(
             f"--model-path must be an existing directory: {args.model_path!r}"
@@ -120,59 +280,60 @@ def validate_args(args):
         raise ValueError(
             f"--data-path must be an existing parquet file: {args.data_path!r}"
         )
-    positive_integer_fields = (
-        "fsdp_world_size",
-        "ray_num_cpus",
-        "infer_tp_size",
-        "infer_dp_size",
-        "infer_actor_max_concurrency",
-        "batch_size",
-        "grad_accum_steps",
-        "max_steps",
-        "sync_every_optimizer_steps",
-        "max_length",
-        "log_every",
-        "metrics_window_size",
-        "replay_capacity",
-        "num_rollout_workers",
-        "rollout_batch_size",
-        "infer_max_tokens",
-        "max_model_len",
-        "vllm_max_num_batched_tokens",
-        "vllm_max_num_seqs",
-    )
-    for field_name in positive_integer_fields:
-        if int(getattr(args, field_name)) < 1:
-            raise ValueError(f"--{field_name.replace('_', '-')} must be positive")
+    """vsiqa"""
+    if args.grad_accum_steps < 1:
+        raise ValueError("--grad-accum-steps must be >= 1")
+    if args.max_steps < 1:
+        raise ValueError("--max-steps must be >= 1")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+    if args.replay_capacity < 1:
+        raise ValueError("--replay-capacity must be >= 1")
     if args.replay_wait_sleep_seconds <= 0:
-        raise ValueError("--replay-wait-sleep-seconds must be positive")
-    if args.metrics_active_timeout_seconds <= 0:
-        raise ValueError("--metrics-active-timeout-seconds must be positive")
+        raise ValueError("--replay-wait-sleep-seconds must be > 0")
     if args.replay_sample_timeout_seconds < 0:
-        raise ValueError("--replay-sample-timeout-seconds must be non-negative")
-    if args.rollout_stop_timeout <= 0:
-        raise ValueError("--rollout-stop-timeout must be positive")
-    if args.learning_rate <= 0:
-        raise ValueError("--learning-rate must be positive")
-    if args.weight_decay < 0:
-        raise ValueError("--weight-decay must be non-negative")
-    if args.clip_eps <= 0:
-        raise ValueError("--clip-eps must be positive")
-    if args.gipo_sigma <= 0:
-        raise ValueError("--gipo-sigma must be positive")
-    if args.sapo_tau_pos <= 0 or args.sapo_tau_neg <= 0:
-        raise ValueError("--sapo-tau-pos and --sapo-tau-neg must be positive")
-    if args.infer_temperature < 0:
-        raise ValueError("--infer-temperature must be non-negative")
-    if not 0 < args.infer_top_p <= 1:
+        raise ValueError("--replay-sample-timeout-seconds must be >= 0")
+    if args.max_length < 1:
+        raise ValueError("--max-length must be >= 1")
+    if args.log_every < 1:
+        raise ValueError("--log-every must be >= 1")
+    if args.metrics_window_size < 1:
+        raise ValueError("--metrics-window-size must be >= 1")
+    if args.metrics_active_timeout_seconds <= 0:
+        raise ValueError("--metrics-active-timeout-seconds must be > 0")
+    if args.fsdp_world_size < 1:
+        raise ValueError("--fsdp-world-size must be >= 1")
+    if args.sync_every_optimizer_steps < 1:
+        raise ValueError("--sync-every-optimizer-steps must be >= 1")
+    if args.infer_max_tokens < 1:
+        raise ValueError("--infer-max-tokens must be >= 1")
+    if args.infer_temperature < 0.0:
+        raise ValueError("--infer-temperature must be >= 0")
+    if not 0.0 < args.infer_top_p <= 1.0:
         raise ValueError("--infer-top-p must be in (0, 1]")
+    if args.infer_actor_max_concurrency < 1:
+        raise ValueError("--infer-actor-max-concurrency must be >= 1")
+    if args.num_rollout_workers < 1:
+        raise ValueError("--num-rollout-workers must be >= 1")
+    if args.rollout_batch_size < 1:
+        raise ValueError("--rollout-batch-size must be >= 1")
+    if args.rollout_stop_timeout <= 0:
+        raise ValueError("--rollout-stop-timeout must be > 0")
+    if args.vllm_max_num_seqs < 1:
+        raise ValueError("--vllm-max-num-seqs must be >= 1")
+    if args.vllm_max_num_batched_tokens < 1:
+        raise ValueError("--vllm-max-num-batched-tokens must be >= 1")
+    if args.max_sync_rounds is not None and args.max_sync_rounds < 0:
+        raise ValueError("--max-sync-rounds must be >= 0 when set")
+    """vsiqa"""
+    if args.max_model_len < 1:
+        raise ValueError("--max-model-len must be positive")
     if not 0 < args.rollout_gpu_memory_utilization <= 1:
         raise ValueError("--rollout-gpu-memory-utilization must be in (0, 1]")
-    if args.max_sync_rounds is not None and args.max_sync_rounds < 0:
-        raise ValueError("--max-sync-rounds must be non-negative")
+    """vsiqa"""
 
 
-def format_shell_command(argv):
+def format_shell_command(argv: List[str]) -> str:
     if not argv:
         return "python"
 
@@ -181,64 +342,55 @@ def format_shell_command(argv):
         return command
 
     lines = [f"{command} \\"]
-    parts = []
-    index = 1
-    while index < len(argv):
-        part = argv[index]
+    parts: List[List[str]] = []
+    idx = 1
+    while idx < len(argv):
+        part = argv[idx]
         if (
             part.startswith("-")
-            and index + 1 < len(argv)
-            and not argv[index + 1].startswith("-")
+            and idx + 1 < len(argv)
+            and not argv[idx + 1].startswith("-")
         ):
-            parts.append([part, argv[index + 1]])
-            index += 2
+            parts.append([part, argv[idx + 1]])
+            idx += 2
         else:
             parts.append([part])
-            index += 1
+            idx += 1
 
-    for index, part_group in enumerate(parts):
+    for idx, part_group in enumerate(parts):
         line = "  " + " ".join(shlex.quote(part) for part in part_group)
-        if index + 1 < len(parts):
+        if idx + 1 < len(parts):
             line += " \\"
         lines.append(line)
+
     return "\n".join(lines)
 
 
-def save_run_config(args):
-    os.makedirs(args.output_dir, exist_ok=True)
-    with open(
-        os.path.join(args.output_dir, "args.json"),
-        "w",
-        encoding="utf-8",
-    ) as file:
+def save_run_config(args: argparse.Namespace) -> None:
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    args_path = os.path.join(args.log_dir, "args.json")
+    with open(args_path, "w", encoding="utf-8") as file:
         json.dump(vars(args), file, ensure_ascii=False, indent=2, sort_keys=True)
         file.write("\n")
 
-    with open(
-        os.path.join(args.output_dir, "command.txt"),
-        "w",
-        encoding="utf-8",
-    ) as file:
-        file.write(format_shell_command(sys.argv))
+    command_path = os.path.join(args.log_dir, "command.txt")
+    command = format_shell_command(sys.argv)
+    with open(command_path, "w", encoding="utf-8") as file:
+        file.write(command)
         file.write("\n")
 
 
-async def run_vsi_qa(args):
+async def run_weight_sync_demo(args: argparse.Namespace):
     if args.ray_address:
         ray.init(address=args.ray_address)
     else:
-        ray.init(
-            num_cpus=args.ray_num_cpus,
-            include_dashboard=False,
-        )
+        ray.init()
 
-    inference_gpu_count = args.infer_tp_size * args.infer_dp_size
-    cluster_gpu_count = int(ray.cluster_resources().get("GPU", 0))
-
-    os.makedirs(args.output_dir, exist_ok=True)
     save_run_config(args)
-    writer = SummaryWriter(args.output_dir)
-    print(f"[metrics] TensorBoard log dir: {args.output_dir}")
+    writer = SummaryWriter(args.log_dir)
+    print(f"[metrics] TensorBoard log dir: {args.log_dir}")
+    """vsiqa"""
     print(
         "[data] "
         "dataset=vsi_qa "
@@ -247,21 +399,20 @@ async def run_vsi_qa(args):
         f"infer_max_tokens={args.infer_max_tokens} "
         f"rollout_batch_size={args.rollout_batch_size}"
     )
-    print(
-        "[topology] "
-        f"visible_gpus={cluster_gpu_count} "
-        f"ray_cpus={args.ray_num_cpus} "
-        f"fsdp={args.fsdp_world_size} "
-        f"infer_tp={args.infer_tp_size} "
-        f"infer_dp={args.infer_dp_size} "
-        f"infer_gpus={inference_gpu_count}"
-    )
-
+    """vsiqa"""
     fsdp_workers = []
+    replay_buffers = []
     infer_actor = None
     rollout_workers = []
     rollout_refs = []
     try:
+        # Use local/shared model weights directly.
+        print(f"[init] Loading local model from {args.model_path}")
+
+        # FSDP rendezvous address (single-node)
+        fsdp_master_addr = args.fsdp_master_addr or get_local_ip()
+        fsdp_master_port = args.fsdp_master_port or find_open_port()
+
         replay_buffers = [
             ReplayBufferActor.remote(capacity=args.replay_capacity)
             for _ in range(args.fsdp_world_size)
@@ -276,75 +427,70 @@ async def run_vsi_qa(args):
             f"(capacity={args.replay_capacity} samples each)."
         )
 
-        fsdp_master_address = get_local_ip()
-        fsdp_master_port = find_open_port()
-        remote_train_worker = ray.remote(num_gpus=1)(FSDPTrainWorker)
+        # Launch FSDP training workers. Ray allocates 1 GPU per worker; vLLM's
+        # internal DP placement groups will land on the remaining GPUs.
+        remote_worker = ray.remote(num_gpus=1)(FSDPTrainWorker)
         fsdp_workers = [
-            remote_train_worker.remote(
+            remote_worker.remote(
                 args,
                 rank,
                 args.fsdp_world_size,
-                fsdp_master_address,
+                fsdp_master_addr,
                 fsdp_master_port,
                 replay_buffers[rank],
             )
             for rank in range(args.fsdp_world_size)
         ]
-        ray.get([worker.get_rank.remote() for worker in fsdp_workers])
+        ray.get([w.get_rank.remote() for w in fsdp_workers])
         print(f"[init] {args.fsdp_world_size} FSDP training workers ready.")
 
         print(
             "[infer-actor] Creating AsyncLLMEngine actor with dummy weights "
-            f"(tp={args.infer_tp_size}, dp={args.infer_dp_size}, "
-            f"max_num_seqs={args.vllm_max_num_seqs}, "
+            # 调度器同一时刻最多允许多少条 sequence 处于 active/running 状态。
+            f"(max_num_seqs={args.vllm_max_num_seqs}, "
+            # 一次调度最大的toekn总量
             f"max_num_batched_tokens={args.vllm_max_num_batched_tokens})..."
         )
-        remote_infer_actor = ray.remote(  # 创建初始化的 infer actor
-            num_gpus=inference_gpu_count,
+        remote_infer_actor = ray.remote(
+            num_gpus=INFERENCE_TP_SIZE * INFERENCE_DP_SIZE,
             max_concurrency=args.infer_actor_max_concurrency,
-        )(VSIQAVLLMInferenceActor)
+        )(VLLMInferenceActor)
         infer_actor = remote_infer_actor.remote(args)
         print("[infer-actor] Actor created.")
 
         remote_rollout_worker = ray.remote(
             num_gpus=0,
-            max_concurrency=2,
-        )(VSIQARolloutWorkerActor)
+            max_concurrency=2, # 允许 run() 正在跑的时候，stop() 还能被执行。
+        )(RolloutWorkerActor)
 
-        def check_rollout_workers():
+        def check_rollout_workers() -> None:
             if not rollout_refs:
                 return
-            ready, _ = ray.wait(
-                rollout_refs,
-                num_returns=1,
-                timeout=0.0,
-            )
+            ready, _ = ray.wait(rollout_refs, num_returns=1, timeout=0.0)
             if ready:
                 ray.get(ready[0])
-                raise RuntimeError(
-                    "A VSIQARolloutWorkerActor exited unexpectedly."
-                )
+                raise RuntimeError("A RolloutWorkerActor exited unexpectedly.")
 
+        # --- Weight-transfer setup ---
         print("[transfer] Setting up weight-transfer endpoint...")
-        transfer_address, transfer_port = ray.get(  # 准备传输地址
+        transfer_addr, transfer_port = ray.get(
             fsdp_workers[0].setup_transfer_endpoint.remote()
         )
-        print(
-            f"[transfer] Endpoint ready at "
-            f"{transfer_address}:{transfer_port}"
-        )
-        transfer_world_size = inference_gpu_count + 1
+        print(f"[transfer] Endpoint ready at {transfer_addr}:{transfer_port}")
+
+        transfer_world_size = INFERENCE_TP_SIZE * INFERENCE_DP_SIZE + 1
         print(
             f"[transfer] World size: {transfer_world_size} "
-            f"(1 trainer + {inference_gpu_count} vLLM workers)"
+            f"(1 trainer + {INFERENCE_TP_SIZE * INFERENCE_DP_SIZE} vLLM workers)"
         )
+
         print("[transfer] Initializing NCCL groups...")
         train_handle = fsdp_workers[0].init_weight_transfer_group.remote(
             transfer_world_size
         )
         ray.get(
             infer_actor.init_weight_transfer_engine.remote(
-                master_address=transfer_address,
+                master_address=transfer_addr,
                 master_port=transfer_port,
                 transfer_world_size=transfer_world_size,
             )
@@ -402,8 +548,8 @@ async def run_vsi_qa(args):
                 f"sync_every_optimizer_steps={args.sync_every_optimizer_steps}"
             )
             infer_stats_start = ray.get(infer_actor.get_stats.remote())
-            infer_started = time.perf_counter()
-            train_segment_started = time.perf_counter()
+            infer_t0 = time.perf_counter()
+            train_segment_start_time = time.perf_counter()
             train_handles = [
                 worker.train_until_next_sync.remote(
                     args.sync_every_optimizer_steps
@@ -414,10 +560,8 @@ async def run_vsi_qa(args):
                 asyncio.to_thread(ray.get, train_handles)
             )
             summaries = await train_future
-            train_segment_elapsed = (
-                time.perf_counter() - train_segment_started
-            )
-            infer_elapsed = time.perf_counter() - infer_started
+            train_segment_elapsed = time.perf_counter() - train_segment_start_time
+            infer_elapsed = time.perf_counter() - infer_t0
             infer_stats_end = ray.get(infer_actor.get_stats.remote())
             check_rollout_workers()
 
@@ -532,67 +676,67 @@ async def run_vsi_qa(args):
                 rank0_summary["optimizer_steps_run"]
                 / max(train_segment_elapsed, 1e-9)
             )
-            tensorboard_step = rank0_summary["optimizer_step"]
+            tb_step = rank0_summary["optimizer_step"]
             writer.add_scalar(
                 "Rollout/GlobalRewardSumMean",
                 rollout_stats["global_reward_sum_mean"],
-                tensorboard_step,
+                tb_step,
             )
             writer.add_scalar(
                 "Rollout/ActiveWorkers",
                 rollout_stats["active_workers"],
-                tensorboard_step,
+                tb_step,
             )
             writer.add_scalar(
                 "Rollout/ResponseLengthMean",
                 rollout_stats["response_length_mean"],
-                tensorboard_step,
+                tb_step,
             )
             writer.add_scalar(
                 "Rollout/AbortRate",
                 rollout_stats["abort_rate"],
-                tensorboard_step,
+                tb_step,
             )
             writer.add_scalar(
                 "Replay/FillRatio",
                 replay_fill_ratio,
-                tensorboard_step,
+                tb_step,
             )
             writer.add_scalar(
                 "Replay/TrainSampleTrainerVersionLagMean",
                 version_lag_mean,
-                tensorboard_step,
+                tb_step,
             )
             writer.add_scalar(
                 "Train/LossMeanAcrossRanks",
                 train_loss_mean,
-                tensorboard_step,
+                tb_step,
             )
             writer.add_scalar(
                 "Train/OptimizerStep",
-                tensorboard_step,
-                tensorboard_step,
+                tb_step,
+                tb_step,
             )
             writer.add_scalar(
                 "Train/LearningRate",
                 rank0_summary["learning_rate"],
-                tensorboard_step,
+                tb_step,
             )
             writer.add_scalar(
                 "Train/OptimizerStepsPerSec",
                 optimizer_steps_per_sec,
-                tensorboard_step,
+                tb_step,
             )
             if args.clip_mode == "ppo":
                 writer.add_scalar(
                     "Clip/PPOClipFrac",
                     rank0_summary["last_ppo_clip_frac"],
-                    tensorboard_step,
+                    tb_step,
                 )
             writer.add_scalar(
                 "Infer/TokensPerSec",
                 infer_tokens_per_sec,
-                tensorboard_step,
+                tb_step,
             )
             writer.flush()
 
@@ -623,7 +767,7 @@ async def run_vsi_qa(args):
             writer.add_scalar(
                 "Sync/ElapsedSeconds",
                 last_sync_elapsed_seconds,
-                tensorboard_step,
+                tb_step,
             )
             writer.flush()
             next_version = ray.get(
@@ -654,40 +798,37 @@ async def run_vsi_qa(args):
             for ref in pending_rollouts:
                 try:
                     ray.cancel(ref)
-                except Exception as error:
-                    print(
-                        "[cleanup] Ignoring rollout cancel error: "
-                        f"{error!r}"
-                    )
+                except Exception as exc:
+                    print(f"[cleanup] Ignoring rollout cancel error: {exc!r}")
     finally:
         if rollout_workers:
             try:
                 ray.get([worker.stop.remote() for worker in rollout_workers])
-            except Exception as error:
-                print(f"[cleanup] Ignoring rollout stop error: {error!r}")
+            except Exception as exc:
+                print(f"[cleanup] Ignoring rollout stop error: {exc!r}")
         for ref in rollout_refs:
             try:
                 ray.cancel(ref)
-            except Exception as error:
-                print(f"[cleanup] Ignoring rollout cancel error: {error!r}")
+            except Exception as exc:
+                print(f"[cleanup] Ignoring rollout cancel error: {exc!r}")
         if infer_actor is not None:
             try:
                 ray.get(infer_actor.shutdown.remote())
-            except Exception as error:
-                print(f"[cleanup] Ignoring InferActor shutdown error: {error!r}")
+            except Exception as exc:
+                print(f"[cleanup] Ignoring InferActor shutdown error: {exc!r}")
         if fsdp_workers:
             try:
                 ray.get([worker.close.remote() for worker in fsdp_workers])
-            except Exception as error:
-                print(f"[cleanup] Ignoring FSDP worker close error: {error!r}")
+            except Exception as exc:
+                print(f"[cleanup] Ignoring FSDP worker close error: {exc!r}")
         writer.close()
         ray.shutdown()
 
 
-def main():
+def main() -> None:
     args = parse_args()
     validate_args(args)
-    asyncio.run(run_vsi_qa(args))
+    asyncio.run(run_weight_sync_demo(args))
 
 
 if __name__ == "__main__":

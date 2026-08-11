@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """VSI-QA rollout worker and rollout statistics actor."""
 
+import argparse
 import random
 import time
 from collections import deque
@@ -9,14 +10,17 @@ from typing import Dict, List
 import ray
 import torch
 
+"""vsiqa"""
 from vsi_qa_rlvr.dataloaders.qwen3vl_rollout_collator import (
     Qwen3VLRolloutDataCollator,
 )
 from vsi_qa_rlvr.dataloaders.vsi_qa_dataset import VSIQADataset
+from vsi_qa_rlvr.inference import InferenceResult
 from vsi_qa_rlvr.scannet_incremental_counting.reward import (
     IncrementalCountingReward,
 )
-from vsi_qa_rlvr.trajectory import VSIQARLSample
+from vsi_qa_rlvr.trajectory import RLSample
+"""vsiqa"""
 
 
 @ray.remote
@@ -76,40 +80,70 @@ class StatsActor:
         }
 
 
-class VSIQARolloutWorkerActor:
-    """CPU Ray actor that feeds VSI-QA rollout requests to vLLM."""
+class RolloutWorkerActor:
+    """CPU Ray actor that builds prompts and feeds token IDs to InferActor."""
 
     def __init__(
         self,
-        args,
+        args: argparse.Namespace,
         infer_actor,
         replay_buffer,
         stats_actor,
-        worker_id,
+        worker_id: int,
     ):
         self.args = args
         self.infer_actor = infer_actor
         self.replay_buffer = replay_buffer
         self.stats_actor = stats_actor
         self.worker_id = int(worker_id)
+
+        """vsiqa"""
         self.dataset = VSIQADataset(args.data_path)
-        self.collator = Qwen3VLRolloutDataCollator(args.model_path)
-        self.reward = IncrementalCountingReward(
-            self.collator.processor.tokenizer
+        self.collator = Qwen3VLRolloutDataCollator(
+            args.model_path,
+            max_model_len=args.max_model_len,
         )
-        self.batch_id = 0
-        self.stopped = False
+        self.tokenizer = self.collator.processor.tokenizer
+        self.reward = IncrementalCountingReward(self.tokenizer)
         print(
             "[rollout] "
             f"worker={self.worker_id} loaded VSI-QA examples: "
             f"count={len(self.dataset)} path={args.data_path!r}"
         )
-
-    def sample_rollout_prompt(self):
-        return self.collator([random.choice(self.dataset)])[0]
+        """vsiqa"""
+        self.batch_id = 0
+        self.stopped = False
 
     async def stop(self):
         self.stopped = True
+
+    """vsiqa"""
+    def compute_reward_info(
+        self,
+        question: str,
+        ground_truth: str,
+        prompt: str,
+        generated_text: str,
+        result: InferenceResult,
+    ) -> Dict[str, float]:
+        del question, prompt, generated_text
+
+        if result.stop_reason == "abort" or not result.output_tokens:
+            return {
+                "format_reward": 0.0,
+                "answer_reward": 0.0,
+                "reward": 0.0,
+            }
+
+        reward_info = self.reward.score(result.output_tokens, ground_truth)
+        return {
+            "format_reward": float(reward_info.get("r_format", 0.0)),
+            "answer_reward": float(
+                reward_info.get("answer_exact_reward", 0.0)
+            ),
+            "reward": float(reward_info.get("score", 0.0)),
+        }
+    """vsiqa"""
 
     def compute_group_advantages(self, rewards: List[float]) -> List[float]:
         if not rewards:
@@ -133,76 +167,108 @@ class VSIQARolloutWorkerActor:
         advantages = (rewards_t - mean) / (std + 1e-6)
         return [float(value) for value in advantages.tolist()]
 
-    def build_rl_samples(self, rollout_item, results):
-        generated_texts = [
-            self.collator.processor.tokenizer.decode(
-                result.output_tokens,
-                skip_special_tokens=True,
-            )
+    """vsiqa"""
+    def build_rl_samples(
+        self,
+        input_ids: List[int],
+        question: str,
+        ground_truth: str,
+        prompt: str,
+        results: List[InferenceResult],
+        prepared_media: dict,
+    ) -> List[RLSample]:
+        decoded_texts = [
+            self.tokenizer.decode(result.output_tokens, skip_special_tokens=True)
             for result in results
         ]
-        ground_truth = rollout_item["reward_model"]["ground_truth"]
-        reward_details = [
-            (
-                self.reward.score(result.output_tokens, ground_truth)
-                if result.stop_reason != "abort" and result.output_tokens
-                else self.reward.empty_score()
+        reward_infos = [
+            self.compute_reward_info(
+                question,
+                ground_truth,
+                prompt,
+                generated_text,
+                result,
             )
-            for result in results
+            for generated_text, result in zip(decoded_texts, results)
         ]
-
-        rewards = [float(details["score"]) for details in reward_details]
+        rewards = [info["reward"] for info in reward_infos]
         advantages = self.compute_group_advantages(rewards)
-        prompt_ids = rollout_item["prepared_media"][
-            "prompt_token_ids"
-        ].tolist()
+
         return [
-            VSIQARLSample(
-                prompt_ids=list(prompt_ids),
+            RLSample(
+                prompt_ids=list(input_ids),
                 response_ids=list(result.output_tokens),
                 old_response_logprobs=list(result.output_logprobs),
-                input_ids=list(prompt_ids) + list(result.output_tokens),
+                input_ids=list(input_ids) + list(result.output_tokens),
                 attention_mask=[1]
-                * (len(prompt_ids) + len(result.output_tokens)),
-                labels=[-100] * len(prompt_ids) + list(result.output_tokens),
+                * (len(input_ids) + len(result.output_tokens)),
+                labels=[-100] * len(input_ids) + list(result.output_tokens),
                 reward=float(reward),
                 advantage=float(advantage),
-                question=rollout_item["question"],
+                question=question,
                 ground_truth=ground_truth,
-                format_reward=float(details["r_format"]),
-                answer_reward=float(details["answer_exact_reward"]),
+                format_reward=float(reward_info["format_reward"]),
+                answer_reward=float(reward_info["answer_reward"]),
                 rollout_worker_id=self.worker_id,
                 batch_id=result.batch_id,
                 sample_id=result.sample_id,
                 output_versions=list(result.output_versions),
                 stop_reason=result.stop_reason,
                 generated_text=generated_text,
-                prepared_media=rollout_item["prepared_media"],
+                prepared_media=prepared_media,
             )
-            for result, generated_text, details, reward, advantage in zip(
+            for result, generated_text, reward_info, reward, advantage in zip(
                 results,
-                generated_texts,
-                reward_details,
+                decoded_texts,
+                reward_infos,
                 rewards,
                 advantages,
             )
         ]
+    """vsiqa"""
+
+    """vsiqa"""
+    def sample_rollout_prompt(self):
+        return self.collator([random.choice(self.dataset)])[0]
+    """vsiqa"""
 
     async def run(self):
         while not self.stopped:
+            """vsiqa"""
             rollout_item = self.sample_rollout_prompt()
+            input_ids = rollout_item["prepared_media"][
+                "prompt_token_ids"
+            ].tolist()
+            question = rollout_item["question"]
+            ground_truth = rollout_item["reward_model"]["ground_truth"]
+            prompt = rollout_item["prompt"]
+            vllm_prompt = rollout_item["vllm_prompt"]
+            prepared_media = rollout_item["prepared_media"]
+            """vsiqa"""
             current_batch_id = self.batch_id
             self.batch_id += 1
+            """vsiqa"""
             results = await self.infer_actor.request_batch.remote(
                 self.worker_id,
                 current_batch_id,
-                rollout_item["vllm_prompt"],
+                vllm_prompt,
                 self.args.infer_max_tokens,
                 self.args.rollout_batch_size,
             )
+            """vsiqa"""
             if not results:
                 continue
-            rl_samples = self.build_rl_samples(rollout_item, results)
+
+            """vsiqa"""
+            rl_samples = self.build_rl_samples(
+                input_ids=list(input_ids),
+                question=question,
+                ground_truth=ground_truth,
+                prompt=prompt,
+                results=results,
+                prepared_media=prepared_media,
+            )
+            """vsiqa"""
             self.replay_buffer.add_samples.remote(rl_samples)
             self.stats_actor.add_rollout_batch.remote(
                 self.worker_id,

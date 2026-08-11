@@ -131,16 +131,20 @@ class Qwen3VLRolloutDataCollator:
                     f"sample_id={item['sample_id']!r}"
                 )
 
+            """vsiqa"""
             batch.append(
                 {
                     "sample_id": item["sample_id"],
                     "question": item["question"],
                     "reward_model": item["reward_model"],
                     "extra_info": item["extra_info"],
+                    "prompt": prompt,
+                    "vllm_prompt": vllm_prompt,
                     "llm_input": llm_input,
                     "prepared_media": prepared_media,
                 }
             )
+            """vsiqa"""
         return batch
 
 

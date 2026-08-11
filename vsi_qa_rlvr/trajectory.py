@@ -25,8 +25,6 @@ class RLSample:
     output_versions: List[int]
     stop_reason: str | None
     generated_text: str
-
-
-@dataclass
-class VSIQARLSample(RLSample):
+    """vsiqa"""
     prepared_media: dict
+    """vsiqa"""

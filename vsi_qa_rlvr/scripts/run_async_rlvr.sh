@@ -36,12 +36,12 @@ echo "output_dir=${OUTPUT_DIR}"
 
 python -m vsi_qa_rlvr.main \
   --model-path /data/all/luck/backup/best_0623-49731 \
+  --dtype bfloat16 \
+  --train-mode full \
+  --trust-remote-code \
   --data-path /data/all/luck/derived_dataset/VSI_590K_derived/chair_count_fps2_qwen_labels_verl_video_summary_xml_max512/train.parquet \
-  --output-dir "${OUTPUT_DIR}" \
-  --ray-num-cpus 16 \
+  --log-dir "${OUTPUT_DIR}" \
   --fsdp-world-size 4 \
-  --infer-tp-size 1 \
-  --infer-dp-size 4 \
   --infer-actor-max-concurrency 1024 \
   --batch-size 1 \
   --grad-accum-steps 8 \
@@ -59,15 +59,11 @@ python -m vsi_qa_rlvr.main \
   --replay-wait-sleep-seconds 0.01 \
   --replay-sample-timeout-seconds 1800 \
   --num-rollout-workers 40 \
-  --rollout-data-batch-size 1 \
-  --rollout-data-workers 1 \
-  --rollout-prefetch-factor 2 \
   --rollout-batch-size 8 \
   --rollout-stop-timeout 600 \
   --infer-max-tokens 512 \
   --infer-temperature 1.0 \
   --infer-top-p 1.0 \
-  --max-resubmit-retries 64 \
   --max-model-len 65536 \
   --vllm-max-num-batched-tokens 131072 \
   --vllm-max-num-seqs 64 \
