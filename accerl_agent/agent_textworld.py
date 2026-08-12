@@ -3292,6 +3292,7 @@ class OnlineGenerationState:
     stop_reason: Literal["length", "stop", "tool_calls", "abort"] | None = None
     attempt_count: int = 0
     sync_interrupted_attempts: int = 0
+    pending_retry_reason: Literal["sync"] | None = None
 
     @property
     def remaining_max_tokens(self) -> int:
@@ -3451,6 +3452,55 @@ def _normalize_stop_reason(stop_reason) -> Literal["length", "stop", "tool_calls
     return "abort"
 
 
+def record_sync_retry_probe(
+    diagnostics: IntervalDiagnostics,
+    request_output,
+    *,
+    prompt_tokens: int,
+) -> None:
+    """Record vLLM timing/token proxies for one sync-retried first token."""
+    metrics = getattr(request_output, "metrics", None)
+    try:
+        queued_ts = float(getattr(metrics, "queued_ts"))
+        scheduled_ts = float(getattr(metrics, "scheduled_ts"))
+        first_token_ts = float(getattr(metrics, "first_token_ts"))
+    except (AttributeError, TypeError, ValueError):
+        diagnostics.increment("sync_retry_invalid_timing_metric_count")
+    else:
+        timestamps_valid = (
+            math.isfinite(queued_ts)
+            and math.isfinite(scheduled_ts)
+            and math.isfinite(first_token_ts)
+            and queued_ts > 0.0
+            and queued_ts <= scheduled_ts <= first_token_ts
+        )
+        if timestamps_valid:
+            diagnostics.observe(
+                "sync_retry_scheduled_to_first_token_ms",
+                (first_token_ts - scheduled_ts) * 1000.0,
+            )
+            diagnostics.observe(
+                "sync_retry_queue_ms",
+                (scheduled_ts - queued_ts) * 1000.0,
+            )
+        else:
+            diagnostics.increment("sync_retry_invalid_timing_metric_count")
+
+    cached_tokens = getattr(request_output, "num_cached_tokens", None)
+    cached_tokens_valid = (
+        isinstance(cached_tokens, int)
+        and not isinstance(cached_tokens, bool)
+        and 0 <= cached_tokens <= prompt_tokens
+    )
+    if cached_tokens_valid:
+        diagnostics.observe(
+            "sync_retry_recomputed_tokens",
+            prompt_tokens - cached_tokens,
+        )
+    else:
+        diagnostics.increment("sync_retry_invalid_cached_tokens_metric_count")
+
+
 class InterruptibleGenerationRunner:
     """Run vLLM requests that survive abort-based weight-update pauses."""
 
@@ -3514,6 +3564,10 @@ class InterruptibleGenerationRunner:
             # 如果当前正在weight update的attempt还没结束，就等着，不要开始新的generate attempt
             await self.resume_event.wait()
 
+            retry_reason = state.pending_retry_reason
+            state.pending_retry_reason = None
+            is_sync_retry = retry_reason == "sync"
+
             remaining = state.remaining_max_tokens
             if remaining <= 0:
                 state.stop_reason = "length"
@@ -3537,6 +3591,9 @@ class InterruptibleGenerationRunner:
             request_finished = False
             attempt_started_at = self.clock()
             first_token_at = None
+            first_token_output = None
+            attempt_prompt_token_ids = state.restart_prompt_token_ids
+            exception_was_sync_interrupt = False
             state.attempt_count += 1
             if self.diagnostics is not None:
                 self.diagnostics.increment("attempt_count")
@@ -3545,7 +3602,7 @@ class InterruptibleGenerationRunner:
             try:
                 # 调用vllm生成接口，拿到输出后更新state，如果生成过程中被weight update打断了，engine.generate()会抛出异常，直接进入finally块结束这个attempt
                 async for request_output in self.engine.generate(
-                    {"prompt_token_ids": state.restart_prompt_token_ids},
+                    {"prompt_token_ids": attempt_prompt_token_ids},
                     sampling_params,
                     request_id=request_id,
                 ):
@@ -3555,6 +3612,7 @@ class InterruptibleGenerationRunner:
                         and _tokens_from_output(request_output)
                     ):
                         first_token_at = self.clock()
+                        first_token_output = request_output
                     request_finished = bool(
                         getattr(request_output, "finished", False)
                     )
@@ -3563,16 +3621,21 @@ class InterruptibleGenerationRunner:
             except Exception:
                 if self.resume_event.is_set():
                     raise
+                exception_was_sync_interrupt = True
                 final_output = None
             finally:
                 await self._decrement_active_attempts()
 
             if final_output is None:
                 state.stop_reason = "abort"
-                state.sync_interrupted_attempts += 1
-                self.total_sync_interrupted_attempts += 1
-                if self.diagnostics is not None:
-                    self.diagnostics.increment("sync_interrupted_attempt_count")
+                if exception_was_sync_interrupt:
+                    state.pending_retry_reason = "sync"
+                    state.sync_interrupted_attempts += 1
+                    self.total_sync_interrupted_attempts += 1
+                    if self.diagnostics is not None:
+                        self.diagnostics.increment(
+                            "sync_interrupted_attempt_count"
+                        )
                 continue
 
             attempt_tokens = _tokens_from_output(final_output)[:remaining]
@@ -3580,8 +3643,11 @@ class InterruptibleGenerationRunner:
             stop_reason = _normalize_stop_reason(
                 _finish_reason_from_output(final_output)
             )
-            sync_interrupted = stop_reason == "abort"
+            sync_interrupted = (
+                stop_reason == "abort" and not self.resume_event.is_set()
+            )
             if sync_interrupted:
+                state.pending_retry_reason = "sync"
                 state.sync_interrupted_attempts += 1
                 self.total_sync_interrupted_attempts += 1
                 if self.diagnostics is not None:
@@ -3591,6 +3657,12 @@ class InterruptibleGenerationRunner:
                     "ttft_ms",
                     (first_token_at - attempt_started_at) * 1000.0,
                 )
+                if is_sync_retry and first_token_output is not None:
+                    record_sync_retry_probe(
+                        self.diagnostics,
+                        first_token_output,
+                        prompt_tokens=len(attempt_prompt_token_ids),
+                    )
                 if not sync_interrupted and len(attempt_tokens) >= 2:
                     decode_elapsed = attempt_finished_at - first_token_at
                     self.diagnostics.observe(
@@ -3753,7 +3825,7 @@ class VLLMInferenceActor:
         active_attempts_before_pause = self.runner._active_attempts
         interrupted_before_pause = self.runner.total_sync_interrupted_attempts
         self.runner.pause()
-        await self.engine.pause_generation(mode="abort", clear_cache=True)
+        await self.engine.pause_generation(mode="abort", clear_cache=False)
         await self.runner.wait_for_idle()
         return {
             "active_attempts": active_attempts_before_pause,
@@ -5206,6 +5278,52 @@ async def run_textworld_train(args: argparse.Namespace):
                 ),
                 "Infer/TTFTMsP95": distribution_scalar(
                     infer_diagnostics, "ttft_ms", "p95"
+                ),
+                "Sync/RetryScheduledToFirstTokenMsMean": (
+                    distribution_scalar(
+                        infer_diagnostics,
+                        "sync_retry_scheduled_to_first_token_ms",
+                        "mean",
+                    )
+                ),
+                "Sync/RetryScheduledToFirstTokenMsCount": (
+                    distribution_scalar(
+                        infer_diagnostics,
+                        "sync_retry_scheduled_to_first_token_ms",
+                        "count",
+                    )
+                ),
+                "Sync/RetryRecomputedTokensMean": distribution_scalar(
+                    infer_diagnostics,
+                    "sync_retry_recomputed_tokens",
+                    "mean",
+                ),
+                "Sync/RetryRecomputedTokensCount": distribution_scalar(
+                    infer_diagnostics,
+                    "sync_retry_recomputed_tokens",
+                    "count",
+                ),
+                "Sync/RetryQueueMsMean": distribution_scalar(
+                    infer_diagnostics,
+                    "sync_retry_queue_ms",
+                    "mean",
+                ),
+                "Sync/RetryQueueMsCount": distribution_scalar(
+                    infer_diagnostics,
+                    "sync_retry_queue_ms",
+                    "count",
+                ),
+                "Sync/RetryInvalidTimingMetricCount": float(
+                    infer_counters.get(
+                        "sync_retry_invalid_timing_metric_count",
+                        0.0,
+                    )
+                ),
+                "Sync/RetryInvalidCachedTokensMetricCount": float(
+                    infer_counters.get(
+                        "sync_retry_invalid_cached_tokens_metric_count",
+                        0.0,
+                    )
                 ),
                 "Infer/TPOTMsMean": distribution_scalar(
                     infer_diagnostics, "tpot_ms", "mean"

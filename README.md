@@ -415,6 +415,9 @@ Saved checkpoint contents include model weights, config, tokenizer files, and `t
 | `Clip/PPOClipFrac` | Fraction of global valid response tokens outside the PPO ratio clip interval; intentionally remains token-level for both algorithms. |
 | `Infer/TokensPerSec` | vLLM generation throughput. |
 | `Sync/ElapsedSeconds` | Weight-sync latency. |
+| `Sync/RetryScheduledToFirstTokenMsMean` | Compute-side first-token latency proxy for attempts explicitly resubmitted after sync. |
+| `Sync/RetryRecomputedTokensMean` | Prompt tokens not served by prefix cache for successful sync-retry probes. |
+| `Sync/RetryQueueMsMean` | Scheduler queue time before a sync-retry attempt is scheduled. |
 
 ### TextWorld inference throughput diagnostics
 
@@ -430,6 +433,9 @@ following per-segment diagnostics:
 | `Infer/PromptTokensMean\|P50\|P95` | Logical-request prompt-length distribution. |
 | `Infer/RequestLatencyMsMean\|P50\|P95` | End-to-end logical-request latency, including resubmits. |
 | `Infer/TTFTMsMean\|P95` | Engine-attempt time to first generated token. |
+| `Sync/RetryScheduledToFirstTokenMsMean\|Count` | From vLLM scheduling to first token for explicit sync retries; a prefill/KV-materialization plus first-decode proxy, not pure KV-cache write time. |
+| `Sync/RetryRecomputedTokensMean\|Count` | Retry prompt tokens minus the top-level `RequestOutput.num_cached_tokens`; invalid cache counts are skipped. |
+| `Sync/RetryQueueMsMean\|Count` | Time from vLLM queueing to scheduling for explicit sync retries. |
 | `Infer/TPOTMsMean\|P95` | Time per output token for successful attempts with at least two tokens. |
 | `Infer/ActiveRequestsMean\|Max`, `Infer/ActiveAttemptsMean\|Max` | Time-weighted logical-request and engine-attempt concurrency. |
 | `Infer/AttemptsPerRequest`, `Infer/SyncInterruptedAttemptRate`, `Infer/ResubmittedRequestRate`, `Infer/PauseActiveAttempts` | Weight-sync interruption and retry pressure; the interruption rate is measured across attempts active when the following sync pause begins. |
@@ -448,6 +454,8 @@ Use the metrics together to classify a throughput drop:
 | TPOT rises at stable prompt lengths and concurrency | Decode throughput. |
 | Active requests fall while rollout CPU timings rise | Environment, parsing, or tokenization. |
 | Interrupted-attempt and resubmitted-request rates rise | Weight-sync interruption overhead. |
+| Retry recomputed tokens and scheduled-to-first-token time rise while retry queue time stays low | Sync-triggered prefill/KV reconstruction is a likely recovery bottleneck. |
+| Retry queue time dominates scheduled-to-first-token time | Concurrent retry scheduler backlog is a more likely recovery bottleneck. |
 | Request latency rises while TTFT and TPOT stay stable | Queueing or scheduling delay. |
 
 `Infer/DiagnosticsDroppedSamples` and
