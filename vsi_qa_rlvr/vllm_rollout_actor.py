@@ -273,7 +273,7 @@ class VLLMInferenceActor:
             mm_encoder_attn_backend=args.rollout_attention_backend,
             logprobs_mode="raw_logprobs",
             allowed_local_media_path="/",
-            limit_mm_per_prompt={"image": 16},
+            limit_mm_per_prompt={"image": args.limit_images},
             weight_transfer_config=WeightTransferConfig(backend="nccl"),
         )
         """vsiqa"""

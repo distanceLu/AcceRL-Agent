@@ -17,16 +17,14 @@ from transformers import AutoProcessor
 import os
 
 from vsi_qa_rlvr.inference import InferenceResult
+from vsi_qa_rlvr.P3_reward import P3Reward
 from vsi_qa_rlvr.reward import IncrementalCountingReward
 from vsi_qa_rlvr.trajectory import RLSample
 """vsiqa"""
 
 
 """vsiqa"""
-SCANNET_IMAGE_PIXELS = 131072
-
-
-def load_gsm8k_train_data(
+def load_train_data(
     data_path: str,
     limit: int | None = None,
 ) -> List[dict]:
@@ -139,13 +137,16 @@ class RolloutWorkerActor:
             local_files_only=True,
         )
         self.tokenizer = self.processor.tokenizer
-        self.reward = IncrementalCountingReward(self.tokenizer)
-        self.gsm8k_examples = load_gsm8k_train_data(args.data_path)
+        if args.reward_type == "p3":
+            self.reward = P3Reward(self.tokenizer)
+        else:
+            self.reward = IncrementalCountingReward(self.tokenizer)
+        self.train_examples = load_train_data(args.data_path)
         print(
             "[rollout] "
             f"worker={self.worker_id} loaded ScanNet examples: "
-            f"count={len(self.gsm8k_examples)} "
-            f"image_pixels={SCANNET_IMAGE_PIXELS} "
+            f"count={len(self.train_examples)} "
+            "image_pixels=from_parquet "
             f"path={args.data_path!r}"
         )
         """vsiqa"""
@@ -173,7 +174,17 @@ class RolloutWorkerActor:
                 "reward": 0.0,
             }
 
-        reward_info = self.reward.score(result.output_tokens, ground_truth)
+        if self.args.reward_type == "p3":
+            reward_info = self.reward.score(
+                result.output_tokens,
+                ground_truth,
+                stop_reason=result.stop_reason,
+            )
+        else:
+            reward_info = self.reward.score(
+                result.output_tokens,
+                ground_truth,
+            )
         return {
             "format_reward": float(reward_info.get("r_format", 0.0)),
             "answer_reward": float(
@@ -266,9 +277,20 @@ class RolloutWorkerActor:
 
     """vsiqa"""
     def sample_rollout_prompt(self) -> Tuple[str, str, str]:
-        row = random.choice(self.gsm8k_examples)
+        row = random.choice(self.train_examples)
         system_message, user_message = row["prompt"]
         image_records = row["images"]
+        min_pixels = int(image_records[0]["min_pixels"])
+        max_pixels = int(image_records[0]["max_pixels"])
+        if any(
+            int(image_record["min_pixels"]) != min_pixels
+            or int(image_record["max_pixels"]) != max_pixels
+            for image_record in image_records
+        ):
+            raise ValueError(
+                "All images in one rollout row must use the same "
+                "min_pixels and max_pixels."
+            )
         question = user_message["content"][
             len("<image>\n") * len(image_records) :
         ]
@@ -280,8 +302,8 @@ class RolloutWorkerActor:
                     {
                         "type": "image",
                         "image": image_record["image"],
-                        "min_pixels": SCANNET_IMAGE_PIXELS,
-                        "max_pixels": SCANNET_IMAGE_PIXELS,
+                        "min_pixels": int(image_record["min_pixels"]),
+                        "max_pixels": int(image_record["max_pixels"]),
                     }
                     for image_record in image_records
                 ]
@@ -301,8 +323,8 @@ class RolloutWorkerActor:
         encoded = self.processor(
             text=[prompt],
             images=images,
-            min_pixels=SCANNET_IMAGE_PIXELS,
-            max_pixels=SCANNET_IMAGE_PIXELS,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
             return_mm_token_type_ids=True,
             return_tensors="pt",
             padding=True,
@@ -330,8 +352,8 @@ class RolloutWorkerActor:
                 ]
             },
             "mm_processor_kwargs": {
-                "min_pixels": SCANNET_IMAGE_PIXELS,
-                "max_pixels": SCANNET_IMAGE_PIXELS,
+                "min_pixels": min_pixels,
+                "max_pixels": max_pixels,
             },
         }
         ground_truth = row["reward_model"]["ground_truth"]

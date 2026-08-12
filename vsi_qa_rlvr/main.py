@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     """vsiqa"""
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--data-path", required=True)
+    parser.add_argument(
+        "--reward-type",
+        choices=("incremental_counting", "p3"),
+        default="incremental_counting",
+    )
+    parser.add_argument("--limit-images", type=int, default=16)
     """vsiqa"""
     parser.add_argument(
         "--dtype",
@@ -280,6 +286,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--data-path must be an existing parquet file: {args.data_path!r}"
         )
+    if args.limit_images < 1:
+        raise ValueError("--limit-images must be positive")
     """vsiqa"""
     if args.grad_accum_steps < 1:
         raise ValueError("--grad-accum-steps must be >= 1")
