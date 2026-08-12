@@ -5,21 +5,56 @@ import argparse
 import random
 import time
 from collections import deque
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
+from PIL import Image
+import pyarrow.parquet as pq
 import ray
 import torch
+from transformers import AutoProcessor
 
 """vsiqa"""
-from vsi_qa_rlvr.dataloaders.qwen3vl_rollout_collator import (
-    Qwen3VLRolloutDataCollator,
-)
-from vsi_qa_rlvr.dataloaders.vsi_qa_dataset import VSIQADataset
+import os
+
 from vsi_qa_rlvr.inference import InferenceResult
-from vsi_qa_rlvr.scannet_incremental_counting.reward import (
-    IncrementalCountingReward,
-)
+from vsi_qa_rlvr.reward import IncrementalCountingReward
 from vsi_qa_rlvr.trajectory import RLSample
+"""vsiqa"""
+
+
+"""vsiqa"""
+SCANNET_IMAGE_PIXELS = 131072
+
+
+def load_gsm8k_train_data(
+    data_path: str,
+    limit: int | None = None,
+) -> List[dict]:
+    examples = pq.read_table(
+        data_path,
+        columns=[
+            "sample_id",
+            "data_source",
+            "prompt",
+            "images",
+            "reward_model",
+            "extra_info",
+        ],
+        memory_map=True,
+    ).to_pylist()
+    examples = [
+        example
+        for example in examples
+        if all(
+            os.path.isfile(image_record["image"])
+            for image_record in example["images"]
+        )
+    ]
+    if limit is not None:
+        examples = examples[:limit]
+    if not examples:
+        raise ValueError(f"No ScanNet examples loaded from {data_path!r}.")
+    return examples
 """vsiqa"""
 
 
@@ -98,17 +133,20 @@ class RolloutWorkerActor:
         self.worker_id = int(worker_id)
 
         """vsiqa"""
-        self.dataset = VSIQADataset(args.data_path)
-        self.collator = Qwen3VLRolloutDataCollator(
+        self.processor = AutoProcessor.from_pretrained(
             args.model_path,
-            max_model_len=args.max_model_len,
+            trust_remote_code=True,
+            local_files_only=True,
         )
-        self.tokenizer = self.collator.processor.tokenizer
+        self.tokenizer = self.processor.tokenizer
         self.reward = IncrementalCountingReward(self.tokenizer)
+        self.gsm8k_examples = load_gsm8k_train_data(args.data_path)
         print(
             "[rollout] "
-            f"worker={self.worker_id} loaded VSI-QA examples: "
-            f"count={len(self.dataset)} path={args.data_path!r}"
+            f"worker={self.worker_id} loaded ScanNet examples: "
+            f"count={len(self.gsm8k_examples)} "
+            f"image_pixels={SCANNET_IMAGE_PIXELS} "
+            f"path={args.data_path!r}"
         )
         """vsiqa"""
         self.batch_id = 0
@@ -175,7 +213,6 @@ class RolloutWorkerActor:
         ground_truth: str,
         prompt: str,
         results: List[InferenceResult],
-        prepared_media: dict,
     ) -> List[RLSample]:
         decoded_texts = [
             self.tokenizer.decode(result.output_tokens, skip_special_tokens=True)
@@ -215,7 +252,7 @@ class RolloutWorkerActor:
                 output_versions=list(result.output_versions),
                 stop_reason=result.stop_reason,
                 generated_text=generated_text,
-                prepared_media=prepared_media,
+                prepared_media=self.prepared_media,
             )
             for result, generated_text, reward_info, reward, advantage in zip(
                 results,
@@ -228,22 +265,84 @@ class RolloutWorkerActor:
     """vsiqa"""
 
     """vsiqa"""
-    def sample_rollout_prompt(self):
-        return self.collator([random.choice(self.dataset)])[0]
+    def sample_rollout_prompt(self) -> Tuple[str, str, str]:
+        row = random.choice(self.gsm8k_examples)
+        system_message, user_message = row["prompt"]
+        image_records = row["images"]
+        question = user_message["content"][
+            len("<image>\n") * len(image_records) :
+        ]
+        messages = [
+            system_message,
+            {
+                "role": user_message["role"],
+                "content": [
+                    {
+                        "type": "image",
+                        "image": image_record["image"],
+                        "min_pixels": SCANNET_IMAGE_PIXELS,
+                        "max_pixels": SCANNET_IMAGE_PIXELS,
+                    }
+                    for image_record in image_records
+                ]
+                + [{"type": "text", "text": question}],
+            },
+        ]
+        prompt = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        images = []
+        for image_record in image_records:
+            with Image.open(image_record["image"]) as image:
+                images.append(image.convert("RGB").copy())
+
+        encoded = self.processor(
+            text=[prompt],
+            images=images,
+            min_pixels=SCANNET_IMAGE_PIXELS,
+            max_pixels=SCANNET_IMAGE_PIXELS,
+            return_mm_token_type_ids=True,
+            return_tensors="pt",
+            padding=True,
+        )
+        valid = encoded["attention_mask"][0].bool()
+        self.prepared_media = {
+            "prompt_token_ids": encoded["input_ids"][0][valid].contiguous(),
+            "prompt_mm_token_type_ids": (
+                encoded["mm_token_type_ids"][0][valid].contiguous()
+            ),
+            "pixel_values": encoded["pixel_values"].contiguous(),
+            "image_grid_thw": encoded["image_grid_thw"].contiguous(),
+            "pad_token_id": int(self.processor.tokenizer.pad_token_id),
+        }
+        self.vllm_prompt = {
+            "prompt_token_ids": self.processor.tokenizer.encode(
+                prompt,
+                add_special_tokens=True,
+            ),
+            "multi_modal_data": {"image": images},
+            "multi_modal_uuids": {
+                "image": [
+                    f"scannet:{row['sample_id']}:{image_index}"
+                    for image_index in range(len(images))
+                ]
+            },
+            "mm_processor_kwargs": {
+                "min_pixels": SCANNET_IMAGE_PIXELS,
+                "max_pixels": SCANNET_IMAGE_PIXELS,
+            },
+        }
+        ground_truth = row["reward_model"]["ground_truth"]
+        return question, ground_truth, prompt
     """vsiqa"""
 
     async def run(self):
         while not self.stopped:
             """vsiqa"""
-            rollout_item = self.sample_rollout_prompt()
-            input_ids = rollout_item["prepared_media"][
-                "prompt_token_ids"
-            ].tolist()
-            question = rollout_item["question"]
-            ground_truth = rollout_item["reward_model"]["ground_truth"]
-            prompt = rollout_item["prompt"]
-            vllm_prompt = rollout_item["vllm_prompt"]
-            prepared_media = rollout_item["prepared_media"]
+            question, ground_truth, prompt = self.sample_rollout_prompt()
+            input_ids = self.prepared_media["prompt_token_ids"].tolist()
             """vsiqa"""
             current_batch_id = self.batch_id
             self.batch_id += 1
@@ -251,7 +350,7 @@ class RolloutWorkerActor:
             results = await self.infer_actor.request_batch.remote(
                 self.worker_id,
                 current_batch_id,
-                vllm_prompt,
+                self.vllm_prompt,
                 self.args.infer_max_tokens,
                 self.args.rollout_batch_size,
             )
@@ -266,7 +365,6 @@ class RolloutWorkerActor:
                 ground_truth=ground_truth,
                 prompt=prompt,
                 results=results,
-                prepared_media=prepared_media,
             )
             """vsiqa"""
             self.replay_buffer.add_samples.remote(rl_samples)

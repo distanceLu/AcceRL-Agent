@@ -330,6 +330,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-model-len must be positive")
     if not 0 < args.rollout_gpu_memory_utilization <= 1:
         raise ValueError("--rollout-gpu-memory-utilization must be in (0, 1]")
+    if args.train_logprob_mode != "full_logits_ce":
+        raise ValueError(
+            "Qwen3-VL multimodal training requires "
+            "--train-logprob-mode full_logits_ce"
+        )
     """vsiqa"""
 
 

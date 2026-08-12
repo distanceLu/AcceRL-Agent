@@ -39,7 +39,7 @@ python -m vsi_qa_rlvr.main \
   --dtype bfloat16 \
   --train-mode full \
   --trust-remote-code \
-  --data-path /data/all/luck/derived_dataset/VSI_590K_derived/chair_count_fps2_qwen_labels_verl_video_summary_xml_max512/train.parquet \
+  --data-path /data/all/luck/derived_dataset/VSI_590K_derived/scannet_chair_incremental_counting/official_sensor/train.parquet \
   --log-dir "${OUTPUT_DIR}" \
   --fsdp-world-size 4 \
   --infer-actor-max-concurrency 1024 \

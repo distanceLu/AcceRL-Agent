@@ -14,7 +14,7 @@ class OnlineGenerationState:
 
     index: int
     """vsiqa"""
-    llm_input: dict
+    input_ids: dict  # Qwen3-VL stores the vLLM Renderer EngineInput here.
     """vsiqa"""
     requested_max_tokens: int
     output_tokens: List[int] = field(default_factory=list)
@@ -29,10 +29,10 @@ class OnlineGenerationState:
 
     """vsiqa"""
     @property
-    def restart_engine_input(self) -> dict:
-        engine_input = dict(self.llm_input)
+    def restart_prompt_token_ids(self) -> dict:  # Return the resumed EngineInput.
+        engine_input = dict(self.input_ids)
         engine_input["prompt_token_ids"] = (
-            list(self.llm_input["prompt_token_ids"])
+            list(self.input_ids["prompt_token_ids"])
             + list(self.output_tokens)
         )
         engine_input["arrival_time"] = time.time()
@@ -53,7 +53,7 @@ class InferenceRequestItem:
     batch_id: int
     sample_id: int
     """vsiqa"""
-    llm_input: dict
+    input_ids: dict  # Qwen3-VL carries the rendered EngineInput between calls.
     """vsiqa"""
     requested_max_tokens: int
 

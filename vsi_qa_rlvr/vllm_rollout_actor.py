@@ -180,7 +180,7 @@ class InterruptibleGenerationRunner:
 
             await self._increment_active_attempts()
             try:
-                engine_input = state.restart_engine_input
+                engine_input = state.restart_prompt_token_ids
                 # 调用vllm生成接口，拿到输出后更新state，如果生成过程中被weight update打断了，engine.generate()会抛出异常，直接进入finally块结束这个attempt
                 async for request_output in self.engine.generate(
                     engine_input,
@@ -273,7 +273,7 @@ class VLLMInferenceActor:
             mm_encoder_attn_backend=args.rollout_attention_backend,
             logprobs_mode="raw_logprobs",
             allowed_local_media_path="/",
-            limit_mm_per_prompt={"video": 1},
+            limit_mm_per_prompt={"image": 16},
             weight_transfer_config=WeightTransferConfig(backend="nccl"),
         )
         """vsiqa"""
@@ -315,7 +315,7 @@ class VLLMInferenceActor:
         self,
         rollout_worker_id: int,
         batch_id: int,
-        vllm_prompt,
+        input_ids: dict,  # Qwen3-VL receives the multimodal vLLM prompt dictionary.
         infer_max_tokens: int,
         num_samples: int,
     ) -> List[InferenceResult]:
@@ -325,7 +325,7 @@ class VLLMInferenceActor:
             return []
 
         engine_inputs = await self.engine.renderer.render_cmpl_async(
-            [vllm_prompt]
+            [input_ids]
         )
         llm_input = engine_inputs[0]
 
@@ -338,7 +338,7 @@ class VLLMInferenceActor:
                 rollout_worker_id=int(rollout_worker_id),
                 batch_id=int(batch_id),
                 sample_id=int(sample_id),
-                llm_input=llm_input,
+                input_ids=llm_input,
                 requested_max_tokens=int(infer_max_tokens),
             )
             requests_to_process.append(item)
@@ -360,7 +360,7 @@ class VLLMInferenceActor:
                 """vsiqa"""
                 state = OnlineGenerationState(
                     index=item.request_index,
-                    llm_input=item.llm_input,
+                    input_ids=item.input_ids,
                     requested_max_tokens=item.requested_max_tokens,
                 )
                 """vsiqa"""

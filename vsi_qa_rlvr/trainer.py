@@ -17,6 +17,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.fsdp import fully_shard
 
+from transformers import AutoTokenizer
+
 """vsiqa"""
 from transformers import Qwen3VLForConditionalGeneration
 """vsiqa"""
@@ -27,7 +29,6 @@ from vllm.distributed.weight_transfer.nccl_engine import (
 )
 
 """vsiqa"""
-from vsi_qa_rlvr.dataloaders.qwen3vl_rl_collator import Qwen3VLRLDataCollator
 from vsi_qa_rlvr.trajectory import RLSample
 """vsiqa"""
 
@@ -71,6 +72,20 @@ def find_open_port() -> int:
         return sock.getsockname()[1]
 
 
+class EncodedExample:
+    def __init__(
+        self,
+        input_ids: List[int],
+        attention_mask: List[int],
+        labels: List[int],
+        old_logprobs: List[float],
+    ):
+        self.input_ids = input_ids
+        self.attention_mask = attention_mask
+        self.labels = labels
+        self.old_logprobs = old_logprobs
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -88,6 +103,81 @@ def pick_dtype(dtype_name: str):
     if torch.cuda.is_available():
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return torch.float32
+
+
+"""vsiqa"""
+def make_collate_fn(tokenizer):
+    pad_token_id = tokenizer.pad_token_id
+
+    def collate(examples: List[EncodedExample]) -> Dict[str, torch.Tensor]:
+        max_len = max(len(example.input_ids) for example in examples)
+        batch_size = len(examples)
+        input_ids = torch.full(
+            (batch_size, max_len),
+            pad_token_id,
+            dtype=torch.long,
+        )
+        attention_mask = torch.zeros_like(input_ids)
+        labels = torch.full_like(input_ids, -100)
+        old_logprobs = torch.zeros(
+            (batch_size, max_len),
+            dtype=torch.float32,
+        )
+        mm_token_type_ids = torch.zeros_like(input_ids)
+
+        for index, example in enumerate(examples):
+            offset = max_len - len(example.input_ids)
+            input_ids[index, offset:] = torch.tensor(
+                example.input_ids,
+                dtype=torch.long,
+            )
+            attention_mask[index, offset:] = torch.tensor(
+                example.attention_mask,
+                dtype=torch.long,
+            )
+            labels[index, offset:] = torch.tensor(
+                example.labels,
+                dtype=torch.long,
+            )
+            old_logprobs[index, offset:] = torch.tensor(
+                example.old_logprobs,
+                dtype=torch.float32,
+            )
+            prompt_mm_token_type_ids = example.prepared_media[
+                "prompt_mm_token_type_ids"
+            ]
+            response_types = torch.zeros(
+                len(example.input_ids) - len(prompt_mm_token_type_ids),
+                dtype=torch.long,
+            )
+            mm_token_type_ids[index, offset:] = torch.cat(
+                (prompt_mm_token_type_ids, response_types)
+            )
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "old_logprobs": old_logprobs,
+            "mm_token_type_ids": mm_token_type_ids,
+            "pixel_values": torch.cat(
+                [
+                    example.prepared_media["pixel_values"]
+                    for example in examples
+                ],
+                dim=0,
+            ),
+            "image_grid_thw": torch.cat(
+                [
+                    example.prepared_media["image_grid_thw"]
+                    for example in examples
+                ],
+                dim=0,
+            ),
+        }
+
+    return collate
+"""vsiqa"""
 
 
 def configure_trainable_parameters(model, train_mode: str) -> None:
@@ -145,6 +235,53 @@ def log_parameter_count(model, train_mode: str, rank: int = 0):
             f"({trainable_params / total_params:.4%})"
         )
     return trainable_parameter_list
+
+
+def move_batch_to_device(batch: Dict, device) -> Dict:
+    return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+
+
+def build_tokenizer(args: argparse.Namespace, log: bool = True):
+    if log:
+        print(f"[init] Loading tokenizer from {args.model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        local_files_only=True,
+        trust_remote_code=args.trust_remote_code,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token_id is None:
+        raise ValueError("Tokenizer must define either pad_token or eos_token.")
+    return tokenizer
+
+
+"""vsiqa"""
+def build_model(args: argparse.Namespace, device, torch_dtype, log: bool = True):
+    if log:
+        print(
+            f"[init] Loading model from {args.model_path} "
+            f"(device={device}, dtype={torch_dtype})"
+        )
+    require_training_attention_backend(args.train_attention_backend)
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        args.model_path,
+        dtype=torch_dtype,
+        attn_implementation=args.train_attention_backend,
+        trust_remote_code=args.trust_remote_code,
+        local_files_only=True,
+    )
+    model.to(device)
+    model.train()
+    model.config.use_cache = False
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
+    return model
+"""vsiqa"""
 
 
 def iter_vllm_loadable_weights(name: str, tensor: torch.Tensor):
@@ -218,25 +355,12 @@ class FSDPTrainWorker:
 
         set_seed(args.seed + rank)
 
+        self.tokenizer = build_tokenizer(args, log=rank == 0)
+        self.collate_fn = make_collate_fn(self.tokenizer)
+        torch_dtype = pick_dtype(args.dtype)
+        model = build_model(args, self.device, torch_dtype, log=rank == 0)
         """vsiqa"""
-        self.forward_dtype = pick_dtype(args.dtype)
-        self.data_collator = Qwen3VLRLDataCollator()
-
-        require_training_attention_backend(args.train_attention_backend)
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            args.model_path,
-            dtype=self.forward_dtype,
-            attn_implementation=args.train_attention_backend,
-            trust_remote_code=args.trust_remote_code,
-            local_files_only=True,
-        )
-        model.config.use_cache = False
-        if args.gradient_checkpointing:
-            model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-        model.to(self.device)
-        model.train()
+        self.forward_dtype = torch_dtype
         """vsiqa"""
         configure_trainable_parameters(model, args.train_mode)
         log_parameter_count(model, args.train_mode, rank=rank)
@@ -312,32 +436,59 @@ class FSDPTrainWorker:
             dist.destroy_process_group()
 
     """vsiqa"""
-    def _prepare_rl_sample(self, sample: RLSample) -> RLSample | None:
-        if not sample.response_ids:
-            return None
-        if len(sample.input_ids) > self.args.max_length:
-            return None
+    def _prepare_rl_sample(self, sample: "RLSample") -> EncodedExample | None:
+        input_ids = list(sample.input_ids)
+        labels = list(sample.labels)
+        attention_mask = list(sample.attention_mask)
+        old_response_logprobs = list(sample.old_response_logprobs)
         if (
             self.args.clip_mode != "none"
-            and len(sample.old_response_logprobs) != len(sample.response_ids)
+            and len(sample.response_ids) != len(old_response_logprobs)
         ):
             return None
-        return sample
+        if len(sample.response_ids) != len(old_response_logprobs):
+            old_response_logprobs = [0.0] * len(sample.response_ids)
+        if (
+            not input_ids
+            or len(input_ids) != len(labels)
+            or len(input_ids) != len(attention_mask)
+        ):
+            return None
+        old_logprobs = [0.0] * len(sample.prompt_ids) + old_response_logprobs
+        if len(old_logprobs) != len(input_ids):
+            return None
+        if len(input_ids) > self.args.max_length:
+            return None
+        if len(input_ids) < 2:
+            return None
+        if all(label == -100 for label in labels[1:]):
+            return None
+
+        example = EncodedExample(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            old_logprobs=old_logprobs,
+        )
+        example.prepared_media = sample.prepared_media
+        return example
     """vsiqa"""
 
     """vsiqa"""
     def _collate_prepared_rl_samples(
         self,
-        prepared_samples: List[Tuple["RLSample", "RLSample"]],
+        prepared_samples: List[Tuple["RLSample", EncodedExample]],
         trainer_version: float,
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Dict[str, float]]:
-        samples = [sample for sample, _ in prepared_samples]
-        if not samples:
+        kept_samples = [sample for sample, _ in prepared_samples]
+        examples = [example for _, example in prepared_samples]
+
+        if not examples:
             raise RuntimeError("No valid RL samples were available for training.")
 
-        batch = self.data_collator(samples)
+        batch = self.collate_fn(examples)
         for key, value in batch.items():
-            if key == "pixel_values_videos":
+            if key == "pixel_values":
                 batch[key] = value.to(
                     device=self.device,
                     dtype=self.forward_dtype,
@@ -346,25 +497,30 @@ class FSDPTrainWorker:
             else:
                 batch[key] = value.to(self.device, non_blocking=True)
         advantages = torch.tensor(
-            [sample.advantage for sample in samples],
+            [sample.advantage for sample in kept_samples],
             dtype=torch.float32,
             device=self.device,
         )
+        response_token_counts = [
+            sum(1 for label in example.labels[1:] if label != -100)
+            for example in examples
+        ]
         version_lags = []
-        for sample in samples:
+        for sample in kept_samples:
             sample_version = max(sample.output_versions) if sample.output_versions else 0
             version_lags.append(
                 max(float(trainer_version) - float(sample_version), 0.0)
             )
         stats = {
-            "sample_count": float(len(samples)),
-            "reward_mean": sum(sample.reward for sample in samples) / len(samples),
+            "sample_count": float(len(kept_samples)),
+            "reward_mean": (
+                sum(sample.reward for sample in kept_samples) / len(kept_samples)
+            ),
             "advantage_mean": (
-                sum(sample.advantage for sample in samples) / len(samples)
+                sum(sample.advantage for sample in kept_samples)
+                / len(kept_samples)
             ),
-            "response_tokens": float(
-                sum(len(sample.response_ids) for sample in samples)
-            ),
+            "response_tokens": float(sum(response_token_counts)),
             "trainer_version_lag_mean": (
                 sum(version_lags) / len(version_lags) if version_lags else 0.0
             ),
@@ -417,32 +573,41 @@ class FSDPTrainWorker:
         advantages: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         labels = batch["labels"][:, 1:]
-        """vsiqa"""
-        response_mask = batch["loss_mask"][:, 1:]
-        """vsiqa"""
+        response_mask = labels.ne(-100)
         response_token_counts = response_mask.sum(dim=-1).clamp_min(1)
         valid_positions = response_mask.nonzero(as_tuple=False)
         if valid_positions.numel() == 0:
             raise RuntimeError("No valid response tokens found for RL loss.")
 
         valid_sample_indices = valid_positions[:, 0]
-        """vsiqa"""
-        with torch.autocast(device_type="cuda", dtype=self.forward_dtype):
-            outputs = self.model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                pixel_values_videos=batch["pixel_values_videos"],
-                video_grid_thw=batch["video_grid_thw"],
-                mm_token_type_ids=batch["mm_token_type_ids"],
-                use_cache=False,
+        if self.args.train_logprob_mode == "full_logits_ce":
+            """vsiqa"""
+            with torch.autocast(device_type="cuda", dtype=self.forward_dtype):
+                outputs = self.model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    pixel_values=batch["pixel_values"],
+                    image_grid_thw=batch["image_grid_thw"],
+                    mm_token_type_ids=batch["mm_token_type_ids"],
+                    use_cache=False,
+                )
+            """vsiqa"""
+            logits = outputs.logits[:, :-1, :]
+            valid_token_log_probs = self._valid_token_log_probs_from_full_logits(
+                logits,
+                labels,
+                response_mask,
             )
-        logits = outputs.logits[:, :-1, :]
-        valid_token_log_probs = self._valid_token_log_probs_from_full_logits(
-            logits,
-            labels,
-            response_mask,
-        )
-        """vsiqa"""
+        elif self.args.train_logprob_mode == "response_only_lm_head":
+            valid_token_log_probs = self._valid_token_log_probs_from_response_only_lm_head(
+                batch,
+                labels,
+                response_mask,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported train_logprob_mode: {self.args.train_logprob_mode}"
+            )
 
         if self.args.clip_mode == "none":
             valid_adv = advantages[valid_sample_indices].to(
@@ -735,11 +900,16 @@ class FSDPTrainWorker:
 
 __all__ = [
     "TRAIN_ATTENTION_BACKENDS",
+    "EncodedExample",
     "FSDPTrainWorker",
+    "build_model",
+    "build_tokenizer",
     "find_open_port",
     "get_local_ip",
     "get_vllm_weight_metadata",
     "iter_vllm_loadable_weights",
+    "make_collate_fn",
+    "move_batch_to_device",
     "require_training_attention_backend",
     "set_seed",
     "validate_weight_scope",
