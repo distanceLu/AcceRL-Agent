@@ -57,9 +57,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--train-mode",
-        default="lm_head",
-        choices=("lm_head", "last_layer", "full"),
-        help="Default lm_head mode is intended to validate the training loop.",
+        default="full",
+        choices=("full",),
+        help="Train all model parameters.",
     )
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=16)

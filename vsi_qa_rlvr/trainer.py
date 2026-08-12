@@ -180,31 +180,18 @@ def make_collate_fn(tokenizer):
 """vsiqa"""
 
 
+"""vsiqa"""
 def configure_trainable_parameters(model, train_mode: str) -> None:
-    if train_mode == "full":
-        for param in model.parameters():
-            param.requires_grad = True
-        return
+    """Enable all model parameters for full-parameter training."""
+    if train_mode != "full":
+        raise ValueError(
+            "Only full-parameter training is supported: "
+            f"train_mode={train_mode!r}"
+        )
 
     for param in model.parameters():
-        param.requires_grad = False
-
-    if train_mode == "lm_head":
-        target_keywords = ("lm_head",)
-    elif train_mode == "last_layer":
-        """vsiqa"""
-        num_layers = len(model.model.language_model.layers)
-        target_keywords = (
-            f"model.language_model.layers.{num_layers - 1}.",
-            "lm_head",
-        )
-        """vsiqa"""
-    else:
-        raise ValueError(f"Unsupported train mode: {train_mode}")
-
-    for name, param in model.named_parameters():
-        if any(keyword in name for keyword in target_keywords):
-            param.requires_grad = True
+        param.requires_grad = True
+"""vsiqa"""
 
 
 def iter_trainable_parameters(model) -> Iterable:
