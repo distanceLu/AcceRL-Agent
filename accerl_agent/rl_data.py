@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Literal, TypeAlias
+from typing import List, Literal, Tuple, TypeAlias
 
 import torch
 
@@ -47,16 +47,47 @@ def classify_textworld_termination_reason(
     return "environment_done_without_terminal_signal"
 
 
-@dataclass
+@dataclass(frozen=True)
 class RawPPOSample:
-    input_ids: List[int]
-    labels: List[int]  # 模型生成的response/action token:label 等于对应的 input_ids, prompt、observation token:label 等于 -100
-    old_logprobs: List[float]  # rollout时模型生成的response/action token的logprob
-    token_rewards: List[float]  # 每个 token 对应的奖励
-    token_terminated: List[bool]  # 每个 token 是否是终止状态的标记,终止token的回来回报为0
-    token_truncated: List[bool]  # 每个 token 是否是截断状态的标记,截断token回来回报可能不为0,需要用bootstrap_value来计算gae
-    output_versions: List[int]
-    bootstrap_prediction_position: int | None  # 仅用于被截断的 PPO 样本，指出应该在哪个上下文位置预测最终状态价值 V(s_final)
+    input_ids: Tuple[int, ...]
+    # Half-open ranges of trainable response tokens within ``input_ids``.
+    response_spans: Tuple[Tuple[int, int], ...]
+    # These two fields align only with the flattened response spans, not with
+    # the full input. Labels are derived directly from ``input_ids``.
+    response_logprobs: Tuple[float, ...]
+    response_rewards: Tuple[float, ...]
+    # The boundary is implicitly on the final response token. A truncated
+    # sample bootstraps from the final (non-response) input token.
+    boundary_kind: Literal["terminated", "truncated"]
+    # Maximum policy version among this sample's response tokens. Training
+    # only uses the latest behavior version for replay-lag diagnostics.
+    behavior_version: int
+
+    def __post_init__(self) -> None:
+        # Canonical tuples make a validated replay sample deeply immutable;
+        # downstream prepare/pack stages can trust its structural invariants.
+        try:
+            object.__setattr__(self, "input_ids", tuple(self.input_ids))
+            object.__setattr__(
+                self,
+                "response_spans",
+                tuple(tuple(span) for span in self.response_spans),
+            )
+            object.__setattr__(
+                self,
+                "response_logprobs",
+                tuple(self.response_logprobs),
+            )
+            object.__setattr__(
+                self,
+                "response_rewards",
+                tuple(self.response_rewards),
+            )
+        except TypeError as exc:
+            raise ValueError(
+                "PPO replay sequence fields must be iterable."
+            ) from exc
+        validate_raw_ppo_sample(self)
 
 
 @dataclass
@@ -73,86 +104,61 @@ RLSample: TypeAlias = RawPPOSample | GRPOSample
 
 def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
     length = len(sample.input_ids)
-    token_fields = {
-        "labels": sample.labels,
-        "old_logprobs": sample.old_logprobs,
-        "token_rewards": sample.token_rewards,
-        "token_terminated": sample.token_terminated,
-        "token_truncated": sample.token_truncated,
-        "output_versions": sample.output_versions,
-    }
     if length < 2:
         raise ValueError("A PPO sample must contain at least two tokens.")
-    for name, values in token_fields.items():
-        if len(values) != length:
-            raise ValueError(
-                f"{name} must be token-aligned: {len(values)} != {length}"
-            )
-    if sample.labels[0] != -100:
-        raise ValueError("The first PPO token cannot be a causal target.")
-    valid_targets = [
-        index for index, label in enumerate(sample.labels) if label != -100
-    ]
-    if not valid_targets:
+    if not sample.response_spans:
         raise ValueError("A PPO sample must contain a response target.")
-    for index in range(length):
-        is_target = sample.labels[index] != -100
-        if is_target:
-            if sample.labels[index] != sample.input_ids[index]:
-                raise ValueError(
-                    "PPO response labels must equal their input token ids."
-                )
-            if sample.output_versions[index] < 0:
-                raise ValueError(
-                    "Response targets require non-negative behavior versions."
-                )
-        else:
-            if sample.old_logprobs[index] != 0.0:
-                raise ValueError("Ignored tokens must have zero old logprob.")
-            if sample.token_rewards[index] != 0.0:
-                raise ValueError("Ignored tokens must have zero token reward.")
-            if sample.token_terminated[index] or sample.token_truncated[index]:
-                raise ValueError("Ignored tokens cannot terminate or truncate.")
-            if sample.output_versions[index] != -1:
-                raise ValueError("Ignored tokens require output_version=-1.")
-
-    terminated_indices = [
-        index
-        for index, value in enumerate(sample.token_terminated)
-        if value
-    ]
-    truncated_indices = [
-        index
-        for index, value in enumerate(sample.token_truncated)
-        if value
-    ]
-    if terminated_indices and truncated_indices:
-        raise ValueError("terminated and truncated are mutually exclusive.")
-    boundary_indices = terminated_indices + truncated_indices
-    if len(boundary_indices) != 1:
-        raise ValueError(
-            "Each PPO episode must have exactly one terminal or truncation boundary."
-        )
-    if boundary_indices[0] != valid_targets[-1]:
-        raise ValueError(
-            "The episode boundary must be the final response target token."
-        )
-
-    if terminated_indices:
-        if sample.bootstrap_prediction_position is not None:
-            raise ValueError("Terminated PPO samples cannot bootstrap.")
-    else:
-        position = sample.bootstrap_prediction_position
-        if position is None:
-            raise ValueError("Truncated PPO samples require a bootstrap position.")
-        if position != length - 1:
+    response_count = 0
+    previous_end = 0
+    for span_index, span in enumerate(sample.response_spans):
+        if (
+            not isinstance(span, tuple)
+            or len(span) != 2
+            or not all(type(value) is int for value in span)
+        ):
             raise ValueError(
-                "PPO bootstrap position must be the final context token."
+                "PPO response spans must be (start, end) integer tuples."
             )
-        if sample.labels[position] != -100:
+        start, end = span
+        if start < 1:
             raise ValueError(
-                "PPO bootstrap position must point to ignored final-state context."
+                "The first PPO token cannot be a causal response target."
             )
+        if start >= end or end > length:
+            raise ValueError(
+                f"PPO response span {span_index} is outside the input range."
+            )
+        if start < previous_end:
+            raise ValueError(
+                "PPO response spans must be ordered and non-overlapping."
+            )
+        response_count += end - start
+        previous_end = end
+
+    response_fields = {
+        "response_logprobs": sample.response_logprobs,
+        "response_rewards": sample.response_rewards,
+    }
+    for name, values in response_fields.items():
+        if len(values) != response_count:
+            raise ValueError(
+                f"{name} must align with response tokens: "
+                f"{len(values)} != {response_count}"
+            )
+    if sample.boundary_kind not in {"terminated", "truncated"}:
+        raise ValueError(
+            "PPO boundary_kind must be 'terminated' or 'truncated'."
+        )
+    if type(sample.behavior_version) is not int or sample.behavior_version < 0:
+        raise ValueError("PPO behavior_version must be a non-negative integer.")
+    if (
+        sample.boundary_kind == "truncated"
+        and sample.response_spans[-1][1] == length
+    ):
+        raise ValueError(
+            "A truncated PPO sample requires final non-response context for "
+            "bootstrap."
+        )
 
 
 def _parallel_reverse_affine_scan(
@@ -200,7 +206,7 @@ def compute_batched_token_gae(
     gamma: float,
     gae_lambda: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute detached token GAE for left-aligned dense episode timelines."""
+    """Checked public API for detached batched token GAE."""
     dense_tensors = {
         "rewards": rewards,
         "baseline_values": baseline_values,
@@ -246,9 +252,40 @@ def compute_batched_token_gae(
     if not boundary[row_indices, final_indices].all():
         raise ValueError("Each episode boundary must be on its final token.")
 
+    return _compute_batched_token_gae_unchecked(
+        rewards=rewards,
+        baseline_values=baseline_values,
+        valid_mask=valid_mask,
+        terminated=terminated,
+        truncated=truncated,
+        bootstrap_values=bootstrap_values,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+    )
+
+
+def _compute_batched_token_gae_unchecked(
+    rewards: torch.Tensor,
+    baseline_values: torch.Tensor,
+    valid_mask: torch.Tensor,
+    terminated: torch.Tensor,
+    truncated: torch.Tensor,
+    bootstrap_values: torch.Tensor,
+    *,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GAE kernel for trainer-validated dense episode timelines."""
+
     values = baseline_values.detach().float()
     rewards_float = rewards.detach().float()
     bootstrap = bootstrap_values.detach().float()
+    valid = valid_mask.detach().bool()
+    terminal = terminated.detach().bool()
+    truncation = truncated.detach().bool()
+    valid_counts = valid.sum(dim=1)
+    row_indices = torch.arange(valid.shape[0], device=valid.device)
+    final_indices = valid_counts - 1
     next_values = torch.zeros_like(values)
     if values.shape[1] > 1:
         next_values[:, :-1] = values[:, 1:]

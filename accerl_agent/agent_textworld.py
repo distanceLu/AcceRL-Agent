@@ -59,8 +59,8 @@ from accerl_agent.rl_data import (
     RLSample,
     RawPPOSample,
     TerminationReason,
+    _compute_batched_token_gae_unchecked,
     classify_textworld_termination_reason,
-    compute_batched_token_gae,
     textworld_ppo_boundary_is_terminal,
     validate_raw_ppo_sample,
 )
@@ -159,7 +159,7 @@ def wait_for_selected_ray_actor_debugger(role: str, rank: int) -> None:
     print(f"[debug] {role} rank {rank} debugger attached.", flush=True)
 
 
-@dataclass
+@dataclass(frozen=True)
 class PreparedVarlenPack:
     """One CPU-resident pack prepared for a Varlen optimizer window."""
 
@@ -172,7 +172,7 @@ class PreparedVarlenPack:
     valid_trajectory_count: int = 0
 
 
-@dataclass
+@dataclass(frozen=True)
 class PPOFlatTokenView:
     """Layout-independent token tensors consumed by the PPO objective."""
 
@@ -406,67 +406,67 @@ def make_grpo_varlen_batch(
 def make_ppo_varlen_batch(
     examples: List[RawPPOSample],
 ) -> Dict[str, torch.Tensor]:
-    """Pack PPO samples and derive all physical-layout metadata on CPU."""
+    """Validate and pack PPO samples through the checked public API."""
     if not examples:
         raise ValueError("At least one PPO sample is required for varlen packing.")
     if not all(isinstance(example, RawPPOSample) for example in examples):
         raise TypeError("PPO varlen packing only accepts RawPPOSample inputs.")
+    for example in examples:
+        validate_raw_ppo_sample(example)
+    return _make_ppo_varlen_batch_unchecked(examples)
+
+
+def _make_ppo_varlen_batch_unchecked(
+    examples: List[RawPPOSample],
+) -> Dict[str, torch.Tensor]:
+    """Pack immutable, constructor-validated PPO replay samples."""
 
     input_ids: List[int] = []
-    labels: List[int] = []
-    old_logprobs: List[float] = []
-    token_rewards: List[float] = []
-    token_terminated: List[bool] = []
-    token_truncated: List[bool] = []
+    response_logprobs: List[float] = []
+    response_rewards: List[float] = []
+    response_terminated: List[bool] = []
+    response_truncated: List[bool] = []
     position_ids: List[int] = []
-    sequence_ids: List[int] = []
     cu_seqlens = [0]
+    target_indices: List[int] = []
+    response_sample_indices: List[int] = []
+    response_ordinals: List[int] = []
+    response_counts: List[int] = []
     bootstrap_sample_indices: List[int] = []
     bootstrap_prediction_indices: List[int] = []
 
     for sequence_id, example in enumerate(examples):
-        validate_raw_ppo_sample(example)
         length = len(example.input_ids)
         sequence_start = cu_seqlens[-1]
         input_ids.extend(example.input_ids)
-        labels.extend(example.labels)
-        old_logprobs.extend(example.old_logprobs)
-        token_rewards.extend(example.token_rewards)
-        token_terminated.extend(example.token_terminated)
-        token_truncated.extend(example.token_truncated)
         position_ids.extend(range(length))
-        sequence_ids.extend([sequence_id] * length)
         cu_seqlens.append(sequence_start + length)
 
-        local_bootstrap = example.bootstrap_prediction_position
-        if local_bootstrap is not None:
-            packed_bootstrap = sequence_start + local_bootstrap
+        local_targets = [
+            position
+            for start, end in example.response_spans
+            for position in range(start, end)
+        ]
+        response_count = len(local_targets)
+        target_indices.extend(
+            sequence_start + position for position in local_targets
+        )
+        response_logprobs.extend(example.response_logprobs)
+        response_rewards.extend(example.response_rewards)
+        response_sample_indices.extend([sequence_id] * response_count)
+        response_ordinals.extend(range(response_count))
+        response_counts.append(response_count)
+        response_terminated.extend([False] * response_count)
+        response_truncated.extend([False] * response_count)
+        if example.boundary_kind == "terminated":
+            response_terminated[-1] = True
+        else:
+            response_truncated[-1] = True
+            packed_bootstrap = sequence_start + length - 1
             bootstrap_sample_indices.append(sequence_id)
             bootstrap_prediction_indices.append(packed_bootstrap)
 
-    target_indices = [
-        index for index, label in enumerate(labels) if label != -100
-    ]
     prediction_indices = [index - 1 for index in target_indices]
-    for target_index, prediction_index in zip(
-        target_indices,
-        prediction_indices,
-    ):
-        if sequence_ids[target_index] != sequence_ids[prediction_index]:
-            raise ValueError("A packed PPO target cannot cross a sequence boundary.")
-        if position_ids[target_index] != position_ids[prediction_index] + 1:
-            raise ValueError(
-                "A packed PPO target must immediately follow its prediction position."
-            )
-    # 每个有效 response token 属于 varlen pack 中哪一条原始 PPO trajectory。
-    response_sample_indices = [
-        sequence_ids[target_index] for target_index in target_indices
-    ]
-    response_counts = [0] * len(examples)
-    response_ordinals = []
-    for sample_index in response_sample_indices:
-        response_ordinals.append(response_counts[sample_index])
-        response_counts[sample_index] += 1
 
     # 找出模型需要计算的位置
     selected_positions = sorted(
@@ -498,11 +498,22 @@ def make_ppo_varlen_batch(
         "input_ids": torch.tensor([input_ids], dtype=torch.long),
         "position_ids": torch.tensor([position_ids], dtype=torch.long),
         "cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32),
-        "labels": torch.tensor(labels, dtype=torch.long),
-        "old_logprobs": torch.tensor(old_logprobs, dtype=torch.float32),
-        "token_rewards": torch.tensor(token_rewards, dtype=torch.float32),
-        "token_terminated": torch.tensor(token_terminated, dtype=torch.bool),
-        "token_truncated": torch.tensor(token_truncated, dtype=torch.bool),
+        "response_logprobs": torch.tensor(
+            response_logprobs,
+            dtype=torch.float32,
+        ),
+        "response_rewards": torch.tensor(
+            response_rewards,
+            dtype=torch.float32,
+        ),
+        "response_terminated": torch.tensor(
+            response_terminated,
+            dtype=torch.bool,
+        ),
+        "response_truncated": torch.tensor(
+            response_truncated,
+            dtype=torch.bool,
+        ),
         "target_indices": torch.tensor(target_indices, dtype=torch.long),
         "response_sample_indices": torch.tensor(
             response_sample_indices,
@@ -1071,66 +1082,48 @@ class FSDPTrainWorker:
         self,
         sample: RawPPOSample,
     ) -> RawPPOSample | None:
-        input_ids = list(sample.input_ids)
-        labels = list(sample.labels)
-        old_logprobs = list(sample.old_logprobs)
-        token_rewards = list(sample.token_rewards)
-        token_terminated = list(sample.token_terminated)
-        token_truncated = list(sample.token_truncated)
-        output_versions = list(sample.output_versions)
-        bootstrap_position = sample.bootstrap_prediction_position
-        original_length = len(input_ids)
-        token_fields = (
-            labels,
-            old_logprobs,
-            token_rewards,
-            token_terminated,
-            token_truncated,
-            output_versions,
-        )
-        if not input_ids or any(
-            len(field) != original_length for field in token_fields
-        ):
-            return None
+        original_length = len(sample.input_ids)
         max_length = self.args.max_length
-        if original_length > max_length:
-            truncate_offset = original_length - max_length
-            input_ids = input_ids[-max_length:]
-            labels = labels[-max_length:]
-            old_logprobs = old_logprobs[-max_length:]
-            token_rewards = token_rewards[-max_length:]
-            token_terminated = token_terminated[-max_length:]
-            token_truncated = token_truncated[-max_length:]
-            output_versions = output_versions[-max_length:]
-            if bootstrap_position is not None:
-                bootstrap_position -= truncate_offset
-                if not 0 <= bootstrap_position < max_length:
-                    return None
-
-        if len(input_ids) < 2:
+        if original_length <= max_length:
+            return sample
+        if max_length < 2:
             return None
-        labels[0] = -100
-        old_logprobs[0] = 0.0
-        token_rewards[0] = 0.0
-        token_terminated[0] = False
-        token_truncated[0] = False
-        output_versions[0] = -1
 
-        prepared = RawPPOSample(
-            input_ids=input_ids,
-            labels=labels,
-            old_logprobs=old_logprobs,
-            token_rewards=token_rewards,
-            token_terminated=token_terminated,
-            token_truncated=token_truncated,
-            output_versions=output_versions,
-            bootstrap_prediction_position=bootstrap_position,
+        truncate_offset = original_length - max_length
+        kept_positions: List[int] = []
+        kept_logprobs: List[float] = []
+        kept_rewards: List[float] = []
+        response_index = 0
+        for start, end in sample.response_spans:
+            for position in range(start, end):
+                if position > truncate_offset:
+                    kept_positions.append(position - truncate_offset)
+                    kept_logprobs.append(
+                        sample.response_logprobs[response_index]
+                    )
+                    kept_rewards.append(sample.response_rewards[response_index])
+                response_index += 1
+        if not kept_positions:
+            return None
+
+        response_spans: List[Tuple[int, int]] = []
+        span_start = kept_positions[0]
+        previous_position = span_start
+        for position in kept_positions[1:]:
+            if position != previous_position + 1:
+                response_spans.append((span_start, previous_position + 1))
+                span_start = position
+            previous_position = position
+        response_spans.append((span_start, previous_position + 1))
+
+        return RawPPOSample(
+            input_ids=list(sample.input_ids[-max_length:]),
+            response_spans=response_spans,
+            response_logprobs=kept_logprobs,
+            response_rewards=kept_rewards,
+            boundary_kind=sample.boundary_kind,
+            behavior_version=sample.behavior_version,
         )
-        try:
-            validate_raw_ppo_sample(prepared)
-        except ValueError:
-            return None
-        return prepared
 
     def _prepare_grpo_sample(
         self,
@@ -1192,7 +1185,7 @@ class FSDPTrainWorker:
                 for sample in prepared_samples
             ):
                 raise TypeError("PPO pack requires RawPPOSample inputs.")
-            batch = make_ppo_varlen_batch(prepared_samples)
+            batch = _make_ppo_varlen_batch_unchecked(prepared_samples)
         else:
             if not all(
                 isinstance(sample, GRPOSample)
@@ -1212,13 +1205,17 @@ class FSDPTrainWorker:
         lag_sum = sum(
             max(
                 trainer_version
-                - max(
-                    (
-                        version
-                        for version in sample.output_versions
-                        if version >= 0
-                    ),
-                    default=0,
+                - (
+                    sample.behavior_version
+                    if isinstance(sample, RawPPOSample)
+                    else max(
+                        (
+                            version
+                            for version in sample.output_versions
+                            if version >= 0
+                        ),
+                        default=0,
+                    )
                 ),
                 0.0,
             )
@@ -1301,12 +1298,12 @@ class FSDPTrainWorker:
             move_to_device=False,
         )
         total_token_count = int(batch["input_ids"].numel())
-        if total_token_count <= 0:
-            raise RuntimeError("A Varlen pack must contain at least one token.")
         valid_token_count = int(batch["target_indices"].numel())
-        if valid_token_count <= 0:
-            raise RuntimeError("A Varlen pack must contain at least one target.")
         if self.args.rl_algorithm == "grpo":
+            if total_token_count <= 0:
+                raise RuntimeError("A Varlen pack must contain at least one token.")
+            if valid_token_count <= 0:
+                raise RuntimeError("A Varlen pack must contain at least one target.")
             valid_sample_indices = batch["sequence_ids"][
                 batch["target_indices"]
             ]
@@ -1319,13 +1316,10 @@ class FSDPTrainWorker:
                     "trajectory."
                 )
         else:
-            response_counts = batch["response_counts"]
-            valid_trajectory_count = int(response_counts.gt(0).sum().item())
-            if valid_trajectory_count <= 0:
-                raise RuntimeError(
-                    "A PPO Varlen pack must contain at least one valid "
-                    "trajectory."
-                )
+            # RawPPOSample construction already guarantees one or more
+            # response tokens per immutable sample. The CPU packed-layout
+            # boundary validates the derived response_counts exactly once.
+            valid_trajectory_count = len(collected)
         max_seqlen = max(len(sample.input_ids) for sample in collected)
         version_lag_sum, sample_count = self._version_lag_stats(
             collected,
@@ -1502,7 +1496,7 @@ class FSDPTrainWorker:
         valid_logits = outputs.logits[0, response_columns]
         current_logprobs = -F.cross_entropy(
             valid_logits,
-            batch["labels"][target_indices],
+            batch["input_ids"][0, target_indices],
             reduction="none",
         ).float()
         response_hidden = selected_hidden[0, response_columns]
@@ -1542,11 +1536,11 @@ class FSDPTrainWorker:
             bootstrap_mask[bootstrap_sample_indices] = True
         return PPOFlatTokenView(
             current_logprobs=current_logprobs,
-            old_logprobs=batch["old_logprobs"][target_indices].float(),
+            old_logprobs=batch["response_logprobs"].float(),
             current_values=current_values,
-            rewards=batch["token_rewards"][target_indices].float(),
-            terminated=batch["token_terminated"][target_indices],
-            truncated=batch["token_truncated"][target_indices],
+            rewards=batch["response_rewards"].float(),
+            terminated=batch["response_terminated"],
+            truncated=batch["response_truncated"],
             response_sample_indices=response_sample_indices,
             response_ordinals=batch["response_ordinals"],
             response_counts=batch["response_counts"],
@@ -1645,9 +1639,16 @@ class FSDPTrainWorker:
         self,
         view: PPOFlatTokenView,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute detached FP32 token advantages and returns for one pack."""
+        """Checked helper for independently supplied PPO token views."""
         self._validate_ppo_flat_token_view(view)
         self._validate_ppo_boundary_layout(view)
+        return self._compute_ppo_raw_targets_unchecked(view)
+
+    def _compute_ppo_raw_targets_unchecked(
+        self,
+        view: PPOFlatTokenView,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute targets for a CPU-validated, internally derived view."""
         sample_count = int(view.response_counts.numel())
         dense_width = int(view.response_counts.max().item())
         dense_valid_mask = (
@@ -1686,7 +1687,7 @@ class FSDPTrainWorker:
             view.response_ordinals,
         ] = view.truncated
         dense_advantages, dense_returns, _ = (
-            compute_batched_token_gae(
+            _compute_batched_token_gae_unchecked(
                 rewards=dense_rewards,
                 baseline_values=dense_values,
                 valid_mask=dense_valid_mask,
@@ -1705,10 +1706,6 @@ class FSDPTrainWorker:
             view.response_sample_indices,
             view.response_ordinals,
         ]
-        if raw_advantages.numel() != view.current_values.numel():
-            raise RuntimeError("PPO batched GAE value/token alignment mismatch.")
-        if raw_advantages.requires_grad or returns.requires_grad:
-            raise RuntimeError("PPO GAE targets must be detached.")
         return raw_advantages.float().detach(), returns.float().detach()
 
     @staticmethod
@@ -1820,8 +1817,30 @@ class FSDPTrainWorker:
         actor_advantages: torch.Tensor,
         returns: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute trajectory-equal PPO loss and dual-reduction statistics."""
+        """Checked helper for independently supplied PPO targets."""
         self._validate_ppo_flat_token_view(view)
+        self._validate_ppo_boundary_layout(view)
+        self._validate_ppo_target_tensors(
+            view,
+            raw_advantages=raw_advantages,
+            actor_advantages=actor_advantages,
+            returns=returns,
+        )
+        return self._compute_ppo_loss_from_targets_unchecked(
+            view,
+            raw_advantages=raw_advantages,
+            actor_advantages=actor_advantages,
+            returns=returns,
+        )
+
+    @staticmethod
+    def _validate_ppo_target_tensors(
+        view: PPOFlatTokenView,
+        *,
+        raw_advantages: torch.Tensor,
+        actor_advantages: torch.Tensor,
+        returns: torch.Tensor,
+    ) -> None:
         expected_shape = view.current_values.shape
         target_fields = {
             "raw_advantages": raw_advantages,
@@ -1836,6 +1855,16 @@ class FSDPTrainWorker:
                 )
             if tensor.requires_grad:
                 raise RuntimeError(f"PPO {name} must be detached.")
+
+    def _compute_ppo_loss_from_targets_unchecked(
+        self,
+        view: PPOFlatTokenView,
+        *,
+        raw_advantages: torch.Tensor,
+        actor_advantages: torch.Tensor,
+        returns: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute loss for targets derived from a validated PPO pack."""
         raw_advantages = raw_advantages.detach().float()
         actor_advantages = actor_advantages.detach().float()
         returns = returns.detach().float()
@@ -1942,13 +1971,29 @@ class FSDPTrainWorker:
         ema_mean: float | None = None,
         ema_scale: float | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute a single-forward trajectory-equal PPO objective."""
+        """Checked single-forward PPO objective for standalone callers."""
+        self._validate_ppo_flat_token_view(view)
+        self._validate_ppo_boundary_layout(view)
+        return self._compute_ppo_reduction_sums_unchecked(
+            view,
+            ema_mean=ema_mean,
+            ema_scale=ema_scale,
+        )
+
+    def _compute_ppo_reduction_sums_unchecked(
+        self,
+        view: PPOFlatTokenView,
+        *,
+        ema_mean: float | None = None,
+        ema_scale: float | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Hot-path PPO objective for a CPU-validated packed batch."""
         mode = self.args.ppo_advantage_normalization
         if mode == "optimizer_window":
             raise RuntimeError(
                 "Optimizer-window PPO must use frozen two-pass targets."
             )
-        raw_advantages, returns = self._compute_ppo_raw_targets(view)
+        raw_advantages, returns = self._compute_ppo_raw_targets_unchecked(view)
         if mode == "none":
             actor_advantages = raw_advantages
         elif mode == "ema_rms":
@@ -1971,7 +2016,7 @@ class FSDPTrainWorker:
                 "PPO actor advantages contain non-finite values after "
                 f"{mode} normalization."
             )
-        return self._compute_ppo_loss_from_targets(
+        return self._compute_ppo_loss_from_targets_unchecked(
             view,
             raw_advantages=raw_advantages,
             actor_advantages=actor_advantages,
@@ -1986,7 +2031,7 @@ class FSDPTrainWorker:
         ema_mean: float | None = None,
         ema_scale: float | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._compute_ppo_reduction_sums(
+        return self._compute_ppo_reduction_sums_unchecked(
             self._forward_ppo_token_view(
                 batch,
                 max_seqlen=max_seqlen,
@@ -2026,11 +2071,11 @@ class FSDPTrainWorker:
         bootstrap_values = torch.zeros(sample_count, dtype=torch.float32)
         view = PPOFlatTokenView(
             current_logprobs=zeros,
-            old_logprobs=batch["old_logprobs"][target_indices].float(),
+            old_logprobs=batch["response_logprobs"].float(),
             current_values=zeros,
-            rewards=batch["token_rewards"][target_indices].float(),
-            terminated=batch["token_terminated"][target_indices],
-            truncated=batch["token_truncated"][target_indices],
+            rewards=batch["response_rewards"].float(),
+            terminated=batch["response_terminated"],
+            truncated=batch["response_truncated"],
             response_sample_indices=batch["response_sample_indices"].long(),
             response_ordinals=batch["response_ordinals"].long(),
             response_counts=batch["response_counts"].long(),
@@ -2121,7 +2166,9 @@ class FSDPTrainWorker:
                         batch,
                         max_seqlen=prepared.max_seqlen,
                     )
-                    raw_advantages, returns = self._compute_ppo_raw_targets(view)
+                    raw_advantages, returns = (
+                        self._compute_ppo_raw_targets_unchecked(view)
+                    )
                 if buffer_snapshots is not None:
                     self._validate_ppo_forward_buffers_unchanged(
                         buffer_snapshots
@@ -2350,7 +2397,7 @@ class FSDPTrainWorker:
                     eps=self.args.ppo_adv_norm_eps,
                 )
                 trajectory_loss_sum, reduction_stats = (
-                    self._compute_ppo_loss_from_targets(
+                    self._compute_ppo_loss_from_targets_unchecked(
                         view,
                         raw_advantages=raw_advantages,
                         actor_advantages=actor_advantages,
@@ -3771,6 +3818,15 @@ class TextWorldRolloutWorkerActor:
         wait_for_selected_ray_actor_debugger("rollout", self.worker_id)
         self.tokenizer = build_tokenizer(args, log=False)
         self.game_files = load_textworld_game_files(args)
+        request_infos = make_textworld_request_infos()
+        self.game_env_ids = {
+            game_file: textworld.gym.register_game(
+                game_file,
+                request_infos=request_infos,
+                max_episode_steps=args.tw_max_episode_steps,
+            )
+            for game_file in self.game_files
+        }
         self.stopped = False
         self.inference_wait_started_at = None
         self.begin_diagnostics_interval()
@@ -3995,13 +4051,18 @@ class TextWorldRolloutWorkerActor:
         sample_advantage: float | None = None,
     ) -> RLSample | None:
         algorithm = self.args.rl_algorithm if algorithm is None else algorithm
+        if algorithm not in {"ppo", "grpo"}:
+            raise ValueError(f"Unsupported rl_algorithm: {algorithm}")
         input_ids: List[int] = []
+        # GRPO keeps its legacy token-aligned fields. PPO stores only compact
+        # response metadata below.
         labels: List[int] = []
         old_logprobs: List[float] = []
-        token_rewards: List[float] = []
-        token_terminated: List[bool] = []
-        token_truncated: List[bool] = []
         output_versions: List[int] = []
+        response_spans: List[Tuple[int, int]] = []
+        response_logprobs: List[float] = []
+        response_rewards: List[float] = []
+        behavior_version = -1
 
         for record in state.step_records:
             prompt_ids = list(record.prompt_ids)
@@ -4012,12 +4073,10 @@ class TextWorldRolloutWorkerActor:
             prompt_delta = prompt_ids[len(input_ids):]
             if prompt_delta:
                 input_ids.extend(prompt_delta)
-                labels.extend([-100] * len(prompt_delta))
-                old_logprobs.extend([0.0] * len(prompt_delta))
-                token_rewards.extend([0.0] * len(prompt_delta))
-                token_terminated.extend([False] * len(prompt_delta))
-                token_truncated.extend([False] * len(prompt_delta))
-                output_versions.extend([-1] * len(prompt_delta))
+                if algorithm == "grpo":
+                    labels.extend([-100] * len(prompt_delta))
+                    old_logprobs.extend([0.0] * len(prompt_delta))
+                    output_versions.extend([-1] * len(prompt_delta))
 
             result = record.training_result
             if not result.output_tokens:
@@ -4025,12 +4084,10 @@ class TextWorldRolloutWorkerActor:
             output_tokens = list(result.output_tokens)
             if result.stop_reason == "abort":
                 input_ids.extend(output_tokens)
-                labels.extend([-100] * len(output_tokens))
-                old_logprobs.extend([0.0] * len(output_tokens))
-                token_rewards.extend([0.0] * len(output_tokens))
-                token_terminated.extend([False] * len(output_tokens))
-                token_truncated.extend([False] * len(output_tokens))
-                output_versions.extend([-1] * len(output_tokens))
+                if algorithm == "grpo":
+                    labels.extend([-100] * len(output_tokens))
+                    old_logprobs.extend([0.0] * len(output_tokens))
+                    output_versions.extend([-1] * len(output_tokens))
                 continue
             result_logprobs = list(result.output_logprobs)
             if len(result_logprobs) != len(result.output_tokens):
@@ -4038,22 +4095,25 @@ class TextWorldRolloutWorkerActor:
             if len(result.output_versions) != len(result.output_tokens):
                 return None
 
+            response_start = len(input_ids)
             input_ids.extend(output_tokens)
-            labels.extend(output_tokens)
-            old_logprobs.extend(result_logprobs)
             if algorithm == "ppo":
+                if any(version < 0 for version in result.output_versions):
+                    return None
+                response_spans.append((response_start, len(input_ids)))
+                response_logprobs.extend(result_logprobs)
                 response_token_rewards = [0.0] * len(output_tokens)
                 response_token_rewards[-1] = float(record.reward)
-            elif algorithm == "grpo":
-                response_token_rewards = [0.0] * len(output_tokens)
+                response_rewards.extend(response_token_rewards)
+                behavior_version = max(
+                    behavior_version,
+                    max(result.output_versions),
+                )
             else:
-                raise ValueError(f"Unsupported rl_algorithm: {algorithm}")
-            token_rewards.extend(response_token_rewards)
-            token_terminated.extend([False] * len(output_tokens))
-            token_truncated.extend([False] * len(output_tokens))
-            output_versions.extend(result.output_versions)
+                labels.extend(output_tokens)
+                old_logprobs.extend(result_logprobs)
+                output_versions.extend(result.output_versions)
 
-        bootstrap_prediction_position = None
         final_delta: List[int] = []
         ppo_boundary_is_terminal = False
         if algorithm == "ppo":
@@ -4071,60 +4131,41 @@ class TextWorldRolloutWorkerActor:
                 final_delta = final_transcript_ids[len(input_ids):]
                 if final_delta:
                     input_ids.extend(final_delta)
-                    labels.extend([-100] * len(final_delta))
-                    old_logprobs.extend([0.0] * len(final_delta))
-                    token_rewards.extend([0.0] * len(final_delta))
-                    token_terminated.extend([False] * len(final_delta))
-                    token_truncated.extend([False] * len(final_delta))
-                    output_versions.extend([-1] * len(final_delta))
-
-        if all(label == -100 for label in labels):
-            return None
-        if (
-            not input_ids
-            or len(input_ids) != len(labels)
-            or len(input_ids) != len(old_logprobs)
-            or len(input_ids) != len(token_rewards)
-            or len(input_ids) != len(token_terminated)
-            or len(input_ids) != len(token_truncated)
-            or len(input_ids) != len(output_versions)
-        ):
+        if not input_ids:
             return None
         if len(input_ids) > self.args.tw_history_token_window:
             return None
 
         if algorithm == "ppo":
-            valid_target_indices = [
-                index for index, label in enumerate(labels) if label != -100
-            ]
-            if not valid_target_indices:
+            if not response_spans:
                 return None
-            boundary_index = valid_target_indices[-1]
-            if ppo_boundary_is_terminal:
-                token_terminated[boundary_index] = True
-            else:
-                token_truncated[boundary_index] = True
-                if not final_delta:
-                    return None
-                bootstrap_prediction_position = len(input_ids) - 1
-            sample = RawPPOSample(
-                input_ids=input_ids,
-                labels=labels,
-                old_logprobs=old_logprobs,
-                token_rewards=token_rewards,
-                token_terminated=token_terminated,
-                token_truncated=token_truncated,
-                output_versions=output_versions,
-                bootstrap_prediction_position=bootstrap_prediction_position,
-            )
+            if not ppo_boundary_is_terminal and not final_delta:
+                return None
             try:
-                validate_raw_ppo_sample(sample)
+                return RawPPOSample(
+                    input_ids=input_ids,
+                    response_spans=response_spans,
+                    response_logprobs=response_logprobs,
+                    response_rewards=response_rewards,
+                    boundary_kind=(
+                        "terminated"
+                        if ppo_boundary_is_terminal
+                        else "truncated"
+                    ),
+                    behavior_version=behavior_version,
+                )
             except ValueError:
                 return None
-            return sample
         elif algorithm == "grpo":
             if sample_advantage is None:
                 raise ValueError("GRPO samples require a sample advantage.")
+            if (
+                len(input_ids) != len(labels)
+                or len(input_ids) != len(old_logprobs)
+                or len(input_ids) != len(output_versions)
+                or all(label == -100 for label in labels)
+            ):
+                return None
             return GRPOSample(
                 input_ids=input_ids,
                 labels=labels,
@@ -4132,8 +4173,7 @@ class TextWorldRolloutWorkerActor:
                 output_versions=output_versions,
                 advantage=float(sample_advantage),
             )
-        else:
-            raise ValueError(f"Unsupported rl_algorithm: {algorithm}")
+        raise AssertionError("unreachable")
 
     def _compute_grpo_group_advantages(
         self,
@@ -4160,12 +4200,7 @@ class TextWorldRolloutWorkerActor:
         else:
             raise ValueError(f"Unsupported rl_algorithm: {algorithm}")
 
-        request_infos = make_textworld_request_infos()
-        env_id = textworld.gym.register_game(
-            game_file,
-            request_infos=request_infos,
-            max_episode_steps=self.args.tw_max_episode_steps,
-        )
+        env_id = self.game_env_ids[game_file]
         states: List[TextWorldTrajectoryState] = []
 
         try:

@@ -336,17 +336,17 @@ The TextWorld functions most commonly replaced are:
 
 This is the most important stability check. Every sample must guarantee:
 
-- Prompt-token labels are `-100`.
-- Trainable response-token labels equal the token ids.
-- Trainable response tokens have old-policy logprobs.
-- Aborted or non-trainable outputs may stay in `input_ids`, but their labels must be `-100`.
-- `response_indices` and `output_versions` are token-aligned; ignored tokens
-  use `-1`.
-- PPO rewards and terminal/truncation masks are token-aligned, with exactly
-  one boundary on the final valid response token.
-- Truncated PPO samples contain ignored final-state context and a valid
-  bootstrap prediction position. TextWorld `step_limit` and `history_limit`
+- PPO response spans are ordered, non-overlapping, and never include input
+  position zero; labels are derived from the corresponding `input_ids`.
+- PPO response logprobs and rewards align with the flattened response spans.
+- PPO stores one non-negative maximum behavior version and one boundary kind;
+  the trainer derives the boundary mask on the final response token.
+- Aborted or non-trainable outputs may stay in `input_ids` outside the spans.
+- Truncated PPO samples end with non-response final-state context; the trainer
+  uses its final token as the bootstrap prediction position. TextWorld
+  `step_limit` and `history_limit`
   samples are terminal failures and do not bootstrap.
+- GRPO retains token-aligned labels, logprobs, and output versions.
 - Rollout samples do not exceed `--tw-history-token-window`, and argument
   validation requires `--max-length >= --tw-history-token-window`.
 

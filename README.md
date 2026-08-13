@@ -300,10 +300,13 @@ if lost:
     reward -= tw_lost_penalty
 ```
 
-PPO mode is enabled with `--rl-algorithm ppo`. Rollout stores token-aligned rewards, behavior
-logprobs, terminal/truncation boundaries, and optional final-state bootstrap
-context, but no values, returns, or advantages. The trainer recomputes current
-values and detached token TD(λ) targets on every replay sample. `--gae-gamma`
+PPO mode is enabled with `--rl-algorithm ppo`. Rollout stores compact response
+spans, response-aligned rewards and behavior logprobs, one boundary kind, the
+latest behavior version, and optional final-state context. The trainer derives
+labels, boundary masks, and bootstrap positions while packing; Replay stores no
+full-length fill-value arrays, values, returns, or advantages. The trainer
+recomputes current values and detached token TD(λ) targets on every replay
+sample. `--gae-gamma`
 discounts once per valid response token; configure the trace and Critic weight
 with `--gae-lambda` and `--value-loss-coef`. PPO advantage normalization
 defaults to exact moments over the complete optimizer accumulation window on
@@ -325,27 +328,27 @@ The training-side policy objective is controlled by `--clip-mode`:
 
 ## Replay Sample Contract
 
-Replay stores `RawPPOSample | GRPOSample`. Every token field is aligned to
-`input_ids`:
+Replay stores `RawPPOSample | GRPOSample`. PPO uses this compact contract:
 
 ```text
-len(input_ids) == len(labels)
-len(input_ids) == len(old_logprobs)
-len(input_ids) == len(response_indices)
-len(input_ids) == len(output_versions)
+input_ids
+response_spans              # ordered, non-overlapping [start, end) ranges
+response_logprobs           # aligned to flattened response spans
+response_rewards            # aligned to flattened response spans
+boundary_kind               # "terminated" or "truncated"
+behavior_version            # max response-token policy version
 ```
 
-`RawPPOSample` additionally aligns `token_rewards`, `token_terminated`, and
-`token_truncated`. Ignored tokens use `label=-100`, zero reward/logprob,
-`False` boundaries, and `response_index=output_version=-1`. Exactly one
-terminal or truncation boundary appears on the final response token.
-Truncations include ignored final-state prompt context and a valid bootstrap
+PPO labels are the `input_ids` inside response spans and ignored elsewhere.
+The boundary is implicitly on the final response token. Truncations include
+non-response final-state context, whose last token is the implicit bootstrap
 prediction position. TextWorld `step_limit` and `history_limit` boundaries are
 treated as terminal failures, so their final-state value is zero and they do
 not bootstrap. The rollout tracks successful environment steps separately
 from action attempts so the TextWorld time-limit wrapper is also classified as
 `step_limit`. PPO rollout never stores values, returns, or advantages.
-`GRPOSample` instead stores one trajectory-level advantage.
+`GRPOSample` retains its token-aligned policy fields and stores one
+trajectory-level advantage.
 
 ## Important Arguments
 
