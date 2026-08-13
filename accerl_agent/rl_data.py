@@ -15,19 +15,16 @@ TerminationReason: TypeAlias = Literal[
 ]
 
 
-PPO_TERMINAL_REASONS = frozenset({
-    "won",
-    "lost",
-    "step_limit",
-    "history_limit",
-})
-
-
 def textworld_ppo_boundary_is_terminal(
     termination_reason: TerminationReason,
 ) -> bool:
     """Return whether PPO must stop return propagation without bootstrap."""
-    return termination_reason in PPO_TERMINAL_REASONS
+    return termination_reason in {
+        "won",
+        "lost",
+        "step_limit",
+        "history_limit",
+    }
 
 
 def classify_textworld_termination_reason(
@@ -141,99 +138,21 @@ def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
             "The episode boundary must be the final response target token."
         )
 
-    is_terminated = bool(terminated_indices)
-    if is_terminated:
+    if terminated_indices:
         if sample.bootstrap_prediction_position is not None:
             raise ValueError("Terminated PPO samples cannot bootstrap.")
     else:
         position = sample.bootstrap_prediction_position
         if position is None:
             raise ValueError("Truncated PPO samples require a bootstrap position.")
-        if not 0 <= position < length:
-            raise ValueError("PPO bootstrap position is out of range.")
         if position != length - 1:
             raise ValueError(
                 "PPO bootstrap position must be the final context token."
-            )
-        if position <= valid_targets[-1]:
-            raise ValueError(
-                "PPO bootstrap context must follow the final response token."
             )
         if sample.labels[position] != -100:
             raise ValueError(
                 "PPO bootstrap position must point to ignored final-state context."
             )
-
-
-def compute_token_gae(
-    rewards: torch.Tensor,
-    baseline_values: torch.Tensor,
-    terminated: torch.Tensor,
-    truncated: torch.Tensor,
-    bootstrap_value: torch.Tensor,
-    *,
-    gamma: float,
-    gae_lambda: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute detached token GAE, lambda returns, and one-step TD deltas."""
-    tensors = {
-        "rewards": rewards,
-        "baseline_values": baseline_values,
-        "terminated": terminated,
-        "truncated": truncated,
-    }
-    for name, tensor in tensors.items():
-        if tensor.ndim != 1:
-            raise ValueError(f"{name} must be one-dimensional.")
-    num_tokens = rewards.numel()
-    if num_tokens < 1:
-        raise ValueError("Token GAE requires at least one response token.")
-    if any(tensor.numel() != num_tokens for tensor in tensors.values()):
-        raise ValueError("All token GAE inputs must have the same length.")
-    if terminated.bool().logical_and(truncated.bool()).any():
-        raise ValueError("A token cannot be both terminated and truncated.")
-    boundary = terminated.bool().logical_or(truncated.bool())
-    if int(boundary.sum().item()) != 1 or not bool(boundary[-1].item()):
-        raise ValueError(
-            "Token GAE requires exactly one boundary on the final token."
-        )
-    if not 0.0 <= gamma:
-        raise ValueError("gamma must be non-negative.")
-    if not 0.0 <= gae_lambda <= 1.0:
-        raise ValueError("gae_lambda must be in [0, 1].")
-
-    rewards = rewards.detach().float()
-    values = baseline_values.detach().float()
-    bootstrap_value = bootstrap_value.detach().float().reshape(())
-    terminated = terminated.detach().bool()
-    truncated = truncated.detach().bool()
-    advantages = torch.zeros_like(rewards)
-    deltas = torch.zeros_like(rewards)
-    next_advantage = rewards.new_zeros(())
-    next_value = bootstrap_value
-
-    for index in range(num_tokens - 1, -1, -1):
-        bootstrap_mask = (~terminated[index]).to(torch.float32)
-        trace_mask = (~(terminated[index] | truncated[index])).to(torch.float32)
-        delta = (
-            rewards[index]
-            + float(gamma) * bootstrap_mask * next_value
-            - values[index]
-        )
-        advantage = (
-            delta
-            + float(gamma)
-            * float(gae_lambda)
-            * trace_mask
-            * next_advantage
-        )
-        deltas[index] = delta
-        advantages[index] = advantage
-        next_value = values[index]
-        next_advantage = advantage
-
-    returns = values + advantages
-    return advantages.detach(), returns.detach(), deltas.detach()
 
 
 def _parallel_reverse_affine_scan(

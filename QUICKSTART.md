@@ -394,7 +394,7 @@ This is the most important stability check. Every sample must guarantee:
 
 - Confirm that `flash_attn` imports in the same environment used by Ray
   trainers.
-- Use `bfloat16`, `float16`, or `auto`; packed training rejects `float32`.
+- Use `bfloat16`, `float16`, or `auto`.
 - Confirm that the model supports Transformers `flash_attention_2`.
 - When using `--train-logprob-mode response_only_lm_head`, confirm that the
   CausalLM forward accepts tensor `logits_to_keep`; this is verified with

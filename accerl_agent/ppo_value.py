@@ -54,12 +54,11 @@ class TokenValueHead(torch.nn.Module):
                 "hidden_states last dimension must equal hidden_size: "
                 f"got {hidden_states.shape[-1]} and {self.hidden_size}"
             )
-        values = F.linear(
+        return F.linear(
             hidden_states.to(dtype=torch.float32),
             self.weight,
             self.bias,
-        )
-        return values.squeeze(-1)
+        ).squeeze(-1)
 
 
 def value_head_checkpoint_paths(checkpoint_root: str) -> tuple[str, str]:
@@ -171,19 +170,13 @@ def load_value_head_checkpoint(
         bias=bias,
     )
 
-    state_dict = load_file(weights_path, device="cpu")
+    state_dict = load_file(weights_path)
     _validate_value_head_state(
         state_dict,
         hidden_size=value_head.hidden_size,
         bias=bias,
     )
-    value_head.load_state_dict(
-        {
-            key: tensor.to(device=value_head.weight.device, dtype=torch.float32)
-            for key, tensor in state_dict.items()
-        },
-        strict=True,
-    )
+    value_head.load_state_dict(state_dict)
     return True
 
 

@@ -35,7 +35,7 @@ If you only want to run the smallest working flow first, see [QUICKSTART.md](QUI
 | --- | --- |
 | `accerl_agent/run_agent_textworld.py` | Canonical launcher for Ray-safe TextWorld training startup. |
 | `accerl_agent/agent_textworld.py` | Full Ray + vLLM + FSDP online RL training implementation. |
-| `accerl_agent/rl_data.py` | Canonical replay schemas, strict PPO validation, and detached scalar/batched token GAE. |
+| `accerl_agent/rl_data.py` | Canonical replay schemas, strict PPO validation, and detached batched token GAE. |
 | `accerl_agent/ppo_value.py` | Shared-backbone FP32 Value Head and Critic checkpoint helpers. |
 | `accerl_agent/textworld_local_infer.py` | Checks vLLM inference and TextWorld environment interaction without training. |
 | `accerl_agent/local_trainer.py` | Local dummy SFT smoke test for tokenizer/model/FSDP training paths. |
@@ -351,7 +351,7 @@ from action attempts so the TextWorld time-limit wrapper is also classified as
 | Argument | Description |
 | --- | --- |
 | `--model-path` | Local HuggingFace model path. |
-| `--dtype` | `auto`, `bfloat16`, `float16`, or `float32`. |
+| `--dtype` | `auto`, `bfloat16`, or `float16`. |
 | `--train-mode` | `full` is supported; `lora` is reserved for a future adapter-training implementation. |
 | `--tw-game-dir` | Directory containing TextWorld `.z8` games. |
 | `--tw-history-token-window` | Token limit for the episode transcript. |

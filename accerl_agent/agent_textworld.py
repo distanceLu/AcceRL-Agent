@@ -292,8 +292,6 @@ def set_seed(seed: int) -> None:
 
 
 def pick_dtype(dtype_name: str):
-    if dtype_name == "float32":
-        return torch.float32
     if dtype_name == "float16":
         return torch.float16
     if dtype_name == "bfloat16":
@@ -442,12 +440,6 @@ def make_ppo_varlen_batch(
     for sequence_id, example in enumerate(examples):
         validate_raw_ppo_sample(example)
         length = len(example.input_ids)
-        if length < 2:
-            raise ValueError("Each packed PPO sequence requires at least two tokens.")
-        if example.labels[0] != -100:
-            raise ValueError(
-                "The first token in a packed PPO sequence cannot be an RL target."
-            )
         sequence_start = cu_seqlens[-1]
         input_ids.extend(example.input_ids)
         labels.extend(example.labels)
@@ -465,27 +457,15 @@ def make_ppo_varlen_batch(
             packed_bootstrap = sequence_start + local_bootstrap
             bootstrap_sample_indices.append(sequence_id)
             bootstrap_prediction_indices.append(packed_bootstrap)
-            if packed_bootstrap != cu_seqlens[-1] - 1:
-                raise ValueError(
-                    "A packed PPO bootstrap must be its sequence's final token."
-                )
-            if labels[packed_bootstrap] != -100:
-                raise ValueError(
-                    "A packed PPO bootstrap must point to an ignored context token."
-                )
 
     target_indices = [
         index for index, label in enumerate(labels) if label != -100
     ]
-    if not target_indices:
-        raise ValueError("A PPO varlen pack must contain at least one RL target.")
     prediction_indices = [index - 1 for index in target_indices]
     for target_index, prediction_index in zip(
         target_indices,
         prediction_indices,
     ):
-        if prediction_index < 0:
-            raise ValueError("A packed PPO prediction position cannot be negative.")
         if sequence_ids[target_index] != sequence_ids[prediction_index]:
             raise ValueError("A packed PPO target cannot cross a sequence boundary.")
         if position_ids[target_index] != position_ids[prediction_index] + 1:
@@ -501,8 +481,6 @@ def make_ppo_varlen_batch(
     for sample_index in response_sample_indices:
         response_ordinals.append(response_counts[sample_index])
         response_counts[sample_index] += 1
-    if any(count <= 0 for count in response_counts):
-        raise ValueError("Every PPO varlen sample requires a response token.")
 
     # 找出模型需要计算的位置
     selected_positions = sorted(
@@ -528,23 +506,6 @@ def make_ppo_varlen_batch(
         selected_column_by_position[position]
         for position in bootstrap_prediction_indices
     ]
-    if any(
-        selected_positions[column] != position
-        for column, position in zip(
-            response_selected_columns,
-            prediction_indices,
-        )
-    ):
-        raise ValueError("PPO response selected-position mapping failed.")
-    if any(
-        selected_positions[column] != position
-        for column, position in zip(
-            bootstrap_selected_columns,
-            bootstrap_prediction_indices,
-        )
-    ):
-        raise ValueError("PPO bootstrap selected-position mapping failed.")
-
     # Derived packing metadata below is Trainer-local and is never persisted
     # in Replay.
     return {
@@ -1695,10 +1656,6 @@ class FSDPTrainWorker:
             raise RuntimeError(
                 "PPO bootstrap mask must exactly match truncated samples."
             )
-        final_terminated = torch.zeros_like(view.bootstrap_mask)
-        final_terminated[final_sample_indices] = view.terminated[expected_final]
-        if view.bootstrap_mask.logical_and(final_terminated).any():
-            raise RuntimeError("Terminated PPO samples cannot bootstrap.")
 
     def _compute_ppo_raw_targets(
         self,
@@ -1744,19 +1701,6 @@ class FSDPTrainWorker:
             view.response_sample_indices,
             view.response_ordinals,
         ] = view.truncated
-        row_indices = torch.arange(
-            sample_count,
-            device=view.response_counts.device,
-        )
-        final_ordinals = view.response_counts - 1
-        final_terminated = dense_terminated[row_indices, final_ordinals]
-        final_truncated = dense_truncated[row_indices, final_ordinals]
-        if not torch.equal(view.bootstrap_mask, final_truncated):
-            raise RuntimeError(
-                "PPO bootstrap mask must exactly match truncated samples."
-            )
-        if view.bootstrap_mask.logical_and(final_terminated).any():
-            raise RuntimeError("Terminated PPO samples cannot bootstrap.")
         dense_advantages, dense_returns, _ = (
             compute_batched_token_gae(
                 rewards=dense_rewards,
@@ -3961,7 +3905,6 @@ def make_textworld_request_infos() -> textworld.EnvInfos:
         max_score=True,
         won=True,
         lost=True,
-        moves=True,
     )
 
 
@@ -4597,8 +4540,6 @@ class TextWorldRolloutWorkerActor:
                     self.diagnostics.increment(
                         "termination_reason_missing_count"
                     )
-                if state.termination_reason == "history_limit":
-                    self.diagnostics.increment("history_limit_count")
                 self.diagnostics.observe(
                     "episode_action_attempts",
                     len(state.step_records),
@@ -5419,7 +5360,12 @@ async def run_textworld_train(args: argparse.Namespace):
                     rollout_diagnostics, "postprocess_ms", "p95"
                 ),
                 "Rollout/HistoryLimitRate": (
-                    float(rollout_counters.get("history_limit_count", 0.0))
+                    float(
+                        rollout_counters.get(
+                            "termination_reason_history_limit_count",
+                            0.0,
+                        )
+                    )
                     / max(rollout_episode_count, 1.0)
                 ),
                 "Rollout/StepLimitRate": (
@@ -5639,7 +5585,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dtype",
         default="auto",
-        choices=("auto", "bfloat16", "float16", "float32"),
+        choices=("auto", "bfloat16", "float16"),
     )
     parser.add_argument(
         "--train-mode",
@@ -6141,11 +6087,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--train-token-budget must be >= --max-length; "
             f"got {args.train_token_budget} < {args.max_length}"
-        )
-    if args.dtype == "float32":
-        raise ValueError(
-            "FlashAttention 2 packed training requires float16, bfloat16, "
-            "or auto dtype"
         )
     if args.replay_capacity < 1:
         raise ValueError("--replay-capacity must be >= 1")
