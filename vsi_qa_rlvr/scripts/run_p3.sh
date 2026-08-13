@@ -14,15 +14,17 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="/cpfs01/luck_workspace/repositiory/AcceRL-Agent${PYTHONPATH:+:${PYTHONPATH}}"
 export HF_HOME=/data/all/luck/cache/huggingface
 export HF_HUB_CACHE=/data/all/luck/cache/huggingface/hub
 export TRANSFORMERS_CACHE=/data/all/luck/cache/huggingface/transformers
-export XDG_CACHE_HOME=/data/all/luck/cache/xdg
+export XDG_CACHE_HOME=/data/all/luck/accerl_p3/xdg
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
-export TMPDIR=/data/all/luck/tmp/vsi_qa
-export RAY_TMPDIR=/data/all/luck/tmp/ray_vsi_qa
+export TMPDIR=/data/all/luck/accerl_p3/tmp
+export RAY_TMPDIR=/data/all/luck/accerl_p3/ray
 
 BASE_MODEL=/data/all/luck/models/verl_rlvr/qwen3vl8b_three_frame_sft_checkpoint80
 DATA_ROOT=/data/all/luck/derived_dataset/VSI_590K_derived/scannet_chair_incremental_counting/three_frame_complete_capability
@@ -41,7 +43,13 @@ if [[ -d "${OUTPUT_DIR}" && -n "$(find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 -
   echo "output directory is not empty: ${OUTPUT_DIR}" >&2
   exit 1
 fi
-mkdir -p "${OUTPUT_DIR}" /data/all/luck/tmp/vsi_qa /data/all/luck/tmp/ray_vsi_qa
+mkdir -p \
+  "${OUTPUT_DIR}" \
+  "${HF_HUB_CACHE}" \
+  "${TRANSFORMERS_CACHE}" \
+  "${XDG_CACHE_HOME}" \
+  "${TMPDIR}" \
+  "${RAY_TMPDIR}"
 
 echo "output_dir=${OUTPUT_DIR}"
 echo "train_file=${TRAIN_FILE}"
@@ -58,9 +66,9 @@ python -m vsi_qa_rlvr.main \
   --limit-images 3 \
   --log-dir "${OUTPUT_DIR}" \
   --fsdp-world-size 4 \
-  --infer-actor-max-concurrency 1024 \
+  --infer-actor-max-concurrency 2048 \
   --batch-size 32 \
-  --grad-accum-steps 1 \
+  --grad-accum-steps 8 \
   --max-steps 400 \
   --sync-every-optimizer-steps 32 \
   --learning-rate 1e-6 \
@@ -75,8 +83,8 @@ python -m vsi_qa_rlvr.main \
   --replay-capacity 8192 \
   --replay-wait-sleep-seconds 0.01 \
   --replay-sample-timeout-seconds 1800 \
-  --num-rollout-workers 64 \
-  --rollout-batch-size 16 \
+  --num-rollout-workers 144 \
+  --rollout-batch-size 8 \
   --rollout-stop-timeout 600 \
   --infer-max-tokens 128 \
   --infer-temperature 1.0 \
