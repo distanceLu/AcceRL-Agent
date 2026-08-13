@@ -187,7 +187,6 @@ python -m accerl_agent.run_agent_textworld \
   --grad-accum-steps 32 \
   --max-steps 500000 \
   --lr-warmup-steps 500 \
-  --train-mode full \
   --sync-every-optimizer-steps 1 \
   --clip-mode ppo \
   --trust-remote-code \
@@ -240,8 +239,7 @@ After the smoke test passes, scale one dimension at a time:
 3. Tune `--train-token-budget`, `--train-max-sequences-per-pack`, and
    `--train-pack-candidate-pool-size` together.
 4. Increase `--grad-accum-steps` if more effective batch size is needed.
-5. Keep `--train-mode full`; `lora` is reserved but not implemented yet.
-6. Tune `--sync-every-optimizer-steps` and `--replay-capacity` to control sample staleness.
+5. Tune `--sync-every-optimizer-steps` and `--replay-capacity` to control sample staleness.
 
 Watch these metrics first:
 
@@ -287,14 +285,13 @@ parameters but are not full training-resume checkpoints.
 
 ## 8. Change Models
 
-When switching models, use `--train-mode full`; `lora` is reserved but not
-implemented yet.
+The TextWorld trainer always performs full-policy training.
 
 For non-Qwen or non-Qwen-MoE style models, carefully check:
 
 - `build_tokenizer()`
 - `build_model()`
-- `configure_trainable_parameters()`
+- `configure_full_training()`
 - The `fully_shard(model.model.layers)` path in `FSDPTrainWorker.__init__()`
 - `iter_vllm_loadable_weights()`
 
@@ -376,7 +373,7 @@ This is the most important stability check. Every sample must guarantee:
 - Check the NCCL environment and node communication.
 - Confirm that the vLLM version supports the current weight-transfer API.
 - Check names, shapes, and dtypes emitted by `iter_vllm_loadable_weights()`.
-- Confirm that the current trainable parameter set is not empty.
+- Confirm that the full policy metadata contains the expected parameters.
 
 ### Loss or KL is unstable
 

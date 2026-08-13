@@ -54,7 +54,7 @@ This project targets Linux GPU environments. Exact package versions must match y
 - A local HuggingFace Causal LM model directory.
 - TextWorld `.z8` game files.
 
-Several parts of the current code assume a model layout close to Qwen/Qwen-MoE, such as `model.model.layers` and `lm_head`. If you use another HuggingFace model family, carefully check `build_model()`, `configure_trainable_parameters()`, the FSDP wrapping path, and `iter_vllm_loadable_weights()`.
+Several parts of the current code assume a model layout close to Qwen/Qwen-MoE, such as `model.model.layers` and `lm_head`. If you use another HuggingFace model family, carefully check `build_model()`, `configure_full_training()`, the FSDP wrapping path, and `iter_vllm_loadable_weights()`.
 
 Packed training requires a GPU-supported `flash-attn`
 build. The `response_only_lm_head` logprob mode also requires a Transformers
@@ -155,7 +155,6 @@ python -m accerl_agent.run_agent_textworld \
   --grad-accum-steps 32 \
   --max-steps 500000 \
   --lr-warmup-steps 500 \
-  --train-mode full \
   --sync-every-optimizer-steps 1 \
   --clip-mode ppo \
   --trust-remote-code \
@@ -192,7 +191,6 @@ python -m accerl_agent.run_agent_textworld \
   --max-steps 2 \
   --max-sync-rounds 1 \
   --sync-every-optimizer-steps 1 \
-  --train-mode full \
   --rl-algorithm ppo \
   --clip-mode ppo \
   --train-token-budget 2048 \
@@ -261,10 +259,10 @@ flowchart LR
     Rollout -->|"RLSample"| Replay
     Rollout -->|"episode metrics"| Stats
     Trainer -->|"sample batch"| Replay
-    Trainer -->|"NCCL trainable weights"| Infer
+    Trainer -->|"NCCL full policy weights"| Infer
 ```
 
-`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, trains the full policy model, and samples independent replay objects. In PPO mode it also owns a separately sharded FP32 Value Head; GRPO does not create or optimize a critic. PPO uses packed FlashAttention 2 boundaries, native tensor `logits_to_keep`, and a temporary model-native LM-head hook, so only response/bootstrap logits and final hidden states are retained. It computes current values and batched detached TD(λ) targets when replay is sampled, then optimizes policy and Value losses with trajectory-equal reduction while retaining token-weighted advantage normalization and diagnostics. GRPO uses the same token-budget packing and trajectory-equal reduction pipeline. Weight synchronization to vLLM remains policy-only.
+`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, always trains the full policy model, and samples independent replay objects. In PPO mode it also owns a separately sharded FP32 Value Head; GRPO does not create or optimize a critic. PPO uses packed FlashAttention 2 boundaries, native tensor `logits_to_keep`, and a temporary model-native LM-head hook, so only response/bootstrap logits and final hidden states are retained. It computes current values and batched detached TD(λ) targets when replay is sampled, then optimizes policy and Value losses with trajectory-equal reduction while retaining token-weighted advantage normalization and diagnostics. GRPO uses the same token-budget packing and trajectory-equal reduction pipeline. Every vLLM synchronization transfers the full policy and excludes the PPO Value Head.
 
 `VLLMInferenceActor` handles rollout inference. It starts vLLM with dummy weights, waits for the initial full weight sync, pauses generation during later syncs, aborts requests when needed, updates weights, and then resumes generation.
 
@@ -355,7 +353,6 @@ from action attempts so the TextWorld time-limit wrapper is also classified as
 | --- | --- |
 | `--model-path` | Local HuggingFace model path. |
 | `--dtype` | `auto`, `bfloat16`, or `float16`. |
-| `--train-mode` | `full` is supported; `lora` is reserved for a future adapter-training implementation. |
 | `--tw-game-dir` | Directory containing TextWorld `.z8` games. |
 | `--tw-history-token-window` | Token limit for the episode transcript. |
 | `--max-length` | Maximum trainer-side sequence length; must be at least `--tw-history-token-window`. |
@@ -449,7 +446,7 @@ If the trainer keeps waiting for replay, check `--num-rollout-workers`, `--min-r
 
 If many actions are invalid, lower the temperature, reduce `--infer-max-tokens`, enable more detailed rollout logs, and confirm that the parser matches the task output format.
 
-If vLLM weight sync fails, check GPU counts, vLLM weight-transfer API support, the NCCL environment, the names/shapes/dtypes returned by `iter_vllm_loadable_weights()`, and whether the trainable parameter set is empty.
+If vLLM weight sync fails, check GPU counts, vLLM weight-transfer API support, the NCCL environment, and the names/shapes/dtypes returned by `iter_vllm_loadable_weights()` for the full policy.
 
 If loss or KL is unstable, lower the learning rate, reduce replay staleness,
 increase the KL penalty, and confirm that invalid, aborted, or empty outputs

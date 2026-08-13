@@ -565,22 +565,10 @@ def select_varlen_pack(
     return selected, remaining
 
 
-def configure_trainable_parameters(model, train_mode: str) -> None:
-    if train_mode == "full":
-        for param in model.parameters():
-            param.requires_grad = True
-        return
-    if train_mode == "lora":
-        # TODO(lora): Inject LoRA adapters before FSDP wrapping, freeze the
-        # base policy, expose only adapter parameters to the optimizer, save
-        # adapter checkpoints, and add a vLLM-compatible adapter sync path.
-        # Remove the matching validate_args guard once that path is complete.
-        raise NotImplementedError("LoRA training is not implemented yet.")
-    raise ValueError(f"Unsupported train mode: {train_mode}")
-
-
-def iter_trainable_parameters(model) -> Iterable:
-    return (param for param in model.parameters() if param.requires_grad)
+def configure_full_training(model) -> None:
+    """Make every policy parameter trainable."""
+    for param in model.parameters():
+        param.requires_grad = True
 
 
 def count_parameters(model) -> Tuple[int, int]:
@@ -594,11 +582,15 @@ def count_parameters(model) -> Tuple[int, int]:
     return total, trainable
 
 
-def log_parameter_count(model, train_mode: str, rank: int = 0):
+def log_parameter_count(model, rank: int = 0) -> None:
     total_params, trainable_params = count_parameters(model)
-    trainable_parameter_list = list(iter_trainable_parameters(model))
-    if not trainable_parameter_list:
-        raise RuntimeError(f"No trainable parameters found for mode: {train_mode}")
+    if total_params == 0:
+        raise RuntimeError("Policy model has no parameters.")
+    if trainable_params != total_params:
+        raise RuntimeError(
+            "Full policy training requires every policy parameter to be "
+            f"trainable, got {trainable_params:,} / {total_params:,}."
+        )
 
     if rank == 0:
         print(
@@ -606,7 +598,6 @@ def log_parameter_count(model, train_mode: str, rank: int = 0):
             f"trainable={trainable_params:,} / total={total_params:,} "
             f"({trainable_params / total_params:.4%})"
         )
-    return trainable_parameter_list
 
 
 def move_batch_to_device(batch: Dict, device) -> Dict:
@@ -835,11 +826,6 @@ def validate_vllm_policy_weight_names(names: Iterable[str]) -> None:
         )
 
 
-def validate_weight_scope(scope: str) -> None:
-    if scope not in {"all", "trainable"}:
-        raise ValueError(f"Unsupported weight scope: {scope!r}")
-
-
 def dtype_nbytes(dtype_name: str) -> int:
     """Return bytes per element for dtype names emitted by get_vllm_weight_metadata."""
     return {
@@ -908,8 +894,8 @@ class FSDPTrainWorker:
         model = build_model(args, self.device, torch_dtype, log=rank == 0)
         # 验证取hidden_state和logits的forward是否支持selected_positions参数,同时计算 Policy logits 和 PPO value
         validate_ppo_selected_forward_support(model, args)
-        configure_trainable_parameters(model, args.train_mode)
-        log_parameter_count(model, args.train_mode, rank=rank)
+        configure_full_training(model)
+        log_parameter_count(model, rank=rank)
 
         value_head, value_head_loaded = build_value_head(
             args,
@@ -936,24 +922,11 @@ class FSDPTrainWorker:
             )
 
         # vLLM metadata must remain policy-only. Keep this list rooted at the
-        # Hugging Face policy model rather than any future actor-critic wrapper.
+        # Hugging Face policy model rather than the PPO Value Head.
         named_parameters = list(model.named_parameters())
-        all_param_names = [name for name, _ in named_parameters]
-        trainable_param_names = [
-            name for name, param in named_parameters if param.requires_grad
-        ]
-        self.weight_metadata_by_scope = {
-            "all": get_vllm_weight_metadata(named_parameters),
-            "trainable": get_vllm_weight_metadata(
-                [
-                    (name, param)
-                    for name, param in named_parameters
-                    if param.requires_grad
-                ]
-            ),
-        }
-        for metadata in self.weight_metadata_by_scope.values():
-            validate_vllm_policy_weight_names(metadata[0])
+        policy_param_names = [name for name, _ in named_parameters]
+        self.weight_metadata = get_vllm_weight_metadata(named_parameters)
+        validate_vllm_policy_weight_names(self.weight_metadata[0])
 
         for layer in model.model.layers:
             fully_shard(layer)
@@ -987,16 +960,10 @@ class FSDPTrainWorker:
                 "world_size / global_valid_token_count."
             )
         sharded_params_by_name = dict(self.model.named_parameters())
-        self.params_by_scope = {
-            "all": [
-                (name, sharded_params_by_name[name])
-                for name in all_param_names
-            ],
-            "trainable": [
-                (name, sharded_params_by_name[name])
-                for name in trainable_param_names
-            ],
-        }
+        self.policy_params = [
+            (name, sharded_params_by_name[name])
+            for name in policy_param_names
+        ]
         if self.value_head is not None:
             sharded_value_params_by_name = dict(
                 self.value_head.named_parameters()
@@ -1007,14 +974,19 @@ class FSDPTrainWorker:
             ]
         else:
             self.value_head_params = []
-        self.policy_trainable_parameters = list(
-            iter_trainable_parameters(self.model)
-        )
+        self.policy_trainable_parameters = list(self.model.parameters())
         self.value_head_parameters = [
             param for _, param in self.value_head_params
         ]
         if not self.policy_trainable_parameters:
-            raise RuntimeError(f"No trainable parameters found for mode: {args.train_mode}")
+            raise RuntimeError("Policy model has no parameters.")
+        if not all(
+            param.requires_grad for param in self.policy_trainable_parameters
+        ):
+            raise RuntimeError(
+                "Full policy training requires every policy parameter to be "
+                "trainable."
+            )
         if self.value_head is not None and not self.value_head_parameters:
             raise RuntimeError("Value Head has no trainable parameters.")
         self.trainable_parameter_list = (
@@ -2925,16 +2897,15 @@ class FSDPTrainWorker:
             ),
         )
 
-    def get_weight_metadata(self, scope: str = "all"):
-        """Return scoped weight names, dtypes, and shapes from pre-FSDP params."""
-        validate_weight_scope(scope)
-        return self.weight_metadata_by_scope[scope]
+    def get_weight_metadata(self):
+        """Return full policy weight names, dtypes, and shapes."""
+        return self.weight_metadata
 
     # ---- collective ops (ALL FSDP ranks must call concurrently) ----
 
-    def gather_and_broadcast_weights(self, scope: str = "all", packed: bool = True):
+    def gather_and_broadcast_weights(self, packed: bool = True):
         """
-        All-gather scoped full parameters and broadcast them to vLLM.
+        All-gather the full policy and broadcast it to vLLM.
         Only rank 0 performs the actual NCCL broadcast; others just
         participate in the FSDP all-gather.
 
@@ -2942,11 +2913,9 @@ class FSDPTrainWorker:
         for each parameter in the same order.  Rank 0 additionally
         feeds each gathered tensor to the weight-transfer engine.
         """
-        validate_weight_scope(scope)
-        params = self.params_by_scope[scope]
         if self.rank == 0:
             def _full_param_iter():
-                for name, param in params:
+                for name, param in self.policy_params:
                     full_param = param.full_tensor().detach()
                     yield from iter_vllm_loadable_weights(name, full_param)
 
@@ -2959,7 +2928,7 @@ class FSDPTrainWorker:
                 trainer_args=trainer_args,
             )
         else:
-            for _, param in params:
+            for _, param in self.policy_params:
                 param.full_tensor()
 
     def save_checkpoint(self, checkpoint_dir: str, tag: str) -> Dict[str, Any]:
@@ -2994,7 +2963,7 @@ class FSDPTrainWorker:
                 value_head_state_dict = {}
 
         with torch.no_grad():
-            for name, param in self.params_by_scope["all"]:
+            for name, param in self.policy_params:
                 full_param = param.full_tensor().detach()
                 if self.rank == 0:
                     assert state_dict is not None
@@ -3031,7 +3000,6 @@ class FSDPTrainWorker:
                 "optimizer_step": self.optimizer_step,
                 "train_micro_step": self.train_micro_step,
                 "fsdp_world_size": self.fsdp_world_size,
-                "train_mode": self.args.train_mode,
                 "rl_algorithm": self.args.rl_algorithm,
                 "max_steps": self.args.max_steps,
                 "sync_every_optimizer_steps": self.args.sync_every_optimizer_steps,
@@ -4307,13 +4275,11 @@ def summarize_weight_payload(dtype_names: List[str], shapes: List[List[int]]) ->
 async def sync_weights_to_vllm(
     infer_actor,
     fsdp_workers,
-    scope: str,
     transfer_world_size: int,
     packed: bool = True,
 ):
-    validate_weight_scope(scope)
     names, dtype_names, shapes = ray.get(
-        fsdp_workers[0].get_weight_metadata.remote(scope)
+        fsdp_workers[0].get_weight_metadata.remote()
     )
     validate_vllm_policy_weight_names(names)
     if not (len(names) == len(dtype_names) == len(shapes)):
@@ -4324,7 +4290,7 @@ async def sync_weights_to_vllm(
     model_gib = summarize_weight_payload(dtype_names, shapes)
     infer_payload_gib = model_gib * (transfer_world_size - 1)
     print(
-        f"[sync] {scope} metadata: tensors={len(names)}, "
+        f"[sync] full-policy metadata: tensors={len(names)}, "
         f"logical_payload={model_gib:.3f} GiB, "
         f"aggregate_infer_payload={infer_payload_gib:.3f} GiB, "
         "critic_in_vllm_payload=False"
@@ -4333,7 +4299,7 @@ async def sync_weights_to_vllm(
     ray.get(infer_actor.start_weight_update.remote())
     t0 = time.perf_counter()
     broadcast_handles = [
-        worker.gather_and_broadcast_weights.remote(scope=scope, packed=packed)
+        worker.gather_and_broadcast_weights.remote(packed=packed)
         for worker in fsdp_workers
     ]
     ray.get(
@@ -4348,7 +4314,7 @@ async def sync_weights_to_vllm(
     ray.get(infer_actor.finish_weight_update.remote())
     elapsed = time.perf_counter() - t0
     print(
-        f"[sync] {scope} weight update complete: {elapsed:.3f}s, "
+        f"[sync] full-policy weight update complete: {elapsed:.3f}s, "
         f"model-sync throughput={model_gib / elapsed:.3f} GiB/s, "
         f"aggregate-infer throughput={infer_payload_gib / elapsed:.3f} GiB/s"
     )
@@ -4585,7 +4551,6 @@ async def run_textworld_train(args: argparse.Namespace):
         await sync_weights_to_vllm(
             infer_actor=infer_actor,
             fsdp_workers=fsdp_workers,
-            scope="all",
             transfer_world_size=transfer_world_size,
             packed=True,
         )
@@ -4869,21 +4834,20 @@ async def run_textworld_train(args: argparse.Namespace):
             ):
                 print(
                     "[sync] max_sync_rounds reached; letting inference finish "
-                    "without more trainable updates."
+                    "without more policy updates."
                 )
                 break
 
             sync_rounds += 1
             print(
                 f"[sync] Round {sync_rounds}: pausing generation for "
-                "trainable-only weight update..."
+                "full-policy weight update..."
             )
             ray.get(infer_actor.pause_and_wait_idle.remote())
 
             sync_elapsed_seconds = await sync_weights_to_vllm(
                 infer_actor=infer_actor,
                 fsdp_workers=fsdp_workers,
-                scope="trainable",
                 transfer_world_size=transfer_world_size,
                 packed=True,
             )
@@ -4969,15 +4933,6 @@ def parse_args() -> argparse.Namespace:
         "--dtype",
         default="auto",
         choices=("auto", "bfloat16", "float16"),
-    )
-    parser.add_argument(
-        "--train-mode",
-        default="full",
-        choices=("full", "lora"),
-        help=(
-            "Policy training mode. 'full' is supported; 'lora' is reserved "
-            "for the forthcoming adapter-training implementation."
-        ),
     )
     parser.add_argument(
         "--tw-game-dir",
@@ -5302,7 +5257,7 @@ def parse_args() -> argparse.Namespace:
         "--sync-every-optimizer-steps",
         type=int,
         default=8,
-        help="Sync trainable weights after this many optimizer steps.",
+        help="Sync full policy weights after this many optimizer steps.",
     )
     parser.add_argument(
         "--infer-size",
@@ -5386,7 +5341,7 @@ def parse_args() -> argparse.Namespace:
         "--max-sync-rounds",
         type=int,
         default=None,
-        help="Optional maximum number of trainable-only sync rounds in the demo.",
+        help="Optional maximum number of full-policy sync rounds in the demo.",
     )
     args = parser.parse_args()
     if args.clip_eps <= 0:
@@ -5432,10 +5387,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.train_mode == "lora":
-        raise NotImplementedError(
-            "--train-mode lora is reserved but not implemented yet."
-        )
     if args.tw_game_limit is not None and args.tw_game_limit < 1:
         raise ValueError("--tw-game-limit must be >= 1 when set")
     if args.tw_max_episode_steps < 1:
