@@ -264,7 +264,7 @@ flowchart LR
     Trainer -->|"NCCL trainable weights"| Infer
 ```
 
-`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, trains the full policy model, and samples independent replay objects. It also owns a separately sharded FP32 Value Head. PPO uses packed FlashAttention 2 boundaries, native tensor `logits_to_keep`, and a temporary model-native LM-head hook, so only response/bootstrap logits and final hidden states are retained. It computes current values and batched detached TD(λ) targets when replay is sampled, then optimizes policy and Value losses with trajectory-equal reduction while retaining token-weighted advantage normalization and diagnostics. GRPO uses the same token-budget packing and trajectory-equal reduction pipeline. Weight synchronization to vLLM remains policy-only.
+`FSDPTrainWorker` loads the tokenizer and `AutoModelForCausalLM`, trains the full policy model, and samples independent replay objects. In PPO mode it also owns a separately sharded FP32 Value Head; GRPO does not create or optimize a critic. PPO uses packed FlashAttention 2 boundaries, native tensor `logits_to_keep`, and a temporary model-native LM-head hook, so only response/bootstrap logits and final hidden states are retained. It computes current values and batched detached TD(λ) targets when replay is sampled, then optimizes policy and Value losses with trajectory-equal reduction while retaining token-weighted advantage normalization and diagnostics. GRPO uses the same token-budget packing and trajectory-equal reduction pipeline. Weight synchronization to vLLM remains policy-only.
 
 `VLLMInferenceActor` handles rollout inference. It starts vLLM with dummy weights, waits for the initial full weight sync, pauses generation during later syncs, aborts requests when needed, updates weights, and then resumes generation.
 
@@ -272,7 +272,10 @@ flowchart LR
 
 `ReplayBufferActor` stores samples sharded by FSDP rank. Rollout workers write to `replay_buffers[worker_id % fsdp_world_size]`, so `--num-rollout-workers` must be at least `--fsdp-world-size`.
 
-`StatsActor` maintains sliding-window metrics and feeds TensorBoard with win rate, normalized score, invalid action rate, replay fill, reward, advantage, throughput, and sync-latency statistics.
+`StatsActor` maintains sliding-window win rate, normalized score, invalid action
+rate, and active-worker state. The main loop writes a compact TensorBoard set
+covering task quality, replay health, training stability, throughput, rollout
+limits, and weight-sync latency.
 
 ## TextWorld Rollout
 
@@ -401,72 +404,44 @@ Saved checkpoint contents include model weights, config, tokenizer files, and `t
 
 | Metric | Meaning |
 | --- | --- |
-| `TextWorld/WinRate` | Episode win rate over the recent window. |
 | `TextWorld/NormalizedScore` | Normalized score over the recent window. |
+| `TextWorld/WinRate` | Episode win rate over the recent window. |
 | `TextWorld/InvalidActionRate` | Fraction of invalid actions. |
-| `TextWorld/EnvStepsMean` | Average number of valid environment steps per episode. |
 | `Replay/FillRatio` | Replay-buffer fill ratio. |
 | `Replay/TrainSampleTrainerVersionLagMean` | Version lag between training samples and the current trainer. |
-| `Train/LossMeanAcrossRanks` | Average loss across FSDP ranks. |
+| `Rollout/ActiveWorkers` | Number of rollout workers active within the configured timeout. |
+| `Rollout/EpisodesPerSec` | Completed TextWorld episodes per second. |
+| `Rollout/InferenceWaitFraction` | Fraction of aggregate worker time spent waiting for inference. |
+| `Rollout/EnvironmentStepsPerEpisodeMean` | Mean valid environment steps per completed episode. |
+| `Rollout/HistoryLimitRate` | Fraction of episodes stopped by the history-token limit. |
+| `Train/PolicyLoss` | Trajectory-equal policy loss used by optimization. |
+| `Train/LearningRate` | Current optimizer learning rate. |
+| `Train/TokensPerSec` | Valid training tokens processed per second. |
 | `Train/PackTokenUtilization` | Fraction of `--train-token-budget` occupied by real tokens in a pack. |
-| `Train/PackSampleCount` | Number of independent samples in a pack. |
-| `Train/PackMaxSequenceLength` | Longest sequence in the current pack. |
-| `Train/PackCpuMilliseconds` | CPU time spent selecting and constructing a pack. |
-| `Train/PolicyLossTokenMean` | PPO global valid-token policy-loss diagnostic; `Train/PolicyLoss` is the trajectory mean used by optimization. |
-| `Train/ValueLossTokenMean` | PPO global valid-token Value-loss diagnostic; `Train/ValueLoss` is the trajectory mean used by optimization. |
 | `KL/OldNewK3TrajectoryMean` | PPO/GRPO KL penalty used by optimization: valid-token mean within each trajectory, then an equal mean across valid trajectories. |
-| `KL/OldNewK3TokenMean` | Global valid-token KL diagnostic reported alongside the trajectory-mean KL. |
 | `Clip/PPOClipFrac` | Fraction of global valid response tokens outside the PPO ratio clip interval; intentionally remains token-level for both algorithms. |
 | `Infer/TokensPerSec` | vLLM generation throughput. |
+| `Infer/LengthRate` | Fraction of logical requests that exhaust their generation-token limit. |
 | `Sync/ElapsedSeconds` | Weight-sync latency. |
-| `Sync/RetryScheduledToFirstTokenMsMean` | Compute-side first-token latency proxy for attempts explicitly resubmitted after sync. |
-| `Sync/RetryRecomputedTokensMean` | Prompt tokens not served by prefix cache for successful sync-retry probes. |
-| `Sync/RetryQueueMsMean` | Scheduler queue time before a sync-retry attempt is scheduled. |
 
-### TextWorld inference throughput diagnostics
+PPO additionally reports the following Value and advantage diagnostics:
 
-`Infer/TokensPerSec` is the number of completed output tokens during a trainer
-segment divided by that segment's wall-clock duration. It is a system-level
-rollout rate, not a pure vLLM decode benchmark. TextWorld runs also report the
-following per-segment diagnostics:
-
-| Metric family | Meaning |
+| Metric | Meaning |
 | --- | --- |
-| `Infer/RequestsPerSec`, `Infer/RequestCount` | Logical request supply rate and count. |
-| `Infer/OutputTokensPerRequest` | Mean completed output length. |
-| `Infer/PromptTokensMean\|P50\|P95` | Logical-request prompt-length distribution. |
-| `Infer/RequestLatencyMsMean\|P50\|P95` | End-to-end logical-request latency, including resubmits. |
-| `Infer/TTFTMsMean\|P95` | Engine-attempt time to first generated token. |
-| `Sync/RetryScheduledToFirstTokenMsMean\|Count` | From vLLM scheduling to first token for explicit sync retries; a prefill/KV-materialization plus first-decode proxy, not pure KV-cache write time. |
-| `Sync/RetryRecomputedTokensMean\|Count` | Retry prompt tokens minus the top-level `RequestOutput.num_cached_tokens`; invalid cache counts are skipped. |
-| `Sync/RetryQueueMsMean\|Count` | Time from vLLM queueing to scheduling for explicit sync retries. |
-| `Infer/TPOTMsMean\|P95` | Time per output token for successful attempts with at least two tokens. |
-| `Infer/ActiveRequestsMean\|Max`, `Infer/ActiveAttemptsMean\|Max` | Time-weighted logical-request and engine-attempt concurrency. |
-| `Infer/AttemptsPerRequest`, `Infer/SyncInterruptedAttemptRate`, `Infer/ResubmittedRequestRate`, `Infer/PauseActiveAttempts` | Weight-sync interruption and retry pressure; the interruption rate is measured across attempts active when the following sync pause begins. |
-| `Infer/StopRate\|LengthRate\|AbortRate` | Final logical-request stop-reason fractions. |
-| `Rollout/EpisodesPerSec`, `Rollout/InferenceWaitFraction` | Episode production and fraction of aggregate worker time waiting for inference. |
-| `Rollout/EnvStepMsMean\|P95`, `Rollout/PostprocessMsMean\|P95` | TextWorld environment and decode/parse/history-update CPU costs. |
-| `Rollout/HistoryLimitRate` | Fraction of completed episodes stopped by the history-token limit. |
+| `Train/ValueLoss` | Trajectory-equal Value loss used by PPO optimization. |
+| `Value/PredictionMean` | Mean Value-head prediction over valid response tokens. |
+| `Value/ReturnMean` | Mean detached TD(λ) target over valid response tokens. |
+| `Value/ExplainedVariance` | Fraction of return variance explained by Value predictions. |
+| `PPO/BootstrapFraction` | Fraction of PPO boundaries that bootstrap rather than terminate. |
+| `PPO/RawAdvantageStd` | Standard deviation of raw token advantages before normalization. |
 
-Use the metrics together to classify a throughput drop:
-
-| Observation | Likely bottleneck |
-| --- | --- |
-| Requests/sec falls while request latency is stable | Rollout or environment request supply. |
-| Output tokens/request falls proportionally with tokens/sec | Shorter model outputs rather than slower inference. |
-| Prompt P95 and TTFT rise while TPOT stays stable | Longer-context prefill. |
-| TPOT rises at stable prompt lengths and concurrency | Decode throughput. |
-| Active requests fall while rollout CPU timings rise | Environment, parsing, or tokenization. |
-| Interrupted-attempt and resubmitted-request rates rise | Weight-sync interruption overhead. |
-| Retry recomputed tokens and scheduled-to-first-token time rise while retry queue time stays low | Sync-triggered prefill/KV reconstruction is a likely recovery bottleneck. |
-| Retry queue time dominates scheduled-to-first-token time | Concurrent retry scheduler backlog is a more likely recovery bottleneck. |
-| Request latency rises while TTFT and TPOT stay stable | Queueing or scheduling delay. |
-
-`Infer/DiagnosticsDroppedSamples` and
-`Rollout/DiagnosticsDroppedSamples` should remain zero. A non-zero value means
-that a segment exceeded the bounded 20,000-sample percentile buffer; counts,
-sums, means, and maxima remain exact, but percentiles cover only retained
-samples.
+`Infer/TokensPerSec` is a system-level rollout rate rather than a pure vLLM
+decode benchmark. Interpret it together with `Rollout/EpisodesPerSec` and
+`Rollout/InferenceWaitFraction`: low inference throughput with a high wait
+fraction points to inference, while low episode throughput with a low wait
+fraction points to environment or rollout-side work. Rising
+`Sync/ElapsedSeconds`, `Infer/LengthRate`, or `Rollout/HistoryLimitRate` isolates
+weight-sync, generation-limit, and context-window pressure respectively.
 
 ## Troubleshooting
 

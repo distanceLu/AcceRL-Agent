@@ -221,7 +221,7 @@ Success criteria:
 - All 3 FSDP ranks and the vLLM actor initialize on separate GPUs.
 - Rollout workers keep producing samples and each replay shard reaches its
   minimum size.
-- `Train/PackTokenUtilization` and `Train/PackSampleCount` become non-zero.
+- `Train/PackTokenUtilization` becomes non-zero.
 - The trainer completes optimizer steps and vLLM receives weight updates.
 - TensorBoard event files appear under `runs/TextWorld_FSDP/<timestamp>`.
 
@@ -250,11 +250,9 @@ Watch these metrics first:
 | `TextWorld/InvalidActionRate` | Checks whether the model/parser produces valid commands. |
 | `Replay/FillRatio` | Checks whether rollout keeps the trainer fed. |
 | `Replay/TrainSampleTrainerVersionLagMean` | Checks whether training samples are too stale. |
-| `Train/LossMeanAcrossRanks` | Checks training stability. |
+| `Train/PolicyLoss` | Checks policy-optimization stability. |
 | `Train/PackTokenUtilization` | Checks how much of the packed token budget is used. |
-| `Train/PackSampleCount` | Shows how many independent samples were packed. |
-| `Train/PackCpuMilliseconds` | Checks whether CPU packing is a bottleneck. |
-| `KL/OldNewK3TokenMean` | Checks whether policy updates are too large. |
+| `KL/OldNewK3TrajectoryMean` | Checks whether policy updates are too large. |
 | `Infer/TokensPerSec` | Checks vLLM throughput. |
 | `Sync/ElapsedSeconds` | Checks whether weight sync is a bottleneck. |
 
@@ -281,10 +279,11 @@ Periodic saving:
 Periodic and final saves both overwrite `latest`, so only the newest model is
 retained.
 
-The current checkpoint contains policy weights, config, tokenizer files,
-`trainer_state.json`, and Value Head weights under `critic/`. It does not
-include optimizer state or the replay buffer, so it can restore model
-parameters but is not a full training-resume checkpoint.
+The current checkpoint contains policy weights, config, tokenizer files, and
+`trainer_state.json`. PPO checkpoints additionally contain Value Head weights
+under `critic/`; GRPO checkpoints do not create a critic. Checkpoints do not
+include optimizer state or the replay buffer, so they can restore model
+parameters but are not full training-resume checkpoints.
 
 ## 8. Change Models
 

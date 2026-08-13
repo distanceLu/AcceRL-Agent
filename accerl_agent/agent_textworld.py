@@ -49,12 +49,6 @@ from vllm.distributed.weight_transfer.nccl_engine import (
 )
 from vllm.v1.executor import Executor
 
-from accerl_agent.interval_diagnostics import (
-    IntervalDiagnostics,
-    TimeWeightedGauge,
-    distribution_scalar,
-    merge_interval_snapshots,
-)
 from accerl_agent.ppo_value import (
     TokenValueHead,
     load_value_head_checkpoint,
@@ -175,7 +169,6 @@ class PreparedVarlenPack:
     max_seqlen: int
     version_lag_sum: float
     sample_count: int
-    cpu_milliseconds: float
     valid_trajectory_count: int = 0
 
 
@@ -268,13 +261,11 @@ class PPOReductionStats(PackedTensorStats):
     policy_trajectory_sum: torch.Tensor
     value_loss_trajectory_sum: torch.Tensor
     kl_trajectory_sum: torch.Tensor
-    policy_token_sum: torch.Tensor
     value_loss_token_sum: torch.Tensor
     kl_token_sum: torch.Tensor
     valid_trajectory_count: torch.Tensor
     clip_count: torch.Tensor
     value_sum: torch.Tensor
-    value_sq_sum: torch.Tensor
     return_sum: torch.Tensor
     return_sq_sum: torch.Tensor
     raw_advantage_sum: torch.Tensor
@@ -363,7 +354,6 @@ def make_grpo_varlen_batch(
     input_ids = []
     labels = []
     old_logprobs = []
-    output_versions = []
     position_ids = []
     sequence_ids = []
     cu_seqlens = [0]
@@ -378,7 +368,6 @@ def make_grpo_varlen_batch(
         input_ids.extend(example.input_ids)
         labels.extend(example.labels)
         old_logprobs.extend(example.old_logprobs)
-        output_versions.extend(example.output_versions)
         position_ids.extend(range(length))
         sequence_ids.extend([sequence_id] * length)
         cu_seqlens.append(cu_seqlens[-1] + length)
@@ -409,7 +398,6 @@ def make_grpo_varlen_batch(
         "sample_advantages": torch.tensor(
             [example.advantage for example in examples], dtype=torch.float32
         ),
-        "output_versions": torch.tensor(output_versions, dtype=torch.long),
         "sequence_ids": torch.tensor(sequence_ids, dtype=torch.long),
         "target_indices": torch.tensor(target_indices, dtype=torch.long),
     }
@@ -430,7 +418,6 @@ def make_ppo_varlen_batch(
     token_rewards: List[float] = []
     token_terminated: List[bool] = []
     token_truncated: List[bool] = []
-    output_versions: List[int] = []
     position_ids: List[int] = []
     sequence_ids: List[int] = []
     cu_seqlens = [0]
@@ -447,7 +434,6 @@ def make_ppo_varlen_batch(
         token_rewards.extend(example.token_rewards)
         token_terminated.extend(example.token_terminated)
         token_truncated.extend(example.token_truncated)
-        output_versions.extend(example.output_versions)
         position_ids.extend(range(length))
         sequence_ids.extend([sequence_id] * length)
         cu_seqlens.append(sequence_start + length)
@@ -517,7 +503,6 @@ def make_ppo_varlen_batch(
         "token_rewards": torch.tensor(token_rewards, dtype=torch.float32),
         "token_terminated": torch.tensor(token_terminated, dtype=torch.bool),
         "token_truncated": torch.tensor(token_truncated, dtype=torch.bool),
-        "output_versions": torch.tensor(output_versions, dtype=torch.long),
         "target_indices": torch.tensor(target_indices, dtype=torch.long),
         "response_sample_indices": torch.tensor(
             response_sample_indices,
@@ -675,6 +660,28 @@ def build_model(args: argparse.Namespace, device, torch_dtype, log: bool = True)
         model.gradient_checkpointing_enable()
 
     return model
+
+
+def build_value_head(
+    args: argparse.Namespace,
+    model,
+    device,
+) -> Tuple[TokenValueHead | None, bool]:
+    """Build and optionally restore the PPO-only Value Head."""
+    if args.rl_algorithm != "ppo":
+        return None, False
+
+    hidden_size = getattr(model.config, "hidden_size", None)
+    if not isinstance(hidden_size, int) or hidden_size < 1:
+        raise ValueError(
+            "The policy model config must define a positive integer "
+            f"hidden_size; got {hidden_size!r}."
+        )
+    value_head = TokenValueHead(hidden_size=hidden_size, bias=True).to(
+        device=device
+    )
+    loaded = load_value_head_checkpoint(value_head, args.model_path)
+    return value_head, loaded
 
 
 def validate_ppo_selected_forward_support(model, args) -> None:
@@ -904,23 +911,18 @@ class FSDPTrainWorker:
         configure_trainable_parameters(model, args.train_mode)
         log_parameter_count(model, args.train_mode, rank=rank)
 
-        hidden_size = getattr(model.config, "hidden_size", None)
-        if not isinstance(hidden_size, int) or hidden_size < 1:
-            raise ValueError(
-                "The policy model config must define a positive integer "
-                f"hidden_size; got {hidden_size!r}."
-            )
-        value_head = TokenValueHead(hidden_size=hidden_size, bias=True).to(
-            device=self.device
+        value_head, value_head_loaded = build_value_head(
+            args,
+            model,
+            self.device,
         )
-        value_head_param_names = [
-            name for name, _ in value_head.named_parameters()
-        ]
-        self.value_head_loaded = load_value_head_checkpoint(
-            value_head,
-            args.model_path,
+        self.value_head_loaded = value_head_loaded
+        value_head_param_names = (
+            [name for name, _ in value_head.named_parameters()]
+            if value_head is not None
+            else []
         )
-        if rank == 0:
+        if rank == 0 and value_head is not None:
             policy_total, policy_trainable = count_parameters(model)
             value_total, value_trainable = count_parameters(value_head)
             print(
@@ -930,7 +932,7 @@ class FSDPTrainWorker:
                 f"value_head_total={value_total:,} "
                 f"value_head_trainable={value_trainable:,} "
                 f"total_trainable={policy_trainable + value_trainable:,} "
-                f"value_head_loaded={self.value_head_loaded}"
+                f"value_head_loaded={value_head_loaded}"
             )
 
         # vLLM metadata must remain policy-only. Keep this list rooted at the
@@ -955,14 +957,18 @@ class FSDPTrainWorker:
 
         for layer in model.model.layers:
             fully_shard(layer)
-        fully_shard(value_head)
+        if value_head is not None:
+            fully_shard(value_head)
         fully_shard(model)
 
         self.model = model
         self.value_head = value_head
+        fsdp_roots = [self.model]
+        if self.value_head is not None:
+            fsdp_roots.append(self.value_head)
         fsdp_modules = [
             module
-            for root in (self.model, self.value_head)
+            for root in fsdp_roots
             for module in root.modules()
             if hasattr(module, "set_gradient_divide_factor")
         ]
@@ -991,11 +997,16 @@ class FSDPTrainWorker:
                 for name in trainable_param_names
             ],
         }
-        sharded_value_params_by_name = dict(self.value_head.named_parameters())
-        self.value_head_params = [
-            (name, sharded_value_params_by_name[name])
-            for name in value_head_param_names
-        ]
+        if self.value_head is not None:
+            sharded_value_params_by_name = dict(
+                self.value_head.named_parameters()
+            )
+            self.value_head_params = [
+                (name, sharded_value_params_by_name[name])
+                for name in value_head_param_names
+            ]
+        else:
+            self.value_head_params = []
         self.policy_trainable_parameters = list(
             iter_trainable_parameters(self.model)
         )
@@ -1004,25 +1015,29 @@ class FSDPTrainWorker:
         ]
         if not self.policy_trainable_parameters:
             raise RuntimeError(f"No trainable parameters found for mode: {args.train_mode}")
-        if not self.value_head_parameters:
+        if self.value_head is not None and not self.value_head_parameters:
             raise RuntimeError("Value Head has no trainable parameters.")
         self.trainable_parameter_list = (
             self.policy_trainable_parameters + self.value_head_parameters
         )
 
-        self.optimizer = torch.optim.AdamW(
-            [
-                {
-                    "params": self.policy_trainable_parameters,
-                    "lr": args.learning_rate,
-                    "group_name": "policy",
-                },
+        optimizer_groups = [
+            {
+                "params": self.policy_trainable_parameters,
+                "lr": args.learning_rate,
+                "group_name": "policy",
+            }
+        ]
+        if self.value_head_parameters:
+            optimizer_groups.append(
                 {
                     "params": self.value_head_parameters,
                     "lr": args.learning_rate,
                     "group_name": "value_head",
-                },
-            ],
+                }
+            )
+        self.optimizer = torch.optim.AdamW(
+            optimizer_groups,
             weight_decay=args.weight_decay,
         )
         self.optimizer.zero_grad(set_to_none=True)
@@ -1308,15 +1323,11 @@ class FSDPTrainWorker:
                 )
             time.sleep(self.args.replay_wait_sleep_seconds)
 
-        pack_start_time = time.perf_counter()
         collected = self._select_varlen_pack()
         batch = self._collate_prepared_rl_samples(
             collected,
             move_to_device=False,
         )
-        cpu_milliseconds = (
-            time.perf_counter() - pack_start_time
-        ) * 1000.0
         total_token_count = int(batch["input_ids"].numel())
         if total_token_count <= 0:
             raise RuntimeError("A Varlen pack must contain at least one token.")
@@ -1355,7 +1366,6 @@ class FSDPTrainWorker:
             max_seqlen=max_seqlen,
             version_lag_sum=version_lag_sum,
             sample_count=sample_count,
-            cpu_milliseconds=cpu_milliseconds,
             valid_trajectory_count=valid_trajectory_count,
         )
 
@@ -1497,6 +1507,8 @@ class FSDPTrainWorker:
         *,
         max_seqlen: int,
     ) -> PPOFlatTokenView:
+        if self.value_head is None:
+            raise RuntimeError("PPO forward requires an initialized Value Head.")
         target_indices = batch["target_indices"]
         response_sample_indices = batch["response_sample_indices"]
         response_columns = batch["response_selected_columns"]
@@ -1896,7 +1908,7 @@ class FSDPTrainWorker:
         sample_count = int(view.response_counts.numel())
         (
             policy_trajectory_sum,
-            policy_token_sum,
+            _,
             valid_trajectory_count,
         ) = sum_token_values_by_trajectory(
             -valid_objective.float(),
@@ -1934,13 +1946,11 @@ class FSDPTrainWorker:
                 policy_trajectory_sum=policy_trajectory_sum,
                 value_loss_trajectory_sum=value_loss_trajectory_sum,
                 kl_trajectory_sum=kl_trajectory_sum,
-                policy_token_sum=policy_token_sum,
                 value_loss_token_sum=value_loss_token_sum,
                 kl_token_sum=kl_token_sum,
                 valid_trajectory_count=valid_trajectory_count,
                 clip_count=clipped_mask.sum(),
                 value_sum=values_detached.sum(),
-                value_sq_sum=values_detached.square().sum(),
                 return_sum=returns_float.sum(),
                 return_sq_sum=returns_float.square().sum(),
                 raw_advantage_sum=raw_advantages64.sum(),
@@ -2059,6 +2069,8 @@ class FSDPTrainWorker:
         self._validate_ppo_boundary_layout(view)
 
     def _snapshot_ppo_forward_buffers(self) -> Dict[str, torch.Tensor]:
+        if self.value_head is None:
+            raise RuntimeError("PPO forward requires an initialized Value Head.")
         snapshots = {}
         for root_name, root in (
             ("model", self.model),
@@ -2072,6 +2084,8 @@ class FSDPTrainWorker:
         self,
         snapshots: Dict[str, torch.Tensor],
     ) -> None:
+        if self.value_head is None:
+            raise RuntimeError("PPO forward requires an initialized Value Head.")
         current = {
             f"{root_name}.{name}": buffer
             for root_name, root in (
@@ -2106,10 +2120,8 @@ class FSDPTrainWorker:
         List[FrozenPPOTargets],
         torch.Tensor,
         torch.Tensor,
-        float,
     ]:
         """Freeze one optimizer window and compute its cross-rank moments."""
-        start_time = time.perf_counter()
         local_moments = torch.zeros(
             3,
             device=self.device,
@@ -2183,12 +2195,10 @@ class FSDPTrainWorker:
                 expected_count=global_valid_token_count,
             )
         )
-        elapsed_milliseconds = (time.perf_counter() - start_time) * 1000.0
         return (
             frozen_targets,
             advantage_mean,
             advantage_std,
-            elapsed_milliseconds,
         )
 
     def _prepare_varlen_optimizer_window(
@@ -2236,36 +2246,16 @@ class FSDPTrainWorker:
         self,
         window: List[PreparedVarlenPack],
     ) -> Dict[str, float]:
-        """Aggregate pack-shape and CPU-construction statistics across ranks."""
-        pack_sums = torch.tensor(
-            [
-                sum(pack.total_token_count for pack in window),
-                len(window),
-                sum(pack.sample_count for pack in window),
-                sum(pack.cpu_milliseconds for pack in window),
-            ],
+        """Aggregate the token count needed for pack utilization."""
+        global_token_count = torch.tensor(
+            sum(pack.total_token_count for pack in window),
             device=self.device,
             dtype=torch.float64,
         )
-        max_seqlen = torch.tensor(
-            max((pack.max_seqlen for pack in window), default=0),
-            device=self.device,
-            dtype=torch.int64,
-        )
-        dist.all_reduce(pack_sums, op=dist.ReduceOp.SUM)
-        dist.all_reduce(max_seqlen, op=dist.ReduceOp.MAX)
-        (
-            global_token_count,
-            global_pack_count,
-            global_sample_count,
-            global_cpu_milliseconds,
-        ) = pack_sums.tolist()
+        dist.all_reduce(global_token_count, op=dist.ReduceOp.SUM)
         return {
-            "global_pack_token_count": global_token_count,
-            "global_pack_count": global_pack_count,
-            "global_pack_sample_count": global_sample_count,
-            "global_pack_cpu_milliseconds": global_cpu_milliseconds,
-            "global_pack_max_seqlen": float(max_seqlen.item()),
+            "global_pack_token_count": float(global_token_count.item()),
+            "global_pack_count": float(len(window) * self.fsdp_world_size),
         }
 
     def _run_ppo_optimizer_step(
@@ -2320,7 +2310,6 @@ class FSDPTrainWorker:
             or (ema_mode and not ema_initialized)
         )
         ema_scale = None
-        ema_scale_clamped = False
         if ema_mode and ema_initialized:
             assert ema_mean is not None
             assert ema_variance is not None
@@ -2338,20 +2327,15 @@ class FSDPTrainWorker:
                 raw_ema_scale,
                 self.args.ppo_advantage_min_scale,
             )
-            ema_scale_clamped = (
-                raw_ema_scale < self.args.ppo_advantage_min_scale
-            )
 
         frozen_window = None
         advantage_mean = None
         advantage_std = None
-        target_prepass_milliseconds = 0.0
         if use_optimizer_window:
             (
                 frozen_window,
                 advantage_mean,
                 advantage_std,
-                target_prepass_milliseconds,
             ) = self._precompute_ppo_optimizer_window_targets(
                 window,
                 global_valid_token_count=global_valid_token_count,
@@ -2529,10 +2513,6 @@ class FSDPTrainWorker:
         kl_trajectory_mean = (
             stats["kl_trajectory_sum"] / trajectory_count
         )
-        policy_loss_token_mean = stats["policy_token_sum"] / token_count
-        value_loss_token_mean = (
-            stats["value_loss_token_sum"] / token_count
-        )
         kl_token_mean = stats["kl_token_sum"] / token_count
         global_version_lag_sum, global_sample_count = (
             local_version_stats.tolist()
@@ -2544,28 +2524,16 @@ class FSDPTrainWorker:
             "global_valid_trajectory_count": trajectory_count,
             "global_version_lag_sum": global_version_lag_sum,
             "global_sample_count": global_sample_count,
-            "policy_loss_mean": policy_loss_mean,
             "value_loss_mean": value_loss_mean,
             "loss_mean": (
                 policy_loss_mean
                 + self.args.value_loss_coef * value_loss_mean
                 + self.args.old_new_kl_coef * kl_trajectory_mean
             ),
-            "policy_loss_token_mean": policy_loss_token_mean,
-            "value_loss_token_mean": value_loss_token_mean,
             "kl_trajectory_mean": kl_trajectory_mean,
             "kl_token_mean": kl_token_mean,
             "clip_fraction": stats["clip_count"] / token_count,
             "current_lr": current_lr,
-            "ppo_target_prepass_milliseconds": target_prepass_milliseconds,
-            "ppo_ema_active": float(ema_mode and ema_initialized),
-            "ppo_ema_mean_used": (
-                float(ema_mean) if ema_mode and ema_initialized else 0.0
-            ),
-            "ppo_ema_scale_used": (
-                float(ema_scale) if ema_scale is not None else 0.0
-            ),
-            "ppo_ema_scale_clamped": float(ema_scale_clamped),
         }
 
     def _run_grpo_optimizer_step(
@@ -2706,7 +2674,6 @@ class FSDPTrainWorker:
                 policy_loss_trajectory_mean
                 + self.args.old_new_kl_coef * kl_trajectory_mean
             ),
-            "policy_loss_mean": policy_loss_trajectory_mean,
             "kl_trajectory_mean": kl_trajectory_mean,
             "kl_token_mean": kl_token_mean,
             "clip_fraction": global_clip_count / token_count,
@@ -2782,7 +2749,6 @@ class FSDPTrainWorker:
             "rank": self.rank,
             "optimizer_steps_run": self.optimizer_step - start_optimizer_step,
             "optimizer_step": self.optimizer_step,
-            "micro_step": self.train_micro_step,
             "reached_max_steps": self.optimizer_step >= self.args.max_steps,
             "segment_valid_tokens": valid_tokens,
             "segment_version_lag_mean": (
@@ -2798,40 +2764,11 @@ class FSDPTrainWorker:
             float(step["global_pack_count"])
             for step in global_steps
         )
-        pack_sample_count = sum(
-            float(step["global_pack_sample_count"])
-            for step in global_steps
-        )
-        pack_cpu_milliseconds = sum(
-            float(step["global_pack_cpu_milliseconds"])
-            for step in global_steps
-        )
         pack_capacity = pack_count * float(self.args.train_token_budget)
-        result.update(
-            {
-                "segment_pack_token_utilization": (
-                    pack_token_count / pack_capacity
-                    if pack_capacity > 0
-                    else 0.0
-                ),
-                "segment_pack_sample_count": (
-                    pack_sample_count / pack_count
-                    if pack_count > 0
-                    else 0.0
-                ),
-                "segment_pack_max_sequence_length": max(
-                    (
-                        float(step["global_pack_max_seqlen"])
-                        for step in global_steps
-                    ),
-                    default=0.0,
-                ),
-                "segment_pack_cpu_milliseconds": (
-                    pack_cpu_milliseconds / pack_count
-                    if pack_count > 0
-                    else 0.0
-                ),
-            }
+        result["segment_pack_token_utilization"] = (
+            pack_token_count / pack_capacity
+            if pack_capacity > 0
+            else 0.0
         )
 
         if self.args.rl_algorithm == "grpo":
@@ -2875,13 +2812,11 @@ class FSDPTrainWorker:
                     ),
                     "segment_policy_loss_mean": policy_mean,
                     "segment_value_loss_mean": 0.0,
-                    "segment_kl_mean": kl_trajectory_mean,
                     "segment_kl_trajectory_mean": kl_trajectory_mean,
                     "segment_kl_token_mean": kl_token_mean,
                     "segment_clip_frac": (
                         clip_metric_sum / token_denominator
                     ),
-                    "segment_valid_trajectories": trajectory_metric_weight,
                 }
             )
             dist.barrier()
@@ -2905,9 +2840,6 @@ class FSDPTrainWorker:
             aggregate_ppo_stats["kl_trajectory_sum"]
             / trajectory_denominator
         )
-        policy_token_mean = (
-            aggregate_ppo_stats["policy_token_sum"] / token_denominator
-        )
         value_loss_token_mean = (
             aggregate_ppo_stats["value_loss_token_sum"]
             / token_denominator
@@ -2928,24 +2860,9 @@ class FSDPTrainWorker:
             )
             return mean, math.sqrt(variance)
 
-        value_mean, value_std = moments("value")
+        value_mean = aggregate_ppo_stats["value_sum"] / token_denominator
         return_mean, return_std = moments("return")
-        raw_advantage_mean, raw_advantage_std = moments("raw_advantage")
-        raw_advantage_rms = math.sqrt(
-            max(
-                aggregate_ppo_stats["raw_advantage_sq_sum"]
-                / token_denominator,
-                0.0,
-            )
-        )
-        last_ema_step = next(
-            (
-                step
-                for step in reversed(global_steps)
-                if float(step["ppo_ema_active"]) > 0.0
-            ),
-            None,
-        )
+        _, raw_advantage_std = moments("raw_advantage")
         residual_mean = return_mean - value_mean
         residual_variance = max(
             2.0 * value_loss_token_mean - residual_mean * residual_mean,
@@ -2970,56 +2887,15 @@ class FSDPTrainWorker:
                 ),
                 "segment_policy_loss_mean": policy_mean,
                 "segment_value_loss_mean": value_loss_mean,
-                "segment_policy_loss_token_mean": policy_token_mean,
-                "segment_value_loss_token_mean": value_loss_token_mean,
-                "segment_kl_mean": kl_trajectory_mean,
                 "segment_kl_trajectory_mean": kl_trajectory_mean,
                 "segment_kl_token_mean": kl_token_mean,
                 "segment_clip_frac": (
                     aggregate_ppo_stats["clip_count"] / token_denominator
                 ),
-                "segment_valid_trajectories": valid_trajectories,
                 "segment_value_prediction_mean": value_mean,
-                "segment_value_prediction_std": value_std,
                 "segment_return_mean": return_mean,
-                "segment_return_std": return_std,
-                "segment_raw_advantage_mean": raw_advantage_mean,
                 "segment_raw_advantage_std": raw_advantage_std,
-                "segment_raw_advantage_rms": raw_advantage_rms,
-                "segment_ppo_ema_mean_used": (
-                    float(last_ema_step["ppo_ema_mean_used"])
-                    if last_ema_step is not None
-                    else 0.0
-                ),
-                "segment_ppo_ema_scale_used": (
-                    float(last_ema_step["ppo_ema_scale_used"])
-                    if last_ema_step is not None
-                    else 0.0
-                ),
-                "segment_ppo_ema_scale_clamped": (
-                    float(last_ema_step["ppo_ema_scale_clamped"])
-                    if last_ema_step is not None
-                    else 0.0
-                ),
-                "segment_ppo_target_prepass_milliseconds": (
-                    sum(
-                        float(step["ppo_target_prepass_milliseconds"])
-                        for step in global_steps
-                    )
-                    / max(len(global_steps), 1)
-                ),
-                "segment_value_mse": (
-                    2.0
-                    * aggregate_ppo_stats["value_loss_token_sum"]
-                    / token_denominator
-                ),
                 "segment_explained_variance": explained_variance,
-                "segment_terminated_token_count": (
-                    aggregate_ppo_stats["terminated_count"]
-                ),
-                "segment_truncated_token_count": (
-                    aggregate_ppo_stats["truncated_count"]
-                ),
                 "segment_bootstrap_fraction": (
                     aggregate_ppo_stats["truncated_count"]
                     / max(boundary_count, 1.0)
@@ -3114,7 +2990,8 @@ class FSDPTrainWorker:
         value_head_state_dict = None
         if self.rank == 0:
             state_dict = {}
-            value_head_state_dict = {}
+            if self.value_head is not None:
+                value_head_state_dict = {}
 
         with torch.no_grad():
             for name, param in self.params_by_scope["all"]:
@@ -3144,19 +3021,12 @@ class FSDPTrainWorker:
         }
         if self.rank == 0:
             assert state_dict is not None
-            assert value_head_state_dict is not None
             self.model.save_pretrained(
                 output_dir,
                 state_dict=state_dict,
                 safe_serialization=True,
             )
             self.tokenizer.save_pretrained(output_dir)
-            value_weights_path, value_config_path = save_value_head_checkpoint(
-                output_dir,
-                value_head_state_dict,
-                hidden_size=self.value_head.hidden_size,
-                bias=self.value_head.bias is not None,
-            )
             trainer_state = {
                 "optimizer_step": self.optimizer_step,
                 "train_micro_step": self.train_micro_step,
@@ -3165,7 +3035,18 @@ class FSDPTrainWorker:
                 "rl_algorithm": self.args.rl_algorithm,
                 "max_steps": self.args.max_steps,
                 "sync_every_optimizer_steps": self.args.sync_every_optimizer_steps,
-                "critic": {
+            }
+            if self.value_head is not None:
+                assert value_head_state_dict is not None
+                value_weights_path, value_config_path = (
+                    save_value_head_checkpoint(
+                        output_dir,
+                        value_head_state_dict,
+                        hidden_size=self.value_head.hidden_size,
+                        bias=self.value_head.bias is not None,
+                    )
+                )
+                trainer_state["critic"] = {
                     "architecture": "TokenValueHead",
                     "hidden_size": self.value_head.hidden_size,
                     "dtype": "float32",
@@ -3177,8 +3058,8 @@ class FSDPTrainWorker:
                         value_config_path,
                         output_dir,
                     ),
-                },
-            }
+                }
+                result["critic_saved"] = True
             state_path = os.path.join(output_dir, "trainer_state.json")
             with open(state_path, "w", encoding="utf-8") as file:
                 json.dump(trainer_state, file, ensure_ascii=False, indent=2, sort_keys=True)
@@ -3186,7 +3067,6 @@ class FSDPTrainWorker:
             del state_dict
             del value_head_state_dict
             result["saved"] = True
-            result["critic_saved"] = True
             print(f"[checkpoint] Saved checkpoint to {output_dir}")
 
         dist.barrier()
@@ -3236,9 +3116,6 @@ class OnlineGenerationState:
     output_logprobs: List[float] = field(default_factory=list)
     output_versions: List[int] = field(default_factory=list)
     stop_reason: Literal["length", "stop", "tool_calls", "abort"] | None = None
-    attempt_count: int = 0
-    sync_interrupted_attempts: int = 0
-    pending_retry_reason: Literal["sync"] | None = None
 
     @property
     def remaining_max_tokens(self) -> int:
@@ -3320,20 +3197,9 @@ class ReplayBufferActor:
         self.rank = int(rank)
         wait_for_selected_ray_actor_debugger("replay", self.rank)
         self.samples = deque(maxlen=capacity)
-        self.total_samples_added = 0
-        self.total_samples_sampled = 0
-        self.total_samples_evicted = 0
 
-    def add_samples(self, samples: List[RLSample]) -> Dict[str, int]:
-        capacity = self.samples.maxlen or 0
-        if capacity > 0:
-            self.total_samples_evicted += max(
-                0,
-                len(self.samples) + len(samples) - capacity,
-            )
+    def add_samples(self, samples: List[RLSample]) -> None:
         self.samples.extend(samples)
-        self.total_samples_added += len(samples)
-        return self.get_stats()
 
     def sample(self, batch_size: int) -> List[RLSample]:
         if batch_size < 1:
@@ -3341,17 +3207,12 @@ class ReplayBufferActor:
         sample_count = min(batch_size, len(self.samples))
         if sample_count == 0:
             return []
-        samples = random.sample(list(self.samples), sample_count)
-        self.total_samples_sampled += len(samples)
-        return samples
+        return random.sample(list(self.samples), sample_count)
 
     def get_stats(self) -> Dict[str, int]:
         return {
             "size": len(self.samples),
             "capacity": self.samples.maxlen or 0,
-            "total_samples_added": self.total_samples_added,
-            "total_samples_sampled": self.total_samples_sampled,
-            "total_samples_evicted": self.total_samples_evicted,
         }
 
 
@@ -3398,55 +3259,6 @@ def _normalize_stop_reason(stop_reason) -> Literal["length", "stop", "tool_calls
     return "abort"
 
 
-def record_sync_retry_probe(
-    diagnostics: IntervalDiagnostics,
-    request_output,
-    *,
-    prompt_tokens: int,
-) -> None:
-    """Record vLLM timing/token proxies for one sync-retried first token."""
-    metrics = getattr(request_output, "metrics", None)
-    try:
-        queued_ts = float(getattr(metrics, "queued_ts"))
-        scheduled_ts = float(getattr(metrics, "scheduled_ts"))
-        first_token_ts = float(getattr(metrics, "first_token_ts"))
-    except (AttributeError, TypeError, ValueError):
-        diagnostics.increment("sync_retry_invalid_timing_metric_count")
-    else:
-        timestamps_valid = (
-            math.isfinite(queued_ts)
-            and math.isfinite(scheduled_ts)
-            and math.isfinite(first_token_ts)
-            and queued_ts > 0.0
-            and queued_ts <= scheduled_ts <= first_token_ts
-        )
-        if timestamps_valid:
-            diagnostics.observe(
-                "sync_retry_scheduled_to_first_token_ms",
-                (first_token_ts - scheduled_ts) * 1000.0,
-            )
-            diagnostics.observe(
-                "sync_retry_queue_ms",
-                (scheduled_ts - queued_ts) * 1000.0,
-            )
-        else:
-            diagnostics.increment("sync_retry_invalid_timing_metric_count")
-
-    cached_tokens = getattr(request_output, "num_cached_tokens", None)
-    cached_tokens_valid = (
-        isinstance(cached_tokens, int)
-        and not isinstance(cached_tokens, bool)
-        and 0 <= cached_tokens <= prompt_tokens
-    )
-    if cached_tokens_valid:
-        diagnostics.observe(
-            "sync_retry_recomputed_tokens",
-            prompt_tokens - cached_tokens,
-        )
-    else:
-        diagnostics.increment("sync_retry_invalid_cached_tokens_metric_count")
-
-
 class InterruptibleGenerationRunner:
     """Run vLLM requests that survive abort-based weight-update pauses."""
 
@@ -3458,9 +3270,6 @@ class InterruptibleGenerationRunner:
         stop_sequences: List[str] | None = None,
         collect_logprobs: bool = False,
         max_resubmit_retries: int = 200,
-        diagnostics: IntervalDiagnostics | None = None,
-        active_attempts_gauge: TimeWeightedGauge | None = None,
-        clock=time.perf_counter,
     ):
         self.engine = engine
         self.temperature = temperature
@@ -3468,14 +3277,10 @@ class InterruptibleGenerationRunner:
         self.stop_sequences = stop_sequences or ["</answer>"]
         self.collect_logprobs = collect_logprobs
         self.max_resubmit_retries = max_resubmit_retries
-        self.diagnostics = diagnostics
-        self.active_attempts_gauge = active_attempts_gauge
-        self.clock = clock
         self.version = 0
         self.resume_event = asyncio.Event()
         self.resume_event.set()
         self._active_attempts = 0
-        self.total_sync_interrupted_attempts = 0
         self._active_changed = asyncio.Condition()
 
     def pause(self) -> None:
@@ -3488,16 +3293,12 @@ class InterruptibleGenerationRunner:
     async def _increment_active_attempts(self) -> None:
         async with self._active_changed:
             self._active_attempts += 1
-            if self.active_attempts_gauge is not None:
-                self.active_attempts_gauge.set(self._active_attempts)
             self._active_changed.notify_all()
 
     # 一个engine.generate() attempt 结束 -1
     async def _decrement_active_attempts(self) -> None:
         async with self._active_changed:
             self._active_attempts -= 1
-            if self.active_attempts_gauge is not None:
-                self.active_attempts_gauge.set(self._active_attempts)
             self._active_changed.notify_all()
 
     # 等待正在跑的 generate attempt 都结束,可能是正常结束，也可能是被abort打断
@@ -3509,10 +3310,6 @@ class InterruptibleGenerationRunner:
         for attempt in range(1, self.max_resubmit_retries + 1):
             # 如果当前正在weight update的attempt还没结束，就等着，不要开始新的generate attempt
             await self.resume_event.wait()
-
-            retry_reason = state.pending_retry_reason
-            state.pending_retry_reason = None
-            is_sync_retry = retry_reason == "sync"
 
             remaining = state.remaining_max_tokens
             if remaining <= 0:
@@ -3535,14 +3332,7 @@ class InterruptibleGenerationRunner:
             )
             final_output = None
             request_finished = False
-            attempt_started_at = self.clock()
-            first_token_at = None
-            first_token_output = None
             attempt_prompt_token_ids = state.restart_prompt_token_ids
-            exception_was_sync_interrupt = False
-            state.attempt_count += 1
-            if self.diagnostics is not None:
-                self.diagnostics.increment("attempt_count")
 
             await self._increment_active_attempts()
             try:
@@ -3553,12 +3343,6 @@ class InterruptibleGenerationRunner:
                     request_id=request_id,
                 ):
                     final_output = request_output
-                    if (
-                        first_token_at is None
-                        and _tokens_from_output(request_output)
-                    ):
-                        first_token_at = self.clock()
-                        first_token_output = request_output
                     request_finished = bool(
                         getattr(request_output, "finished", False)
                     )
@@ -3567,54 +3351,18 @@ class InterruptibleGenerationRunner:
             except Exception:
                 if self.resume_event.is_set():
                     raise
-                exception_was_sync_interrupt = True
                 final_output = None
             finally:
                 await self._decrement_active_attempts()
 
             if final_output is None:
                 state.stop_reason = "abort"
-                if exception_was_sync_interrupt:
-                    state.pending_retry_reason = "sync"
-                    state.sync_interrupted_attempts += 1
-                    self.total_sync_interrupted_attempts += 1
-                    if self.diagnostics is not None:
-                        self.diagnostics.increment(
-                            "sync_interrupted_attempt_count"
-                        )
                 continue
 
             attempt_tokens = _tokens_from_output(final_output)[:remaining]
-            attempt_finished_at = self.clock()
             stop_reason = _normalize_stop_reason(
                 _finish_reason_from_output(final_output)
             )
-            sync_interrupted = (
-                stop_reason == "abort" and not self.resume_event.is_set()
-            )
-            if sync_interrupted:
-                state.pending_retry_reason = "sync"
-                state.sync_interrupted_attempts += 1
-                self.total_sync_interrupted_attempts += 1
-                if self.diagnostics is not None:
-                    self.diagnostics.increment("sync_interrupted_attempt_count")
-            if self.diagnostics is not None and first_token_at is not None:
-                self.diagnostics.observe(
-                    "ttft_ms",
-                    (first_token_at - attempt_started_at) * 1000.0,
-                )
-                if is_sync_retry and first_token_output is not None:
-                    record_sync_retry_probe(
-                        self.diagnostics,
-                        first_token_output,
-                        prompt_tokens=len(attempt_prompt_token_ids),
-                    )
-                if not sync_interrupted and len(attempt_tokens) >= 2:
-                    decode_elapsed = attempt_finished_at - first_token_at
-                    self.diagnostics.observe(
-                        "tpot_ms",
-                        decode_elapsed * 1000.0 / (len(attempt_tokens) - 1),
-                    )
             if attempt_tokens:
                 attempt_logprobs = []
                 if self.collect_logprobs:
@@ -3678,20 +3426,18 @@ class VLLMInferenceActor:
             load_format="dummy",
         )
         self.engine = create_async_engine(**engine_kwargs)
-        self.diagnostics = IntervalDiagnostics()
-        self.active_requests_gauge = TimeWeightedGauge()
-        self.active_attempts_gauge = TimeWeightedGauge()
         self.runner = InterruptibleGenerationRunner(
             self.engine,
             temperature=args.infer_temperature,
             top_p=args.infer_top_p,
             stop_sequences=["\n"],
             collect_logprobs=True,
-            diagnostics=self.diagnostics,
-            active_attempts_gauge=self.active_attempts_gauge,
         )
         self.active_generation_tasks = set()
         self.total_tokens = 0
+        self.interval_request_count = 0
+        self.interval_length_count = 0
+        self.interval_started_at = time.perf_counter()
         self.next_request_index = 0
         self.stopped = False
 
@@ -3715,8 +3461,6 @@ class VLLMInferenceActor:
         self,
         state: OnlineGenerationState,
     ) -> InferenceResult:
-        request_started_at = time.perf_counter()
-        self.active_requests_gauge.increment()
         generation_task = asyncio.create_task(self.runner.generate(state))
         self.active_generation_tasks.add(generation_task)
         generation_task.add_done_callback(self.active_generation_tasks.discard)
@@ -3727,8 +3471,6 @@ class VLLMInferenceActor:
                 generation_task.cancel()
             await asyncio.gather(generation_task, return_exceptions=True)
             raise
-        finally:
-            self.active_requests_gauge.increment(-1.0)
 
         result = InferenceResult(
             output_tokens=list(completed_state.output_tokens),
@@ -3736,50 +3478,32 @@ class VLLMInferenceActor:
             output_versions=list(completed_state.output_versions),
             stop_reason=completed_state.stop_reason,
         )
-        request_latency_ms = (time.perf_counter() - request_started_at) * 1000.0
-        self.diagnostics.increment("request_count")
-        self.diagnostics.increment("output_token_count", len(result.output_tokens))
-        self.diagnostics.observe("prompt_tokens", len(state.input_ids))
-        self.diagnostics.observe("output_tokens_per_request", len(result.output_tokens))
-        self.diagnostics.observe("request_latency_ms", request_latency_ms)
-        self.diagnostics.observe("attempts_per_request", state.attempt_count)
-        if state.attempt_count > 1:
-            self.diagnostics.increment("resubmitted_request_count")
-        stop_reason = result.stop_reason or "abort"
-        if stop_reason == "tool_calls":
-            stop_reason = "stop"
-        self.diagnostics.increment(f"stop_reason_{stop_reason}_count")
         self.total_tokens += len(result.output_tokens)
+        self.interval_request_count += 1
+        self.interval_length_count += result.stop_reason == "length"
         return result
 
     def begin_diagnostics_interval(self) -> Dict[str, int]:
-        self.diagnostics.reset()
-        self.active_requests_gauge.reset_interval()
-        self.active_attempts_gauge.reset_interval()
+        self.interval_request_count = 0
+        self.interval_length_count = 0
+        self.interval_started_at = time.perf_counter()
         return {"total_tokens": self.total_tokens}
 
     def end_diagnostics_interval(self) -> Dict[str, object]:
-        result = self.diagnostics.snapshot_and_reset()
-        result["gauges"] = {
-            "active_requests": self.active_requests_gauge.snapshot(),
-            "active_attempts": self.active_attempts_gauge.snapshot(),
+        return {
+            "request_count": self.interval_request_count,
+            "length_count": self.interval_length_count,
+            "total_tokens": self.total_tokens,
+            "elapsed_seconds": max(
+                0.0,
+                time.perf_counter() - self.interval_started_at,
+            ),
         }
-        result["total_tokens"] = self.total_tokens
-        return result
 
-    async def pause_and_wait_idle(self):
-        active_attempts_before_pause = self.runner._active_attempts
-        interrupted_before_pause = self.runner.total_sync_interrupted_attempts
+    async def pause_and_wait_idle(self) -> None:
         self.runner.pause()
         await self.engine.pause_generation(mode="abort", clear_cache=True)
         await self.runner.wait_for_idle()
-        return {
-            "active_attempts": active_attempts_before_pause,
-            "interrupted_attempts": (
-                self.runner.total_sync_interrupted_attempts
-                - interrupted_before_pause
-            ),
-        }
 
     async def resume_generation(self, increment_version: bool = False):
         if increment_version:
@@ -4080,8 +3804,8 @@ class TextWorldRolloutWorkerActor:
         self.tokenizer = build_tokenizer(args, log=False)
         self.game_files = load_textworld_game_files(args)
         self.stopped = False
-        self.diagnostics = IntervalDiagnostics()
-        self.diagnostics_interval_started_at = time.perf_counter()
+        self.inference_wait_started_at = None
+        self.begin_diagnostics_interval()
         if self._log_detail:
             print(
                 "[tw-rollout] "
@@ -4098,16 +3822,31 @@ class TextWorldRolloutWorkerActor:
         self.stopped = True
 
     def begin_diagnostics_interval(self) -> None:
-        self.diagnostics.reset()
-        self.diagnostics_interval_started_at = time.perf_counter()
+        now = time.perf_counter()
+        self.interval_episode_count = 0
+        self.interval_inference_wait_seconds = 0.0
+        self.interval_history_limit_count = 0
+        self.interval_environment_steps_sum = 0
+        if self.inference_wait_started_at is not None:
+            self.inference_wait_started_at = now
+        self.interval_started_at = now
 
     def end_diagnostics_interval(self) -> Dict[str, object]:
-        result = self.diagnostics.snapshot_and_reset()
-        result["counters"]["interval_elapsed_seconds"] = max(
-            0.0,
-            time.perf_counter() - self.diagnostics_interval_started_at,
-        )
-        return result
+        now = time.perf_counter()
+        inference_wait_seconds = self.interval_inference_wait_seconds
+        if self.inference_wait_started_at is not None:
+            inference_wait_seconds += now - self.inference_wait_started_at
+            self.inference_wait_started_at = now
+        return {
+            "episode_count": self.interval_episode_count,
+            "inference_wait_seconds": inference_wait_seconds,
+            "history_limit_count": self.interval_history_limit_count,
+            "environment_steps_sum": self.interval_environment_steps_sum,
+            "elapsed_seconds": max(
+                0.0,
+                now - self.interval_started_at,
+            ),
+        }
 
     def _compute_step_reward(
         self,
@@ -4144,8 +3883,6 @@ class TextWorldRolloutWorkerActor:
         pending: TextWorldPendingRequest,
         result: InferenceResult,
     ) -> None:
-        postprocess_started_at = time.perf_counter()
-        env_step_seconds = 0.0
         state = pending.state
         admissible_commands = state.infos.get("admissible_commands", []) or []
         raw_text = self.tokenizer.decode(
@@ -4161,11 +3898,8 @@ class TextWorldRolloutWorkerActor:
         state.transcript_ids.extend(result.output_tokens)
         if parsed_action.action is not None:
             selected_action = parsed_action.action
-            env_step_started_at = time.perf_counter()
             obs, step_score, done, infos = state.env.step(selected_action)
             state.environment_steps += 1
-            env_step_seconds = time.perf_counter() - env_step_started_at
-            self.diagnostics.observe("env_step_ms", env_step_seconds * 1000.0)
             state.obs = obs
             state.infos = dict(infos)
             state.latest_score = _textworld_score(step_score, infos)
@@ -4218,11 +3952,6 @@ class TextWorldRolloutWorkerActor:
                 reward=reward,
             )
         )
-        postprocess_seconds = time.perf_counter() - postprocess_started_at
-        self.diagnostics.observe(
-            "postprocess_ms",
-            max(0.0, postprocess_seconds - env_step_seconds) * 1000.0,
-        )
 
     async def _run_textworld_step_batch(
         self,
@@ -4274,12 +4003,15 @@ class TextWorldRolloutWorkerActor:
         if not request_refs:
             return len(active_states)
 
-        inference_wait_started_at = time.perf_counter()
-        generation_results = await asyncio.gather(*request_refs)
-        self.diagnostics.increment(
-            "inference_wait_seconds",
-            time.perf_counter() - inference_wait_started_at,
-        )
+        self.inference_wait_started_at = time.perf_counter()
+        try:
+            generation_results = await asyncio.gather(*request_refs)
+        finally:
+            if self.inference_wait_started_at is not None:
+                self.interval_inference_wait_seconds += (
+                    time.perf_counter() - self.inference_wait_started_at
+                )
+                self.inference_wait_started_at = None
         for pending_request, result in zip(pending, generation_results):
             self._apply_textworld_action_result(
                 pending_request,
@@ -4530,24 +4262,11 @@ class TextWorldRolloutWorkerActor:
 
             max_score = _textworld_max_score(states[0].infos) if states else 0.0
             for state in states:
-                self.diagnostics.increment("episode_count")
-                termination_reason = state.termination_reason
-                if termination_reason is not None:
-                    self.diagnostics.increment(
-                        f"termination_reason_{termination_reason}_count"
-                    )
-                else:
-                    self.diagnostics.increment(
-                        "termination_reason_missing_count"
-                    )
-                self.diagnostics.observe(
-                    "episode_action_attempts",
-                    len(state.step_records),
+                self.interval_episode_count += 1
+                self.interval_history_limit_count += (
+                    state.termination_reason == "history_limit"
                 )
-                self.diagnostics.observe(
-                    "episode_environment_steps",
-                    state.environment_steps,
-                )
+                self.interval_environment_steps_sum += state.environment_steps
                 self.stats_actor.add_textworld_episode.remote(
                     self.worker_id,
                     state.latest_score,
@@ -4924,7 +4643,6 @@ async def run_textworld_train(args: argparse.Namespace):
             infer_stats_start = ray.get(
                 infer_actor.begin_diagnostics_interval.remote()
             )
-            infer_t0 = time.perf_counter()
             train_segment_start_time = time.perf_counter()
             train_handles = [
                 worker.train_until_next_sync.remote(
@@ -4937,17 +4655,14 @@ async def run_textworld_train(args: argparse.Namespace):
             )
             summaries = await train_future
             train_segment_elapsed = time.perf_counter() - train_segment_start_time
-            infer_elapsed = time.perf_counter() - infer_t0
             infer_diagnostics = ray.get(
                 infer_actor.end_diagnostics_interval.remote()
             )
-            infer_stats_end = infer_diagnostics
-            rollout_diagnostics = merge_interval_snapshots(
-                ray.get([
-                    worker.end_diagnostics_interval.remote()
-                    for worker in rollout_workers
-                ])
-            )
+            infer_elapsed = float(infer_diagnostics["elapsed_seconds"])
+            rollout_intervals = ray.get([
+                worker.end_diagnostics_interval.remote()
+                for worker in rollout_workers
+            ])
             check_rollout_workers()
             rank0_summary = next(item for item in summaries if item["rank"] == 0)
             training_reached_max = bool(rank0_summary["reached_max_steps"])
@@ -4957,26 +4672,30 @@ async def run_textworld_train(args: argparse.Namespace):
                 break
 
             infer_delta_tokens = (
-                infer_stats_end["total_tokens"] - infer_stats_start["total_tokens"]
+                infer_diagnostics["total_tokens"]
+                - infer_stats_start["total_tokens"]
             )
             infer_tokens_per_sec = infer_delta_tokens / max(infer_elapsed, 1e-9)
-            infer_counters = infer_diagnostics["counters"]
-            infer_gauges = infer_diagnostics["gauges"]
-            infer_request_count = float(infer_counters.get("request_count", 0.0))
-            rollout_counters = rollout_diagnostics["counters"]
-            rollout_episode_count = float(
-                rollout_counters.get("episode_count", 0.0)
+            infer_request_count = float(infer_diagnostics["request_count"])
+            rollout_episode_count = sum(
+                float(interval["episode_count"])
+                for interval in rollout_intervals
             )
-            rollout_total_worker_seconds = float(
-                rollout_counters.get("interval_elapsed_seconds", 0.0)
+            rollout_total_worker_seconds = sum(
+                float(interval["elapsed_seconds"])
+                for interval in rollout_intervals
             )
-            infer_dropped_samples = sum(
-                int(distribution.get("dropped", 0))
-                for distribution in infer_diagnostics["distributions"].values()
+            rollout_inference_wait_seconds = sum(
+                float(interval["inference_wait_seconds"])
+                for interval in rollout_intervals
             )
-            rollout_dropped_samples = sum(
-                int(distribution.get("dropped", 0))
-                for distribution in rollout_diagnostics["distributions"].values()
+            rollout_history_limit_count = sum(
+                float(interval["history_limit_count"])
+                for interval in rollout_intervals
+            )
+            rollout_environment_steps = sum(
+                float(interval["environment_steps_sum"])
+                for interval in rollout_intervals
             )
             replay_stats = ray.get([
                 worker.get_replay_stats.remote()
@@ -4989,90 +4708,24 @@ async def run_textworld_train(args: argparse.Namespace):
                 total_replay_size / total_replay_capacity
                 if total_replay_capacity > 0 else 0.0
             )
-            train_loss_mean = (
-                sum(float(summary["segment_loss_mean"]) for summary in summaries)
-                / len(summaries)
+            train_loss_mean = float(rank0_summary["segment_loss_mean"])
+            policy_loss_mean = float(
+                rank0_summary["segment_policy_loss_mean"]
             )
-            policy_loss_mean = (
-                sum(
-                    float(summary["segment_policy_loss_mean"])
-                    for summary in summaries
-                )
-                / len(summaries)
+            value_loss_mean = float(rank0_summary["segment_value_loss_mean"])
+            kl_token_mean = float(rank0_summary["segment_kl_token_mean"])
+            kl_trajectory_mean = float(
+                rank0_summary["segment_kl_trajectory_mean"]
             )
-            value_loss_mean = (
-                sum(
-                    float(summary["segment_value_loss_mean"])
-                    for summary in summaries
-                )
-                / len(summaries)
-            )
-            kl_token_mean = (
-                sum(
-                    float(summary["segment_kl_token_mean"])
-                    for summary in summaries
-                )
-                / len(summaries)
-            )
-            kl_trajectory_mean = (
-                sum(
-                    float(summary["segment_kl_trajectory_mean"])
-                    for summary in summaries
-                )
-                / len(summaries)
-            )
-            policy_loss_token_mean = None
-            value_loss_token_mean = None
-            if args.rl_algorithm == "ppo":
-                policy_loss_token_mean = (
-                    sum(
-                        float(summary["segment_policy_loss_token_mean"])
-                        for summary in summaries
-                    )
-                    / len(summaries)
-                )
-                value_loss_token_mean = (
-                    sum(
-                        float(summary["segment_value_loss_token_mean"])
-                        for summary in summaries
-                    )
-                    / len(summaries)
-                )
-            clip_fraction = (
-                sum(
-                    float(summary["segment_clip_frac"])
-                    for summary in summaries
-                )
-                / len(summaries)
-            )
-            ppo_target_prepass_milliseconds = (
-                sum(
-                    float(
-                        summary.get(
-                            "segment_ppo_target_prepass_milliseconds",
-                            0.0,
-                        )
-                    )
-                    for summary in summaries
-                )
-                / len(summaries)
-            )
-            version_lag_mean = (
-                sum(
-                    float(summary["segment_version_lag_mean"])
-                    for summary in summaries
-                )
-                / len(summaries)
+            clip_fraction = float(rank0_summary["segment_clip_frac"])
+            version_lag_mean = float(
+                rank0_summary["segment_version_lag_mean"]
             )
             segment_valid_tokens = float(
                 rank0_summary["segment_valid_tokens"]
             )
             train_tokens_per_sec = (
                 segment_valid_tokens
-                / max(train_segment_elapsed, 1e-9)
-            )
-            optimizer_steps_per_sec = (
-                rank0_summary["optimizer_steps_run"]
                 / max(train_segment_elapsed, 1e-9)
             )
             tb_step = rank0_summary["optimizer_step"]
@@ -5103,35 +4756,8 @@ async def run_textworld_train(args: argparse.Namespace):
                 tb_step,
             )
             writer.add_scalar(
-                "Train/TotalLoss",
-                train_loss_mean,
-                tb_step,
-            )
-            writer.add_scalar(
                 "Train/PolicyLoss",
                 policy_loss_mean,
-                tb_step,
-            )
-            writer.add_scalar(
-                "Train/ValueLoss",
-                value_loss_mean,
-                tb_step,
-            )
-            if policy_loss_token_mean is not None:
-                writer.add_scalar(
-                    "Train/PolicyLossTokenMean",
-                    policy_loss_token_mean,
-                    tb_step,
-                )
-            if value_loss_token_mean is not None:
-                writer.add_scalar(
-                    "Train/ValueLossTokenMean",
-                    value_loss_token_mean,
-                    tb_step,
-                )
-            writer.add_scalar(
-                "KL/OldNewK3TokenMean",
-                kl_token_mean,
                 tb_step,
             )
             writer.add_scalar(
@@ -5146,28 +4772,8 @@ async def run_textworld_train(args: argparse.Namespace):
             )
             writer.add_scalar("Train/TokensPerSec", train_tokens_per_sec, tb_step)
             writer.add_scalar(
-                "Train/OptimizerStepsPerSec",
-                optimizer_steps_per_sec,
-                tb_step,
-            )
-            writer.add_scalar(
                 "Train/PackTokenUtilization",
                 rank0_summary["segment_pack_token_utilization"],
-                tb_step,
-            )
-            writer.add_scalar(
-                "Train/PackSampleCount",
-                rank0_summary["segment_pack_sample_count"],
-                tb_step,
-            )
-            writer.add_scalar(
-                "Train/PackMaxSequenceLength",
-                rank0_summary["segment_pack_max_sequence_length"],
-                tb_step,
-            )
-            writer.add_scalar(
-                "Train/PackCpuMilliseconds",
-                rank0_summary["segment_pack_cpu_milliseconds"],
                 tb_step,
             )
             if args.clip_mode == "ppo":
@@ -5178,43 +4784,17 @@ async def run_textworld_train(args: argparse.Namespace):
                 )
             if args.rl_algorithm == "ppo":
                 writer.add_scalar(
-                    "Train/PPOTargetPrepassMilliseconds",
-                    ppo_target_prepass_milliseconds,
+                    "Train/ValueLoss",
+                    value_loss_mean,
                     tb_step,
                 )
                 ppo_metric_tags = {
                     "Value/PredictionMean": "segment_value_prediction_mean",
-                    "Value/PredictionStd": "segment_value_prediction_std",
                     "Value/ReturnMean": "segment_return_mean",
-                    "Value/ReturnStd": "segment_return_std",
-                    "Value/MSE": "segment_value_mse",
                     "Value/ExplainedVariance": "segment_explained_variance",
-                    "PPO/TerminatedTokenCount": (
-                        "segment_terminated_token_count"
-                    ),
-                    "PPO/TruncatedTokenCount": (
-                        "segment_truncated_token_count"
-                    ),
                     "PPO/BootstrapFraction": "segment_bootstrap_fraction",
-                    "PPO/RawAdvantageMean": (
-                        "segment_raw_advantage_mean"
-                    ),
                     "PPO/RawAdvantageStd": "segment_raw_advantage_std",
-                    "PPO/RawAdvantageRMS": "segment_raw_advantage_rms",
                 }
-                if args.ppo_advantage_normalization in (
-                    "ema_rms",
-                    "ema_zscore",
-                ):
-                    ppo_metric_tags.update(
-                        {
-                            "PPO/EMAMeanUsed": "segment_ppo_ema_mean_used",
-                            "PPO/EMAScaleUsed": "segment_ppo_ema_scale_used",
-                            "PPO/EMAScaleClamped": (
-                                "segment_ppo_ema_scale_clamped"
-                            ),
-                        }
-                    )
                 for tag, summary_key in ppo_metric_tags.items():
                     writer.add_scalar(
                         tag,
@@ -5223,208 +4803,32 @@ async def run_textworld_train(args: argparse.Namespace):
                     )
             writer.add_scalar("Infer/TokensPerSec", infer_tokens_per_sec, tb_step)
             infer_metric_values = {
-                "Infer/RequestsPerSec": (
-                    infer_request_count / max(infer_elapsed, 1e-9)
-                ),
-                "Infer/RequestCount": infer_request_count,
-                "Infer/OutputTokensPerRequest": distribution_scalar(
-                    infer_diagnostics, "output_tokens_per_request", "mean"
-                ),
-                "Infer/PromptTokensMean": distribution_scalar(
-                    infer_diagnostics, "prompt_tokens", "mean"
-                ),
-                "Infer/PromptTokensP50": distribution_scalar(
-                    infer_diagnostics, "prompt_tokens", "p50"
-                ),
-                "Infer/PromptTokensP95": distribution_scalar(
-                    infer_diagnostics, "prompt_tokens", "p95"
-                ),
-                "Infer/RequestLatencyMsMean": distribution_scalar(
-                    infer_diagnostics, "request_latency_ms", "mean"
-                ),
-                "Infer/RequestLatencyMsP50": distribution_scalar(
-                    infer_diagnostics, "request_latency_ms", "p50"
-                ),
-                "Infer/RequestLatencyMsP95": distribution_scalar(
-                    infer_diagnostics, "request_latency_ms", "p95"
-                ),
-                "Infer/TTFTMsMean": distribution_scalar(
-                    infer_diagnostics, "ttft_ms", "mean"
-                ),
-                "Infer/TTFTMsP95": distribution_scalar(
-                    infer_diagnostics, "ttft_ms", "p95"
-                ),
-                "Sync/RetryScheduledToFirstTokenMsMean": (
-                    distribution_scalar(
-                        infer_diagnostics,
-                        "sync_retry_scheduled_to_first_token_ms",
-                        "mean",
-                    )
-                ),
-                "Sync/RetryScheduledToFirstTokenMsCount": (
-                    distribution_scalar(
-                        infer_diagnostics,
-                        "sync_retry_scheduled_to_first_token_ms",
-                        "count",
-                    )
-                ),
-                "Sync/RetryRecomputedTokensMean": distribution_scalar(
-                    infer_diagnostics,
-                    "sync_retry_recomputed_tokens",
-                    "mean",
-                ),
-                "Sync/RetryRecomputedTokensCount": distribution_scalar(
-                    infer_diagnostics,
-                    "sync_retry_recomputed_tokens",
-                    "count",
-                ),
-                "Sync/RetryQueueMsMean": distribution_scalar(
-                    infer_diagnostics,
-                    "sync_retry_queue_ms",
-                    "mean",
-                ),
-                "Sync/RetryQueueMsCount": distribution_scalar(
-                    infer_diagnostics,
-                    "sync_retry_queue_ms",
-                    "count",
-                ),
-                "Sync/RetryInvalidTimingMetricCount": float(
-                    infer_counters.get(
-                        "sync_retry_invalid_timing_metric_count",
-                        0.0,
-                    )
-                ),
-                "Sync/RetryInvalidCachedTokensMetricCount": float(
-                    infer_counters.get(
-                        "sync_retry_invalid_cached_tokens_metric_count",
-                        0.0,
-                    )
-                ),
-                "Infer/TPOTMsMean": distribution_scalar(
-                    infer_diagnostics, "tpot_ms", "mean"
-                ),
-                "Infer/TPOTMsP95": distribution_scalar(
-                    infer_diagnostics, "tpot_ms", "p95"
-                ),
-                "Infer/ActiveRequestsMean": float(
-                    infer_gauges["active_requests"]["mean"]
-                ),
-                "Infer/ActiveRequestsMax": float(
-                    infer_gauges["active_requests"]["max"]
-                ),
-                "Infer/ActiveAttemptsMean": float(
-                    infer_gauges["active_attempts"]["mean"]
-                ),
-                "Infer/ActiveAttemptsMax": float(
-                    infer_gauges["active_attempts"]["max"]
-                ),
-                "Infer/AttemptsPerRequest": distribution_scalar(
-                    infer_diagnostics, "attempts_per_request", "mean"
-                ),
-                "Infer/ResubmittedRequestRate": (
-                    float(infer_counters.get("resubmitted_request_count", 0.0))
-                    / max(infer_request_count, 1.0)
-                ),
-                "Infer/StopRate": (
-                    float(infer_counters.get("stop_reason_stop_count", 0.0))
-                    / max(infer_request_count, 1.0)
-                ),
                 "Infer/LengthRate": (
-                    float(infer_counters.get("stop_reason_length_count", 0.0))
+                    float(infer_diagnostics["length_count"])
                     / max(infer_request_count, 1.0)
                 ),
-                "Infer/AbortRate": (
-                    float(infer_counters.get("stop_reason_abort_count", 0.0))
-                    / max(infer_request_count, 1.0)
-                ),
-                "Infer/DiagnosticsDroppedSamples": infer_dropped_samples,
             }
             rollout_metric_values = {
                 "Rollout/EpisodesPerSec": (
-                    rollout_episode_count / max(infer_elapsed, 1e-9)
+                    rollout_episode_count
+                    / max(
+                        rollout_total_worker_seconds
+                        / max(len(rollout_intervals), 1),
+                        1e-9,
+                    )
                 ),
                 "Rollout/InferenceWaitFraction": (
-                    float(rollout_counters.get("inference_wait_seconds", 0.0))
+                    rollout_inference_wait_seconds
                     / max(rollout_total_worker_seconds, 1e-9)
                 ),
-                "Rollout/EnvStepMsMean": distribution_scalar(
-                    rollout_diagnostics, "env_step_ms", "mean"
-                ),
-                "Rollout/EnvStepMsP95": distribution_scalar(
-                    rollout_diagnostics, "env_step_ms", "p95"
-                ),
-                "Rollout/PostprocessMsMean": distribution_scalar(
-                    rollout_diagnostics, "postprocess_ms", "mean"
-                ),
-                "Rollout/PostprocessMsP95": distribution_scalar(
-                    rollout_diagnostics, "postprocess_ms", "p95"
-                ),
                 "Rollout/HistoryLimitRate": (
-                    float(
-                        rollout_counters.get(
-                            "termination_reason_history_limit_count",
-                            0.0,
-                        )
-                    )
+                    rollout_history_limit_count
                     / max(rollout_episode_count, 1.0)
                 ),
-                "Rollout/StepLimitRate": (
-                    float(
-                        rollout_counters.get(
-                            "termination_reason_step_limit_count",
-                            0.0,
-                        )
-                    )
+                "Rollout/EnvironmentStepsPerEpisodeMean": (
+                    rollout_environment_steps
                     / max(rollout_episode_count, 1.0)
                 ),
-                "Rollout/EnvironmentDoneWithoutTerminalSignalRate": (
-                    float(
-                        rollout_counters.get(
-                            "termination_reason_"
-                            "environment_done_without_terminal_signal_count",
-                            0.0,
-                        )
-                    )
-                    / max(rollout_episode_count, 1.0)
-                ),
-                "Rollout/LostTerminationRate": (
-                    float(
-                        rollout_counters.get(
-                            "termination_reason_lost_count",
-                            0.0,
-                        )
-                    )
-                    / max(rollout_episode_count, 1.0)
-                ),
-                "Rollout/WonTerminationRate": (
-                    float(
-                        rollout_counters.get(
-                            "termination_reason_won_count",
-                            0.0,
-                        )
-                    )
-                    / max(rollout_episode_count, 1.0)
-                ),
-                "Rollout/MissingTerminationReasonRate": (
-                    float(
-                        rollout_counters.get(
-                            "termination_reason_missing_count",
-                            0.0,
-                        )
-                    )
-                    / max(rollout_episode_count, 1.0)
-                ),
-                "Rollout/ActionAttemptsPerEpisodeMean": distribution_scalar(
-                    rollout_diagnostics,
-                    "episode_action_attempts",
-                    "mean",
-                ),
-                "Rollout/EnvironmentStepsPerEpisodeMean": distribution_scalar(
-                    rollout_diagnostics,
-                    "episode_environment_steps",
-                    "mean",
-                ),
-                "Rollout/DiagnosticsDroppedSamples": rollout_dropped_samples,
             }
             for tag, value in {
                 **infer_metric_values,
@@ -5463,11 +4867,6 @@ async def run_textworld_train(args: argparse.Namespace):
                 args.max_sync_rounds is not None
                 and sync_rounds >= args.max_sync_rounds
             ):
-                writer.add_scalar(
-                    "Infer/SyncInterruptedAttemptRate", 0.0, tb_step
-                )
-                writer.add_scalar("Infer/PauseActiveAttempts", 0.0, tb_step)
-                writer.flush()
                 print(
                     "[sync] max_sync_rounds reached; letting inference finish "
                     "without more trainable updates."
@@ -5479,23 +4878,7 @@ async def run_textworld_train(args: argparse.Namespace):
                 f"[sync] Round {sync_rounds}: pausing generation for "
                 "trainable-only weight update..."
             )
-            pause_diagnostics = ray.get(
-                infer_actor.pause_and_wait_idle.remote()
-            )
-            pause_active_attempts = float(
-                pause_diagnostics["active_attempts"]
-            )
-            writer.add_scalar(
-                "Infer/SyncInterruptedAttemptRate",
-                float(pause_diagnostics["interrupted_attempts"])
-                / max(pause_active_attempts, 1.0),
-                tb_step,
-            )
-            writer.add_scalar(
-                "Infer/PauseActiveAttempts",
-                pause_active_attempts,
-                tb_step,
-            )
+            ray.get(infer_actor.pause_and_wait_idle.remote())
 
             sync_elapsed_seconds = await sync_weights_to_vllm(
                 infer_actor=infer_actor,
