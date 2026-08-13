@@ -65,7 +65,9 @@ from accerl_agent.rl_data import (
     RLSample,
     RawPPOSample,
     TerminationReason,
+    classify_textworld_termination_reason,
     compute_batched_token_gae,
+    textworld_ppo_boundary_is_terminal,
     validate_raw_ppo_sample,
 )
 
@@ -3825,7 +3827,7 @@ class VLLMInferenceActor:
         active_attempts_before_pause = self.runner._active_attempts
         interrupted_before_pause = self.runner.total_sync_interrupted_attempts
         self.runner.pause()
-        await self.engine.pause_generation(mode="abort", clear_cache=False)
+        await self.engine.pause_generation(mode="abort", clear_cache=True)
         await self.runner.wait_for_idle()
         return {
             "active_attempts": active_attempts_before_pause,
@@ -3918,6 +3920,7 @@ class TextWorldTrajectoryState:
     step_records: List[TextWorldStepRecord] = field(default_factory=list)
     transcript_ids: List[int] = field(default_factory=list)
     invalid_actions: int = 0
+    environment_steps: int = 0
     done: bool = False
     won: bool = False
     lost: bool = False
@@ -4217,6 +4220,7 @@ class TextWorldRolloutWorkerActor:
             selected_action = parsed_action.action
             env_step_started_at = time.perf_counter()
             obs, step_score, done, infos = state.env.step(selected_action)
+            state.environment_steps += 1
             env_step_seconds = time.perf_counter() - env_step_started_at
             self.diagnostics.observe("env_step_ms", env_step_seconds * 1000.0)
             state.obs = obs
@@ -4225,14 +4229,13 @@ class TextWorldRolloutWorkerActor:
             state.done = bool(done)
             state.won = bool(infos.get("won", False))
             state.lost = bool(infos.get("lost", False))
-            if state.won:
-                state.termination_reason = "won"
-            elif state.lost:
-                state.termination_reason = "lost"
-            elif state.done:
-                state.termination_reason = (
-                    "environment_done_without_terminal_signal"
-                )
+            state.termination_reason = classify_textworld_termination_reason(
+                won=state.won,
+                lost=state.lost,
+                done=state.done,
+                environment_steps=state.environment_steps,
+                max_episode_steps=self.args.tw_max_episode_steps,
+            )
             if not state.done or state.termination_reason not in {"won", "lost"}:
                 self._append_transcript_user_content(
                     state.transcript_ids,
@@ -4408,23 +4411,29 @@ class TextWorldRolloutWorkerActor:
             output_versions.extend(result.output_versions)
 
         bootstrap_prediction_position = None
+        final_delta: List[int] = []
+        ppo_boundary_is_terminal = False
         if algorithm == "ppo":
             if state.termination_reason is None:
                 return None
-            final_transcript_ids = list(state.transcript_ids)
-            if len(input_ids) > len(final_transcript_ids):
-                return None
-            if final_transcript_ids[: len(input_ids)] != input_ids:
-                return None
-            final_delta = final_transcript_ids[len(input_ids):]
-            if final_delta:
-                input_ids.extend(final_delta)
-                labels.extend([-100] * len(final_delta))
-                old_logprobs.extend([0.0] * len(final_delta))
-                token_rewards.extend([0.0] * len(final_delta))
-                token_terminated.extend([False] * len(final_delta))
-                token_truncated.extend([False] * len(final_delta))
-                output_versions.extend([-1] * len(final_delta))
+            ppo_boundary_is_terminal = textworld_ppo_boundary_is_terminal(
+                state.termination_reason
+            )
+            if not ppo_boundary_is_terminal:
+                final_transcript_ids = list(state.transcript_ids)
+                if len(input_ids) > len(final_transcript_ids):
+                    return None
+                if final_transcript_ids[: len(input_ids)] != input_ids:
+                    return None
+                final_delta = final_transcript_ids[len(input_ids):]
+                if final_delta:
+                    input_ids.extend(final_delta)
+                    labels.extend([-100] * len(final_delta))
+                    old_logprobs.extend([0.0] * len(final_delta))
+                    token_rewards.extend([0.0] * len(final_delta))
+                    token_terminated.extend([False] * len(final_delta))
+                    token_truncated.extend([False] * len(final_delta))
+                    output_versions.extend([-1] * len(final_delta))
 
         if all(label == -100 for label in labels):
             return None
@@ -4448,7 +4457,7 @@ class TextWorldRolloutWorkerActor:
             if not valid_target_indices:
                 return None
             boundary_index = valid_target_indices[-1]
-            if state.termination_reason in {"won", "lost"}:
+            if ppo_boundary_is_terminal:
                 token_terminated[boundary_index] = True
             else:
                 token_truncated[boundary_index] = True
@@ -4540,11 +4549,19 @@ class TextWorldRolloutWorkerActor:
                 if active_count == 0:
                     break
 
+            # The outer loop counts model action attempts, including invalid
+            # actions.  Classify exhausting that budget consistently for both
+            # PPO and GRPO; TextWorld's wrapper limit is classified separately
+            # from the successful environment-step count above.
+            for state in states:
+                if (
+                    state.termination_reason is None
+                    and len(state.step_records) >= self.args.tw_max_episode_steps
+                ):
+                    state.done = True
+                    state.termination_reason = "step_limit"
+
             if algorithm == "ppo":
-                for state in states:
-                    if state.termination_reason is None and state.step_records:
-                        state.done = True
-                        state.termination_reason = "step_limit"
                 advantages = [None] * len(states)
             else:
                 raw_returns = [
@@ -4571,8 +4588,25 @@ class TextWorldRolloutWorkerActor:
             max_score = _textworld_max_score(states[0].infos) if states else 0.0
             for state in states:
                 self.diagnostics.increment("episode_count")
+                termination_reason = state.termination_reason
+                if termination_reason is not None:
+                    self.diagnostics.increment(
+                        f"termination_reason_{termination_reason}_count"
+                    )
+                else:
+                    self.diagnostics.increment(
+                        "termination_reason_missing_count"
+                    )
                 if state.termination_reason == "history_limit":
                     self.diagnostics.increment("history_limit_count")
+                self.diagnostics.observe(
+                    "episode_action_attempts",
+                    len(state.step_records),
+                )
+                self.diagnostics.observe(
+                    "episode_environment_steps",
+                    state.environment_steps,
+                )
                 self.stats_actor.add_textworld_episode.remote(
                     self.worker_id,
                     state.latest_score,
@@ -5387,6 +5421,62 @@ async def run_textworld_train(args: argparse.Namespace):
                 "Rollout/HistoryLimitRate": (
                     float(rollout_counters.get("history_limit_count", 0.0))
                     / max(rollout_episode_count, 1.0)
+                ),
+                "Rollout/StepLimitRate": (
+                    float(
+                        rollout_counters.get(
+                            "termination_reason_step_limit_count",
+                            0.0,
+                        )
+                    )
+                    / max(rollout_episode_count, 1.0)
+                ),
+                "Rollout/EnvironmentDoneWithoutTerminalSignalRate": (
+                    float(
+                        rollout_counters.get(
+                            "termination_reason_"
+                            "environment_done_without_terminal_signal_count",
+                            0.0,
+                        )
+                    )
+                    / max(rollout_episode_count, 1.0)
+                ),
+                "Rollout/LostTerminationRate": (
+                    float(
+                        rollout_counters.get(
+                            "termination_reason_lost_count",
+                            0.0,
+                        )
+                    )
+                    / max(rollout_episode_count, 1.0)
+                ),
+                "Rollout/WonTerminationRate": (
+                    float(
+                        rollout_counters.get(
+                            "termination_reason_won_count",
+                            0.0,
+                        )
+                    )
+                    / max(rollout_episode_count, 1.0)
+                ),
+                "Rollout/MissingTerminationReasonRate": (
+                    float(
+                        rollout_counters.get(
+                            "termination_reason_missing_count",
+                            0.0,
+                        )
+                    )
+                    / max(rollout_episode_count, 1.0)
+                ),
+                "Rollout/ActionAttemptsPerEpisodeMean": distribution_scalar(
+                    rollout_diagnostics,
+                    "episode_action_attempts",
+                    "mean",
+                ),
+                "Rollout/EnvironmentStepsPerEpisodeMean": distribution_scalar(
+                    rollout_diagnostics,
+                    "episode_environment_steps",
+                    "mean",
                 ),
                 "Rollout/DiagnosticsDroppedSamples": rollout_dropped_samples,
             }

@@ -15,6 +15,41 @@ TerminationReason: TypeAlias = Literal[
 ]
 
 
+PPO_TERMINAL_REASONS = frozenset({
+    "won",
+    "lost",
+    "step_limit",
+    "history_limit",
+})
+
+
+def textworld_ppo_boundary_is_terminal(
+    termination_reason: TerminationReason,
+) -> bool:
+    """Return whether PPO must stop return propagation without bootstrap."""
+    return termination_reason in PPO_TERMINAL_REASONS
+
+
+def classify_textworld_termination_reason(
+    *,
+    won: bool,
+    lost: bool,
+    done: bool,
+    environment_steps: int,
+    max_episode_steps: int,
+) -> TerminationReason | None:
+    """Classify TextWorld ``done`` while preserving time-limit semantics."""
+    if won:
+        return "won"
+    if lost:
+        return "lost"
+    if not done:
+        return None
+    if environment_steps >= max_episode_steps:
+        return "step_limit"
+    return "environment_done_without_terminal_signal"
+
+
 @dataclass
 class RawPPOSample:
     input_ids: List[int]

@@ -349,7 +349,8 @@ This is the most important stability check. Every sample must guarantee:
 - PPO rewards and terminal/truncation masks are token-aligned, with exactly
   one boundary on the final valid response token.
 - Truncated PPO samples contain ignored final-state context and a valid
-  bootstrap prediction position.
+  bootstrap prediction position. TextWorld `step_limit` and `history_limit`
+  samples are terminal failures and do not bootstrap.
 - Rollout samples do not exceed `--tw-history-token-window`, and argument
   validation requires `--max-length >= --tw-history-token-window`.
 

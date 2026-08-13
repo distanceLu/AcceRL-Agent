@@ -339,7 +339,11 @@ len(input_ids) == len(output_versions)
 `False` boundaries, and `response_index=output_version=-1`. Exactly one
 terminal or truncation boundary appears on the final response token.
 Truncations include ignored final-state prompt context and a valid bootstrap
-prediction position. PPO rollout never stores values, returns, or advantages.
+prediction position. TextWorld `step_limit` and `history_limit` boundaries are
+treated as terminal failures, so their final-state value is zero and they do
+not bootstrap. The rollout tracks successful environment steps separately
+from action attempts so the TextWorld time-limit wrapper is also classified as
+`step_limit`. PPO rollout never stores values, returns, or advantages.
 `GRPOSample` instead stores one trajectory-level advantage.
 
 ## Important Arguments
