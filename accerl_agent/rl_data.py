@@ -90,13 +90,38 @@ class RawPPOSample:
         validate_raw_ppo_sample(self)
 
 
-@dataclass
+@dataclass(frozen=True)
 class GRPOSample:
-    input_ids: List[int]
-    labels: List[int]
-    old_logprobs: List[float]
-    output_versions: List[int]
-    advantage: float  # reward 在构造样本之前已经转换成了组内相对 advantage，所以训练样本不再需要保存原始 reward。
+    input_ids: Tuple[int, ...]
+    # Half-open ranges of trainable response tokens within ``input_ids``.
+    response_spans: Tuple[Tuple[int, int], ...]
+    # Aligns only with the flattened response spans.
+    response_logprobs: Tuple[float, ...]
+    # Reward is converted to a group-relative trajectory advantage before the
+    # sample enters replay, so the raw reward is not retained.
+    advantage: float
+    # Maximum policy version among this sample's response tokens. It is used
+    # only for replay-lag diagnostics.
+    behavior_version: int
+
+    def __post_init__(self) -> None:
+        try:
+            object.__setattr__(self, "input_ids", tuple(self.input_ids))
+            object.__setattr__(
+                self,
+                "response_spans",
+                tuple(tuple(span) for span in self.response_spans),
+            )
+            object.__setattr__(
+                self,
+                "response_logprobs",
+                tuple(self.response_logprobs),
+            )
+        except TypeError as exc:
+            raise ValueError(
+                "GRPO replay sequence fields must be iterable."
+            ) from exc
+        validate_grpo_sample(self)
 
 
 RLSample: TypeAlias = RawPPOSample | GRPOSample
@@ -159,6 +184,47 @@ def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
             "A truncated PPO sample requires final non-response context for "
             "bootstrap."
         )
+
+
+def validate_grpo_sample(sample: GRPOSample) -> None:
+    length = len(sample.input_ids)
+    if length < 2:
+        raise ValueError("A GRPO sample must contain at least two tokens.")
+    if not sample.response_spans:
+        raise ValueError("A GRPO sample must contain a response target.")
+    response_count = 0
+    previous_end = 0
+    for span_index, span in enumerate(sample.response_spans):
+        if (
+            not isinstance(span, tuple)
+            or len(span) != 2
+            or not all(type(value) is int for value in span)
+        ):
+            raise ValueError(
+                "GRPO response spans must be (start, end) integer tuples."
+            )
+        start, end = span
+        if start < 1:
+            raise ValueError(
+                "The first GRPO token cannot be a causal response target."
+            )
+        if start >= end or end > length:
+            raise ValueError(
+                f"GRPO response span {span_index} is outside the input range."
+            )
+        if start < previous_end:
+            raise ValueError(
+                "GRPO response spans must be ordered and non-overlapping."
+            )
+        response_count += end - start
+        previous_end = end
+    if len(sample.response_logprobs) != response_count:
+        raise ValueError(
+            "GRPO response_logprobs must align with response tokens: "
+            f"{len(sample.response_logprobs)} != {response_count}"
+        )
+    if type(sample.behavior_version) is not int or sample.behavior_version < 0:
+        raise ValueError("GRPO behavior_version must be a non-negative integer.")
 
 
 def _parallel_reverse_affine_scan(

@@ -327,14 +327,16 @@ The training-side policy objective is controlled by `--clip-mode`:
 
 ## Replay Sample Contract
 
-Replay stores `RawPPOSample | GRPOSample`. PPO uses this compact contract:
+Replay stores `RawPPOSample | GRPOSample`. Both algorithms use compact
+response fields:
 
 ```text
 input_ids
 response_spans              # ordered, non-overlapping [start, end) ranges
 response_logprobs           # aligned to flattened response spans
-response_rewards            # aligned to flattened response spans
-boundary_kind               # "terminated" or "truncated"
+response_rewards            # PPO only; aligned to flattened response spans
+advantage                   # GRPO only; one scalar per trajectory
+boundary_kind               # PPO only; "terminated" or "truncated"
 behavior_version            # max response-token policy version
 ```
 
@@ -346,8 +348,9 @@ treated as terminal failures, so their final-state value is zero and they do
 not bootstrap. The rollout tracks successful environment steps separately
 from action attempts so the TextWorld time-limit wrapper is also classified as
 `step_limit`. PPO rollout never stores values, returns, or advantages.
-`GRPOSample` retains its token-aligned policy fields and stores one
-trajectory-level advantage.
+GRPO uses the same compact `response_spans` and `response_logprobs` layout and
+stores one trajectory-level advantage. Neither sample type stores full-length
+labels, logprobs, or per-token policy versions.
 
 ## Important Arguments
 

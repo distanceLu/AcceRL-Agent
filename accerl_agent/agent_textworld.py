@@ -292,6 +292,7 @@ def pick_dtype(dtype_name: str):
     return torch.float32
 
 
+# # 每个 trajectory 的 token 先平均，之后再对所有 trajectory 求和，确保每条 trajectory 对 loss 等权
 def sum_token_values_by_trajectory(
     token_values: torch.Tensor,
     token_sample_indices: torch.Tensor,
@@ -321,7 +322,7 @@ def sum_token_values_by_trajectory(
         raise ValueError(
             "RL token values and sample indices must share a device."
         )
-
+    
     response_counts = torch.bincount(
         token_sample_indices.long(),
         minlength=sample_count,
@@ -347,58 +348,54 @@ def sum_token_values_by_trajectory(
 def make_grpo_varlen_batch(
     examples: List[GRPOSample],
 ) -> Dict[str, torch.Tensor]:
-    """Flatten examples while retaining their causal and RL sample boundaries."""
+    """Pack compact GRPO response spans into a response-only loss layout."""
     if not examples:
         raise ValueError("At least one example is required for varlen packing.")
+    if not all(isinstance(example, GRPOSample) for example in examples):
+        raise TypeError("GRPO varlen packing only accepts GRPOSample inputs.")
 
     input_ids = []
-    labels = []
-    old_logprobs = []
+    response_logprobs = []
     position_ids = []
-    sequence_ids = []
     cu_seqlens = [0]
+    target_indices = []
+    response_sample_indices = []
 
     for sequence_id, example in enumerate(examples):
         length = len(example.input_ids)
-        if length < 2:
-            raise ValueError("Each packed sequence must contain at least two tokens.")
-        if example.labels[0] != -100:
-            raise ValueError("The first token in a packed sequence cannot be an RL target.")
-
+        sequence_start = cu_seqlens[-1]
         input_ids.extend(example.input_ids)
-        labels.extend(example.labels)
-        old_logprobs.extend(example.old_logprobs)
         position_ids.extend(range(length))
-        sequence_ids.extend([sequence_id] * length)
-        cu_seqlens.append(cu_seqlens[-1] + length)
+        cu_seqlens.append(sequence_start + length)
+        local_targets = [
+            position
+            for start, end in example.response_spans
+            for position in range(start, end)
+        ]
+        target_indices.extend(
+            sequence_start + position for position in local_targets
+        )
+        response_logprobs.extend(example.response_logprobs)
+        response_sample_indices.extend([sequence_id] * len(local_targets))
 
-    target_indices = [
-        index for index, label in enumerate(labels) if label != -100
-    ]
     if not target_indices:
         raise ValueError("A varlen batch must contain at least one RL target.")
-    prediction_indices = [index - 1 for index in target_indices]
-    for target_index, prediction_index in zip(
-        target_indices,
-        prediction_indices,
-    ):
-        if sequence_ids[target_index] != sequence_ids[prediction_index]:
-            raise ValueError("A packed target cannot cross a sequence boundary.")
-        if position_ids[target_index] != position_ids[prediction_index] + 1:
-            raise ValueError(
-                "A packed target must immediately follow its prediction position."
-            )
 
     return {
         "input_ids": torch.tensor([input_ids], dtype=torch.long),
         "position_ids": torch.tensor([position_ids], dtype=torch.long),
         "cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32),
-        "labels": torch.tensor(labels, dtype=torch.long),
-        "old_logprobs": torch.tensor(old_logprobs, dtype=torch.float32),
+        "response_logprobs": torch.tensor(
+            response_logprobs,
+            dtype=torch.float32,
+        ),
         "sample_advantages": torch.tensor(
             [example.advantage for example in examples], dtype=torch.float32
         ),
-        "sequence_ids": torch.tensor(sequence_ids, dtype=torch.long),
+        "response_sample_indices": torch.tensor(
+            response_sample_indices,
+            dtype=torch.long,
+        ),
         "target_indices": torch.tensor(target_indices, dtype=torch.long),
     }
 
@@ -1032,8 +1029,9 @@ class FSDPTrainWorker:
         self.ppo_adv_ema_mean: float | None = None
         self.ppo_adv_ema_variance: float | None = None
         self.pending_prepared_samples: List[RLSample] = []
-        self._ppo_forward_buffers_validated = False
+        self._ppo_forward_buffers_validated = False # PPO两次forward安全检查
 
+        # FSDP2 worker rank 0 additionally handles vLLM weight transfer.
         self.transfer_port = None
         self.transfer_master_address = None
         self.model_update_group = None
@@ -1131,45 +1129,44 @@ class FSDPTrainWorker:
         self,
         sample: GRPOSample,
     ) -> GRPOSample | None:
-        input_ids = list(sample.input_ids)
-        labels = list(sample.labels)
-        old_logprobs = list(sample.old_logprobs)
-        output_versions = list(sample.output_versions)
-        original_length = len(input_ids)
-        if not input_ids or any(
-            len(field) != original_length
-            for field in (
-                labels,
-                old_logprobs,
-                output_versions,
-            )
-        ):
-            return None
+        original_length = len(sample.input_ids)
         max_length = self.args.max_length
-        if original_length > max_length:
-            input_ids = input_ids[-max_length:]
-            labels = labels[-max_length:]
-            old_logprobs = old_logprobs[-max_length:]
-            output_versions = output_versions[-max_length:]
-        if len(input_ids) < 2:
+        if original_length <= max_length:
+            return sample
+        if max_length < 2:
             return None
-        labels[0] = -100
-        old_logprobs[0] = 0.0
-        output_versions[0] = -1
-        if all(label == -100 for label in labels[1:]):
+
+        truncate_offset = original_length - max_length
+        kept_positions: List[int] = []
+        kept_logprobs: List[float] = []
+        response_index = 0
+        for start, end in sample.response_spans:
+            for position in range(start, end):
+                if position > truncate_offset:
+                    kept_positions.append(position - truncate_offset)
+                    kept_logprobs.append(
+                        sample.response_logprobs[response_index]
+                    )
+                response_index += 1
+        if not kept_positions:
             return None
-        if any(
-            output_version < 0
-            for output_version, label in zip(output_versions[1:], labels[1:])
-            if label != -100
-        ):
-            return None
+
+        response_spans: List[Tuple[int, int]] = []
+        span_start = kept_positions[0]
+        previous_position = span_start
+        for position in kept_positions[1:]:
+            if position != previous_position + 1:
+                response_spans.append((span_start, previous_position + 1))
+                span_start = position
+            previous_position = position
+        response_spans.append((span_start, previous_position + 1))
+
         return GRPOSample(
-            input_ids=input_ids,
-            labels=labels,
-            old_logprobs=old_logprobs,
+            input_ids=sample.input_ids[-max_length:],
+            response_spans=response_spans,
+            response_logprobs=kept_logprobs,
             advantage=sample.advantage,
-            output_versions=output_versions,
+            behavior_version=sample.behavior_version,
         )
 
     def _collate_prepared_rl_samples(
@@ -1207,18 +1204,7 @@ class FSDPTrainWorker:
         lag_sum = sum(
             max(
                 trainer_version
-                - (
-                    sample.behavior_version
-                    if isinstance(sample, RawPPOSample)
-                    else max(
-                        (
-                            version
-                            for version in sample.output_versions
-                            if version >= 0
-                        ),
-                        default=0,
-                    )
-                ),
+                - sample.behavior_version,
                 0.0,
             )
             for sample in samples
@@ -1306,9 +1292,7 @@ class FSDPTrainWorker:
                 raise RuntimeError("A Varlen pack must contain at least one token.")
             if valid_token_count <= 0:
                 raise RuntimeError("A Varlen pack must contain at least one target.")
-            valid_sample_indices = batch["sequence_ids"][
-                batch["target_indices"]
-            ]
+            valid_sample_indices = batch["response_sample_indices"]
             valid_trajectory_count = int(
                 torch.unique(valid_sample_indices).numel()
             )
@@ -1352,8 +1336,8 @@ class FSDPTrainWorker:
         prediction_indices = target_indices - 1
         if target_indices.numel() == 0:
             raise RuntimeError("No valid response tokens found for RL loss.")
-        valid_sample_indices = batch["sequence_ids"][target_indices]
-        valid_labels = batch["labels"][target_indices]
+        valid_sample_indices = batch["response_sample_indices"]
+        valid_labels = batch["input_ids"][0, target_indices]
         model_kwargs = {
             "input_ids": batch["input_ids"],
             "position_ids": batch["position_ids"],
@@ -1378,7 +1362,7 @@ class FSDPTrainWorker:
             valid_labels,
             reduction="none",
         )
-        valid_old_token_log_probs = batch["old_logprobs"][target_indices].to(
+        valid_old_token_log_probs = batch["response_logprobs"].to(
             torch.float32
         )
 
@@ -2283,7 +2267,7 @@ class FSDPTrainWorker:
         )
         local_valid_trajectory_count = sum(
             prepared.valid_trajectory_count for prepared in window
-        )
+        )  # 让每条 trajectory 对 loss等权，因此最终 loss 要除以全局 trajectory 数
         global_reduction_counts = torch.tensor(
             [local_valid_token_count, local_valid_trajectory_count],
             device=self.device,
@@ -3374,7 +3358,7 @@ class InterruptibleGenerationRunner:
             )
             if attempt_tokens:
                 attempt_logprobs = []
-                if self.collect_logprobs:
+                if self.collect_logprobs: # 如果需要收集logprobs，就从final_output里提取对应的logprobs
                     attempt_logprobs = _logprobs_from_output(
                         final_output,
                         attempt_tokens,
@@ -3450,7 +3434,7 @@ class VLLMInferenceActor:
         self.next_request_index = 0
         self.stopped = False
 
-    async def request_batch(
+    async def request_generation(
         self,
         input_ids: List[int],
         infer_max_tokens: int,
@@ -4002,7 +3986,7 @@ class TextWorldRolloutWorkerActor:
                 self.args.tw_history_token_window - len(input_ids),
             )
             request_refs.append(
-                self.infer_actor.request_batch.remote(
+                self.infer_actor.request_generation.remote(
                     list(input_ids),
                     infer_max_tokens,
                 )
@@ -4048,11 +4032,9 @@ class TextWorldRolloutWorkerActor:
         if algorithm not in {"ppo", "grpo"}:
             raise ValueError(f"Unsupported rl_algorithm: {algorithm}")
         input_ids: List[int] = []
-        # GRPO keeps its legacy token-aligned fields. PPO stores only compact
-        # response metadata below.
-        labels: List[int] = []
-        old_logprobs: List[float] = []
-        output_versions: List[int] = []
+        # Both algorithms retain only response metadata. Prompt, observation,
+        # and aborted-generation tokens stay in input_ids without padded
+        # label/logprob/version fields.
         response_spans: List[Tuple[int, int]] = []
         response_logprobs: List[float] = []
         response_rewards: List[float] = []
@@ -4067,10 +4049,6 @@ class TextWorldRolloutWorkerActor:
             prompt_delta = prompt_ids[len(input_ids):]
             if prompt_delta:
                 input_ids.extend(prompt_delta)
-                if algorithm == "grpo":
-                    labels.extend([-100] * len(prompt_delta))
-                    old_logprobs.extend([0.0] * len(prompt_delta))
-                    output_versions.extend([-1] * len(prompt_delta))
 
             result = record.training_result
             if not result.output_tokens:
@@ -4078,10 +4056,6 @@ class TextWorldRolloutWorkerActor:
             output_tokens = list(result.output_tokens)
             if result.stop_reason == "abort":
                 input_ids.extend(output_tokens)
-                if algorithm == "grpo":
-                    labels.extend([-100] * len(output_tokens))
-                    old_logprobs.extend([0.0] * len(output_tokens))
-                    output_versions.extend([-1] * len(output_tokens))
                 continue
             result_logprobs = list(result.output_logprobs)
             if len(result_logprobs) != len(result.output_tokens):
@@ -4091,22 +4065,18 @@ class TextWorldRolloutWorkerActor:
 
             response_start = len(input_ids)
             input_ids.extend(output_tokens)
+            if any(version < 0 for version in result.output_versions):
+                return None
+            response_spans.append((response_start, len(input_ids)))
+            response_logprobs.extend(result_logprobs)
+            behavior_version = max(
+                behavior_version,
+                max(result.output_versions),
+            )
             if algorithm == "ppo":
-                if any(version < 0 for version in result.output_versions):
-                    return None
-                response_spans.append((response_start, len(input_ids)))
-                response_logprobs.extend(result_logprobs)
                 response_token_rewards = [0.0] * len(output_tokens)
                 response_token_rewards[-1] = float(record.reward)
                 response_rewards.extend(response_token_rewards)
-                behavior_version = max(
-                    behavior_version,
-                    max(result.output_versions),
-                )
-            else:
-                labels.extend(output_tokens)
-                old_logprobs.extend(result_logprobs)
-                output_versions.extend(result.output_versions)
 
         final_delta: List[int] = []
         ppo_boundary_is_terminal = False
@@ -4153,20 +4123,18 @@ class TextWorldRolloutWorkerActor:
         elif algorithm == "grpo":
             if sample_advantage is None:
                 raise ValueError("GRPO samples require a sample advantage.")
-            if (
-                len(input_ids) != len(labels)
-                or len(input_ids) != len(old_logprobs)
-                or len(input_ids) != len(output_versions)
-                or all(label == -100 for label in labels)
-            ):
+            if not response_spans:
                 return None
-            return GRPOSample(
-                input_ids=input_ids,
-                labels=labels,
-                old_logprobs=old_logprobs,
-                output_versions=output_versions,
-                advantage=float(sample_advantage),
-            )
+            try:
+                return GRPOSample(
+                    input_ids=input_ids,
+                    response_spans=response_spans,
+                    response_logprobs=response_logprobs,
+                    advantage=float(sample_advantage),
+                    behavior_version=behavior_version,
+                )
+            except ValueError:
+                return None
         raise AssertionError("unreachable")
 
     def _compute_grpo_group_advantages(
@@ -4491,7 +4459,7 @@ async def run_textworld_train(args: argparse.Namespace):
         # Use local/shared model weights directly.
         print(f"[init] Loading local model from {args.model_path}")
 
-        # FSDP rendezvous address (single-node)
+        # FSDP rendezvous address (single-node) trainer内fsdp传输通道
         fsdp_master_addr = args.fsdp_master_addr or get_local_ip()
         fsdp_master_port = args.fsdp_master_port or find_open_port()
 
