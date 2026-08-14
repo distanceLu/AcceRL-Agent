@@ -21,7 +21,6 @@ class OnlineGenerationState:
     output_logprobs: List[float] = field(default_factory=list)
     output_versions: List[int] = field(default_factory=list)
     stop_reason: Literal["length", "stop", "tool_calls", "abort"] | None = None
-    attempts: int = 0
 
     @property
     def remaining_max_tokens(self) -> int:
@@ -29,7 +28,8 @@ class OnlineGenerationState:
 
     """vsiqa"""
     @property
-    def restart_prompt_token_ids(self) -> dict:  # Return the resumed EngineInput.
+    def restart_prompt_token_ids(self) -> dict:
+        """Return the resumed Qwen3-VL EngineInput."""
         engine_input = dict(self.input_ids)
         engine_input["prompt_token_ids"] = (
             list(self.input_ids["prompt_token_ids"])
@@ -41,37 +41,8 @@ class OnlineGenerationState:
 
 
 @dataclass
-class RepeatingInferenceStats:
-    total_requests: int = 0
-    total_tokens: int = 0
-
-
-@dataclass
-class InferenceRequestItem:
-    request_index: int
-    rollout_worker_id: int
-    batch_id: int
-    sample_id: int
-    """vsiqa"""
-    input_ids: dict  # Qwen3-VL carries the rendered EngineInput between calls.
-    """vsiqa"""
-    requested_max_tokens: int
-
-
-@dataclass
 class InferenceResult:
-    request_index: int
-    rollout_worker_id: int
-    batch_id: int
-    sample_id: int
     output_tokens: List[int]
     output_logprobs: List[float]
     output_versions: List[int]
     stop_reason: Literal["length", "stop", "tool_calls", "abort"] | None
-    attempts: int
-
-    @property
-    def version_range(self) -> str:
-        if not self.output_versions:
-            return "none"
-        return f"{min(self.output_versions)}-{max(self.output_versions)}"

@@ -42,7 +42,8 @@ python -m vsi_qa_rlvr.main \
   --data-path /data/all/luck/derived_dataset/VSI_590K_derived/scannet_chair_incremental_counting/official_sensor/train.parquet \
   --log-dir "${OUTPUT_DIR}" \
   --fsdp-world-size 4 \
-  --infer-actor-max-concurrency 1024 \
+  --infer-size 2 \
+  --infer-tp-size 1 \
   --batch-size 1 \
   --grad-accum-steps 8 \
   --max-steps 3000 \
@@ -64,11 +65,10 @@ python -m vsi_qa_rlvr.main \
   --infer-max-tokens 512 \
   --infer-temperature 1.0 \
   --infer-top-p 1.0 \
-  --max-model-len 65536 \
+  --vllm-max-model-len 65536 \
   --vllm-max-num-batched-tokens 131072 \
   --vllm-max-num-seqs 64 \
   --rollout-attention-backend TRITON_ATTN \
-  --rollout-gpu-memory-utilization 0.55 \
   2>&1 | tee "${OUTPUT_DIR}/train.log"
 
 echo "train_log=${OUTPUT_DIR}/train.log"

@@ -66,7 +66,8 @@ python -m vsi_qa_rlvr.main \
   --limit-images 3 \
   --log-dir "${OUTPUT_DIR}" \
   --fsdp-world-size 4 \
-  --infer-actor-max-concurrency 2048 \
+  --infer-size 2 \
+  --infer-tp-size 1 \
   --batch-size 32 \
   --grad-accum-steps 8 \
   --max-steps 400 \
@@ -89,11 +90,10 @@ python -m vsi_qa_rlvr.main \
   --infer-max-tokens 128 \
   --infer-temperature 1.0 \
   --infer-top-p 1.0 \
-  --max-model-len 8192 \
+  --vllm-max-model-len 8192 \
   --vllm-max-num-batched-tokens 262144 \
   --vllm-max-num-seqs 384 \
   --rollout-attention-backend FLASH_ATTN \
-  --rollout-gpu-memory-utilization 0.90 \
   2>&1 | tee "${OUTPUT_DIR}/train.log"
 
 echo "train_log=${OUTPUT_DIR}/train.log"

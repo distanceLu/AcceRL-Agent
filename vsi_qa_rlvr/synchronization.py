@@ -91,6 +91,3 @@ async def sync_weights_to_vllm(
         f"aggregate-infer throughput={infer_payload_gib / elapsed:.3f} GiB/s"
     )
     return elapsed
-
-
-__all__ = ["sync_weights_to_vllm"]

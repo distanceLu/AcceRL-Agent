@@ -2,19 +2,22 @@
 """VSI-QA rollout worker and rollout statistics actor."""
 
 import argparse
+import asyncio
+import math
 import random
 import time
 from collections import deque
 from typing import Dict, List, Tuple
 
-from PIL import Image
-import pyarrow.parquet as pq
 import ray
 import torch
-from transformers import AutoProcessor
 
 """vsiqa"""
 import os
+
+from PIL import Image
+import pyarrow.parquet as pq
+from transformers import AutoProcessor
 
 from vsi_qa_rlvr.inference import InferenceResult
 from vsi_qa_rlvr.P3_reward import P3Reward
@@ -61,13 +64,16 @@ class StatsActor:
     """Aggregates rollout metrics from async rollout workers."""
 
     def __init__(self, window_size: int, active_timeout_seconds: float):
+        self.worker_last_active = {}
+        self.active_timeout_seconds = active_timeout_seconds
+        """vsiqa"""
         self.reward_sums = deque(maxlen=window_size)
         self.response_lengths = deque(maxlen=window_size)
         self.abort_flags = deque(maxlen=window_size)
-        self.worker_last_active = {}
-        self.active_timeout_seconds = active_timeout_seconds
         self.total_episodes = 0
+        """vsiqa"""
 
+    """vsiqa"""
     def add_rollout_batch(
         self,
         worker_id: int,
@@ -86,14 +92,15 @@ class StatsActor:
         self.abort_flags.extend(bool(value) for value in abort_flags)
         self.total_episodes += len(rewards)
         self.worker_last_active[int(worker_id)] = time.time()
+    """vsiqa"""
 
     def get_stats(self) -> Dict[str, float]:
-        now = time.time()
-        active_cutoff = now - self.active_timeout_seconds
+        active_cutoff = time.time() - self.active_timeout_seconds
         active_workers = sum(
-            1 for last_active in self.worker_last_active.values()
-            if last_active >= active_cutoff
+            last_active >= active_cutoff
+            for last_active in self.worker_last_active.values()
         )
+        """vsiqa"""
         reward_count = len(self.reward_sums)
         response_count = len(self.response_lengths)
         abort_count = len(self.abort_flags)
@@ -111,10 +118,11 @@ class StatsActor:
             "active_workers": active_workers,
             "total_episodes": self.total_episodes,
         }
+        """vsiqa"""
 
 
 class RolloutWorkerActor:
-    """CPU Ray actor that builds prompts and feeds token IDs to InferActor."""
+    """CPU Ray actor that generates rollouts and writes RL samples to Replay."""
 
     def __init__(
         self,
@@ -126,9 +134,9 @@ class RolloutWorkerActor:
     ):
         self.args = args
         self.infer_actor = infer_actor
+        self.worker_id = int(worker_id)
         self.replay_buffer = replay_buffer
         self.stats_actor = stats_actor
-        self.worker_id = int(worker_id)
 
         """vsiqa"""
         self.processor = AutoProcessor.from_pretrained(
@@ -142,16 +150,21 @@ class RolloutWorkerActor:
         else:
             self.reward = IncrementalCountingReward(self.tokenizer)
         self.train_examples = load_train_data(args.data_path)
-        print(
-            "[rollout] "
-            f"worker={self.worker_id} loaded ScanNet examples: "
-            f"count={len(self.train_examples)} "
-            "image_pixels=from_parquet "
-            f"path={args.data_path!r}"
-        )
-        """vsiqa"""
+        if self._log_detail:
+            print(
+                "[rollout] "
+                f"worker={self.worker_id} loaded ScanNet examples: "
+                f"count={len(self.train_examples)} "
+                "image_pixels=from_parquet "
+                f"path={args.data_path!r}"
+            )
         self.batch_id = 0
         self.stopped = False
+        """vsiqa"""
+
+    @property
+    def _log_detail(self) -> bool:
+        return self.worker_id == 0
 
     async def stop(self):
         self.stopped = True
@@ -194,27 +207,40 @@ class RolloutWorkerActor:
         }
     """vsiqa"""
 
-    def compute_group_advantages(self, rewards: List[float]) -> List[float]:
+    def _compute_token_level_advantages(
+        self,
+        labels: List[int],
+        token_rewards: List[float],
+    ) -> List[float]:
+        if len(labels) != len(token_rewards):
+            raise ValueError("labels and token_rewards must have the same length.")
+        advantages = [0.0] * len(labels)
+        running_return = 0.0
+        for index in range(len(labels) - 1, -1, -1):
+            if labels[index] == -100:
+                continue
+            running_return = (
+                float(token_rewards[index])
+                + self.args.ppo_gamma * running_return
+            )
+            advantages[index] = running_return
+        return advantages
+
+    def _compute_grpo_group_advantages(
+        self,
+        rewards: List[float],
+    ) -> Tuple[float, float, List[float]]:
         if not rewards:
-            return []
-
-        valid_count = sum(1 for reward in rewards if reward > 0.0)
-        if valid_count <= 1:
-            return [0.0 for _ in rewards]
-
-        reward_range = max(rewards) - min(rewards)
-        if reward_range < 1e-6:
-            return [0.0 for _ in rewards]
-
-        rewards_t = torch.tensor(rewards, dtype=torch.float64)
-
-        mean = rewards_t.mean()
-        std = rewards_t.std(unbiased=False)
-        if std.item() < 1e-6:
-            return [0.0 for _ in rewards]
-
-        advantages = (rewards_t - mean) / (std + 1e-6)
-        return [float(value) for value in advantages.tolist()]
+            return 0.0, 0.0, []
+        mean = sum(rewards) / len(rewards)
+        variance = sum((reward - mean) ** 2 for reward in rewards) / len(rewards)
+        std = math.sqrt(variance)
+        if len(rewards) <= 1 or std <= self.args.grpo_adv_eps:
+            return mean, std, [0.0 for _ in rewards]
+        return mean, std, [
+            (reward - mean) / (std + self.args.grpo_adv_eps)
+            for reward in rewards
+        ]
 
     """vsiqa"""
     def build_rl_samples(
@@ -223,6 +249,7 @@ class RolloutWorkerActor:
         question: str,
         ground_truth: str,
         prompt: str,
+        batch_id: int,
         results: List[InferenceResult],
     ) -> List[RLSample]:
         decoded_texts = [
@@ -240,39 +267,86 @@ class RolloutWorkerActor:
             for generated_text, result in zip(decoded_texts, results)
         ]
         rewards = [info["reward"] for info in reward_infos]
-        advantages = self.compute_group_advantages(rewards)
-
-        return [
-            RLSample(
-                prompt_ids=list(input_ids),
-                response_ids=list(result.output_tokens),
-                old_response_logprobs=list(result.output_logprobs),
-                input_ids=list(input_ids) + list(result.output_tokens),
-                attention_mask=[1]
-                * (len(input_ids) + len(result.output_tokens)),
-                labels=[-100] * len(input_ids) + list(result.output_tokens),
-                reward=float(reward),
-                advantage=float(advantage),
-                question=question,
-                ground_truth=ground_truth,
-                format_reward=float(reward_info["format_reward"]),
-                answer_reward=float(reward_info["answer_reward"]),
-                rollout_worker_id=self.worker_id,
-                batch_id=result.batch_id,
-                sample_id=result.sample_id,
-                output_versions=list(result.output_versions),
-                stop_reason=result.stop_reason,
-                generated_text=generated_text,
-                prepared_media=self.prepared_media,
+        if self.args.rl_algorithm == "grpo":
+            _, _, advantages = self._compute_grpo_group_advantages(rewards)
+        elif self.args.rl_algorithm == "ppo":
+            advantages = [0.0 for _ in rewards]
+        else:
+            raise ValueError(
+                f"Unsupported rl_algorithm: {self.args.rl_algorithm}"
             )
-            for result, generated_text, reward_info, reward, advantage in zip(
+
+        samples = []
+        for sample_id, (
+            result,
+            generated_text,
+            reward_info,
+            reward,
+            advantage,
+        ) in enumerate(
+            zip(
                 results,
                 decoded_texts,
                 reward_infos,
                 rewards,
                 advantages,
             )
-        ]
+        ):
+            if (
+                not result.output_tokens
+                or result.stop_reason == "abort"
+                or len(result.output_logprobs) != len(result.output_tokens)
+                or len(result.output_versions) != len(result.output_tokens)
+            ):
+                continue
+            response_length = len(result.output_tokens)
+            labels = [-100] * len(input_ids) + list(result.output_tokens)
+            if self.args.rl_algorithm == "ppo":
+                token_rewards = [0.0] * len(labels)
+                token_rewards[-1] = float(reward)
+                token_advantages = self._compute_token_level_advantages(
+                    labels,
+                    token_rewards,
+                )
+                sample_advantage = 0.0
+            else:
+                token_advantages = (
+                    [0.0] * len(input_ids)
+                    + [float(advantage)] * response_length
+                )
+                sample_advantage = float(advantage)
+            samples.append(RLSample(
+                algorithm=self.args.rl_algorithm,
+                input_ids=list(input_ids) + list(result.output_tokens),
+                attention_mask=[1]
+                * (len(input_ids) + response_length),
+                labels=labels,
+                old_logprobs=(
+                    [0.0] * len(input_ids)
+                    + list(result.output_logprobs)
+                ),
+                advantage=sample_advantage,
+                token_advantages=token_advantages,
+                response_indices=(
+                    [-1] * len(input_ids) + [0] * response_length
+                ),
+                output_versions=list(result.output_versions),
+                prompt_ids=list(input_ids),
+                response_ids=list(result.output_tokens),
+                old_response_logprobs=list(result.output_logprobs),
+                reward=float(reward),
+                question=question,
+                ground_truth=ground_truth,
+                format_reward=float(reward_info["format_reward"]),
+                answer_reward=float(reward_info["answer_reward"]),
+                rollout_worker_id=self.worker_id,
+                batch_id=batch_id,
+                sample_id=sample_id,
+                stop_reason=result.stop_reason,
+                generated_text=generated_text,
+                prepared_media=self.prepared_media,
+            ))
+        return samples
     """vsiqa"""
 
     """vsiqa"""
@@ -360,35 +434,39 @@ class RolloutWorkerActor:
         return question, ground_truth, prompt
     """vsiqa"""
 
-    async def run(self):
+    async def run(self) -> Dict[str, int]:
+        """vsiqa"""
         while not self.stopped:
-            """vsiqa"""
             question, ground_truth, prompt = self.sample_rollout_prompt()
             input_ids = self.prepared_media["prompt_token_ids"].tolist()
-            """vsiqa"""
             current_batch_id = self.batch_id
             self.batch_id += 1
-            """vsiqa"""
-            results = await self.infer_actor.request_batch.remote(
-                self.worker_id,
-                current_batch_id,
-                self.vllm_prompt,
-                self.args.infer_max_tokens,
-                self.args.rollout_batch_size,
+            num_samples = (
+                self.args.grpo_group_size
+                if self.args.rl_algorithm == "grpo"
+                else self.args.rollout_batch_size
             )
-            """vsiqa"""
+            request_refs = [
+                self.infer_actor.request_batch.remote(
+                    self.vllm_prompt,
+                    self.args.infer_max_tokens,
+                )
+                for _ in range(num_samples)
+            ]
+            results = await asyncio.gather(*request_refs)
             if not results:
                 continue
 
-            """vsiqa"""
             rl_samples = self.build_rl_samples(
                 input_ids=list(input_ids),
                 question=question,
                 ground_truth=ground_truth,
                 prompt=prompt,
+                batch_id=current_batch_id,
                 results=results,
             )
-            """vsiqa"""
+            if not rl_samples:
+                continue
             self.replay_buffer.add_samples.remote(rl_samples)
             self.stats_actor.add_rollout_batch.remote(
                 self.worker_id,
@@ -403,7 +481,15 @@ class RolloutWorkerActor:
             reward_t = torch.tensor(rewards, dtype=torch.float32)
             advantage_t = torch.tensor(advantages, dtype=torch.float32)
             response_length_t = torch.tensor(response_lengths, dtype=torch.float32)
-            version_ranges = sorted({result.version_range for result in results})
+            version_ranges = sorted({
+                (
+                    f"{min(result.output_versions)}-"
+                    f"{max(result.output_versions)}"
+                    if result.output_versions
+                    else "none"
+                )
+                for result in results
+            })
             stop_reasons = sorted({
                 str(sample.stop_reason)
                 for sample in rl_samples
@@ -424,3 +510,4 @@ class RolloutWorkerActor:
 
         print(f"[rollout] worker={self.worker_id} stopped.")
         return {"worker_id": self.worker_id, "batches": self.batch_id}
+        """vsiqa"""

@@ -19,8 +19,6 @@ class ReplayBufferActor:
         self.total_samples_added = 0
         self.total_samples_sampled = 0
         self.total_samples_evicted = 0
-        self.total_batches_added = 0
-        self.total_batches_sampled = 0
 
     def add_samples(self, samples: List[RLSample]) -> Dict[str, int]:
         capacity = self.samples.maxlen or 0
@@ -31,7 +29,6 @@ class ReplayBufferActor:
             )
         self.samples.extend(samples)
         self.total_samples_added += len(samples)
-        self.total_batches_added += 1
         return self.get_stats()
 
     def sample(self, batch_size: int) -> List[RLSample]:
@@ -42,7 +39,6 @@ class ReplayBufferActor:
             return []
         samples = random.sample(list(self.samples), sample_count)
         self.total_samples_sampled += len(samples)
-        self.total_batches_sampled += 1
         return samples
 
     def get_stats(self) -> Dict[str, int]:
@@ -52,6 +48,4 @@ class ReplayBufferActor:
             "total_samples_added": self.total_samples_added,
             "total_samples_sampled": self.total_samples_sampled,
             "total_samples_evicted": self.total_samples_evicted,
-            "total_batches_added": self.total_batches_added,
-            "total_batches_sampled": self.total_batches_sampled,
         }

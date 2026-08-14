@@ -3,9 +3,10 @@
 
 import asyncio
 import argparse
+import inspect
 import uuid
 from dataclasses import asdict
-from typing import List, Literal
+from typing import Dict, List, Literal
 
 import vllm
 from vllm import SamplingParams
@@ -20,17 +21,9 @@ from vllm.distributed.weight_transfer.nccl_engine import (
 )
 from vllm.v1.executor import Executor
 
-from vsi_qa_rlvr.inference import (
-    InferenceRequestItem,
-    InferenceResult,
-    OnlineGenerationState,
-    RepeatingInferenceStats,
-)
+from vsi_qa_rlvr.inference import InferenceResult, OnlineGenerationState
 
 
-INFERENCE_TP_SIZE = 1
-INFERENCE_DP_SIZE = 2
-INFER_LOG_EVERY_REQUESTS = 128
 """vsiqa"""
 ROLLOUT_ATTENTION_BACKENDS = ("FLASH_ATTN", "TRITON_ATTN")
 """vsiqa"""
@@ -38,6 +31,7 @@ ROLLOUT_ATTENTION_BACKENDS = ("FLASH_ATTN", "TRITON_ATTN")
 
 def create_async_engine(**kwargs):
     """Create an AsyncLLMEngine directly (no subclass needed)."""
+    kwargs = _filter_async_engine_args(kwargs)
     engine_args = vllm.AsyncEngineArgs(**kwargs)
     vllm_config = engine_args.create_engine_config()
     executor_class = Executor.get_class(vllm_config)
@@ -47,6 +41,24 @@ def create_async_engine(**kwargs):
         log_requests=engine_args.enable_log_requests,
         log_stats=not engine_args.disable_log_stats,
     )
+
+
+def _filter_async_engine_args(kwargs: Dict) -> Dict:
+    signature = inspect.signature(vllm.AsyncEngineArgs)
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return kwargs
+    filtered = {
+        key: value
+        for key, value in kwargs.items()
+        if key in signature.parameters
+    }
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        print(f"[vllm] Ignoring unsupported AsyncEngineArgs: {dropped}")
+    return filtered
 
 
 def _tokens_from_output(request_output) -> List[int]:
@@ -105,12 +117,14 @@ class InterruptibleGenerationRunner:
         engine,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        stop_sequences: List[str] | None = None,
         collect_logprobs: bool = False,
         max_resubmit_retries: int = 200,
     ):
         self.engine = engine
         self.temperature = temperature
         self.top_p = top_p
+        self.stop_sequences = stop_sequences or ["</answer>"]
         self.collect_logprobs = collect_logprobs
         self.max_resubmit_retries = max_resubmit_retries
         self.version = 0
@@ -124,10 +138,6 @@ class InterruptibleGenerationRunner:
 
     def resume(self) -> None:
         self.resume_event.set()
-
-    @property
-    def is_resumed(self) -> bool:
-        return self.resume_event.is_set()
 
     # 新的engine.generate() attempt开始 +1
     async def _increment_active_attempts(self) -> None:
@@ -146,7 +156,6 @@ class InterruptibleGenerationRunner:
         async with self._active_changed:
             await self._active_changed.wait_for(lambda: self._active_attempts == 0)
 
-    """vsiqa"""
     async def generate(
         self,
         state: OnlineGenerationState,
@@ -160,13 +169,12 @@ class InterruptibleGenerationRunner:
                 state.stop_reason = "length"
                 return state
 
-            state.attempts = attempt
             attempt_version = self.version
             sampling_kwargs = {
                 "temperature": self.temperature,
                 "top_p": self.top_p,
                 "max_tokens": remaining,
-                "stop": ["</answer>"],
+                "stop": self.stop_sequences,
             }
             if self.collect_logprobs:
                 sampling_kwargs["logprobs"] = 1
@@ -180,10 +188,10 @@ class InterruptibleGenerationRunner:
 
             await self._increment_active_attempts()
             try:
-                engine_input = state.restart_prompt_token_ids
                 # 调用vllm生成接口，拿到输出后更新state，如果生成过程中被weight update打断了，engine.generate()会抛出异常，直接进入finally块结束这个attempt
+                """vsiqa"""
                 async for request_output in self.engine.generate(
-                    engine_input,
+                    state.restart_prompt_token_ids,
                     sampling_params,
                     request_id=request_id,
                 ):
@@ -191,6 +199,7 @@ class InterruptibleGenerationRunner:
                     request_finished = bool(
                         getattr(request_output, "finished", False)
                     )
+                """vsiqa"""
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -246,207 +255,110 @@ class InterruptibleGenerationRunner:
             f"{self.max_resubmit_retries}; keeping partial output."
         )
         return state
-    """vsiqa"""
 
 
 class VLLMInferenceActor:
     """GPU Ray actor that owns vLLM and consumes tokenized rollout requests."""
 
     def __init__(self, args: argparse.Namespace):
-        self.args = args
-        """vsiqa"""
-        self.engine = create_async_engine(
+        engine_kwargs = dict(
             model=args.model_path,
-            trust_remote_code=True,
-            dtype="bfloat16",
-            enforce_eager=False,
-            tensor_parallel_size=INFERENCE_TP_SIZE,
-            data_parallel_size=INFERENCE_DP_SIZE,
+            trust_remote_code=args.trust_remote_code,
+            enforce_eager=True,
+            tensor_parallel_size=args.infer_tp_size,
+            data_parallel_size=args.infer_size,
+            enable_expert_parallel=True,
             distributed_executor_backend="mp",
             data_parallel_backend="mp",
-            load_format="dummy",
-            gpu_memory_utilization=args.rollout_gpu_memory_utilization,
-            max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+            gpu_memory_utilization=0.8,
             max_num_seqs=args.vllm_max_num_seqs,
-            max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+            enable_prefix_caching=not args.disable_vllm_prefix_caching,
+            weight_transfer_config=WeightTransferConfig(backend="nccl"),
+            load_format="dummy",
+        )
+        if args.vllm_max_model_len is not None:
+            engine_kwargs["max_model_len"] = args.vllm_max_model_len
+        """vsiqa"""
+        engine_kwargs.update(
             attention_backend=args.rollout_attention_backend,
             mm_encoder_attn_backend=args.rollout_attention_backend,
-            logprobs_mode="raw_logprobs",
             allowed_local_media_path="/",
             limit_mm_per_prompt={"image": args.limit_images},
-            weight_transfer_config=WeightTransferConfig(backend="nccl"),
         )
+        """vsiqa"""
+        self.engine = create_async_engine(**engine_kwargs)
         """vsiqa"""
         self.runner = InterruptibleGenerationRunner(
             self.engine,
             temperature=args.infer_temperature,
             top_p=args.infer_top_p,
-            collect_logprobs=args.clip_mode != "none",
+            stop_sequences=["</answer>"],  # Qwen/VSI-QA answer terminator.
+            collect_logprobs=True,
         )
+        """vsiqa"""
         self.active_generation_tasks = set()
-        self.stats = RepeatingInferenceStats()
+        self.total_tokens = 0
         self.next_request_index = 0
-        self.pending_futures = set()
         self.stopped = False
-        """vsiqa"""
-        print(
-            "[infer-actor] AsyncLLMEngine ready: "
-            f"tp={INFERENCE_TP_SIZE} dp={INFERENCE_DP_SIZE} "
-            "continuous_submit=True "
-            f"vllm_max_num_seqs={args.vllm_max_num_seqs} "
-            f"vllm_max_num_batched_tokens="
-            f"{args.vllm_max_num_batched_tokens} "
-            f"attention_backend={args.rollout_attention_backend} "
-            f"infer_temperature={args.infer_temperature} "
-            f"infer_top_p={args.infer_top_p}"
-        )
-        """vsiqa"""
-
-    async def start(self):
-        self.stopped = False
-        print(
-            "[infer-actor] Continuous submit mode enabled; "
-            "vLLM handles batching internally."
-        )
-        return {"continuous_submit": True, "inference_loop_task": 0}
 
     """vsiqa"""
     async def request_batch(
         self,
-        rollout_worker_id: int,
-        batch_id: int,
         input_ids: dict,  # Qwen3-VL receives the multimodal vLLM prompt dictionary.
         infer_max_tokens: int,
-        num_samples: int,
-    ) -> List[InferenceResult]:
+    ) -> InferenceResult:
         if self.stopped:
             raise RuntimeError("VLLMInferenceActor is stopped.")
-        if num_samples < 1:
-            return []
 
         engine_inputs = await self.engine.renderer.render_cmpl_async(
             [input_ids]
         )
         llm_input = engine_inputs[0]
-
-        requests_to_process = []
-        for sample_id in range(num_samples):
-            request_index = self.next_request_index
-            self.next_request_index += 1
-            item = InferenceRequestItem(
-                request_index=request_index,
-                rollout_worker_id=int(rollout_worker_id),
-                batch_id=int(batch_id),
-                sample_id=int(sample_id),
-                input_ids=llm_input,
-                requested_max_tokens=int(infer_max_tokens),
-            )
-            requests_to_process.append(item)
-
-        return await self._run_generation_items(requests_to_process)
+        request_index = self.next_request_index
+        self.next_request_index += 1
+        state = OnlineGenerationState(
+            index=request_index,
+            input_ids=llm_input,
+            requested_max_tokens=int(infer_max_tokens),
+        )
+        return await self._run_generation(state)
     """vsiqa"""
 
-    async def _run_generation_items(
+    async def _run_generation(
         self,
-        requests_to_process: List[InferenceRequestItem],
-    ) -> List[InferenceResult]:
-        current_call = asyncio.current_task()
-        if current_call is not None:
-            self.pending_futures.add(current_call)
-
-        generation_tasks = []
+        state: OnlineGenerationState,
+    ) -> InferenceResult:
+        generation_task = asyncio.create_task(self.runner.generate(state))
+        self.active_generation_tasks.add(generation_task)
+        generation_task.add_done_callback(self.active_generation_tasks.discard)
         try:
-            for item in requests_to_process:
-                """vsiqa"""
-                state = OnlineGenerationState(
-                    index=item.request_index,
-                    input_ids=item.input_ids,
-                    requested_max_tokens=item.requested_max_tokens,
-                )
-                """vsiqa"""
-                task = asyncio.create_task(self.runner.generate(state))
-                self.active_generation_tasks.add(task)
-                task.add_done_callback(self.active_generation_tasks.discard)
-                generation_tasks.append(task)
+            completed_state = await generation_task
+        except asyncio.CancelledError:
+            if not generation_task.done():
+                generation_task.cancel()
+            await asyncio.gather(generation_task, return_exceptions=True)
+            raise
 
-            try:
-                completed_states = await asyncio.gather(
-                    *generation_tasks,
-                    return_exceptions=True,
-                )
-            except asyncio.CancelledError:
-                for task in generation_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*generation_tasks, return_exceptions=True)
-                raise
-
-            results = []
-            first_exception = None
-            for item, completed_state in zip(requests_to_process, completed_states):
-                if isinstance(completed_state, BaseException):
-                    if first_exception is None:
-                        first_exception = completed_state
-                    continue
-
-                result = InferenceResult(
-                    request_index=item.request_index,
-                    rollout_worker_id=item.rollout_worker_id,
-                    batch_id=item.batch_id,
-                    sample_id=item.sample_id,
-                    output_tokens=list(completed_state.output_tokens),
-                    output_logprobs=list(completed_state.output_logprobs),
-                    output_versions=list(completed_state.output_versions),
-                    stop_reason=completed_state.stop_reason,
-                    attempts=completed_state.attempts,
-                )
-                await self._record_completed_state(result)
-                results.append(result)
-
-            if first_exception is not None:
-                raise first_exception
-            return results
-        finally:
-            if current_call is not None:
-                self.pending_futures.discard(current_call)
-
-    async def _record_completed_state(
-        self,
-        result: InferenceResult,
-    ) -> None:
-        self.stats.total_requests += 1
-        self.stats.total_tokens += len(result.output_tokens)
-
-        if self.stats.total_requests % INFER_LOG_EVERY_REQUESTS == 0:
-            print(
-                "[infer-actor] Batch progress: "
-                f"completed_requests={self.stats.total_requests} "
-                f"total_tokens={self.stats.total_tokens} "
-                f"active_generation_tasks={len(self.active_generation_tasks)} "
-                f"active_attempts={self.runner._active_attempts} "
-                f"latest_worker={result.rollout_worker_id} "
-                f"latest_batch={result.batch_id} "
-                f"latest_sample={result.sample_id} "
-                f"latest_request={result.request_index} "
-                f"latest_tokens={len(result.output_tokens)} "
-                f"latest_versions={result.version_range}"
-            )
+        result = InferenceResult(
+            output_tokens=list(completed_state.output_tokens),
+            output_logprobs=list(completed_state.output_logprobs),
+            output_versions=list(completed_state.output_versions),
+            stop_reason=completed_state.stop_reason,
+        )
+        self.total_tokens += len(result.output_tokens)
+        return result
 
     async def pause_and_wait_idle(self):
         self.runner.pause()
         await self.engine.pause_generation(mode="abort", clear_cache=True)
         await self.runner.wait_for_idle()
-        print("[infer-actor] Generation paused and in-flight attempts drained.")
 
     async def resume_generation(self, increment_version: bool = False):
         if increment_version:
             self.runner.version += 1
         await self.engine.resume_generation()
         self.runner.resume()
-        print(
-            "[infer-actor] Generation resumed: "
-            f"weight_version={self.runner.version}"
-        )
         return self.runner.version
 
     async def init_weight_transfer_engine(
@@ -495,17 +407,7 @@ class VLLMInferenceActor:
         await self.engine.finish_weight_update()
 
     def get_stats(self):
-        return {
-            "pending_futures": len(self.pending_futures),
-            "total_requests": self.stats.total_requests,
-            "total_tokens": self.stats.total_tokens,
-            "active_attempts": self.runner._active_attempts,
-            "active_generation_tasks": len(self.active_generation_tasks),
-            "vllm_max_num_seqs": self.args.vllm_max_num_seqs,
-            "vllm_max_num_batched_tokens": self.args.vllm_max_num_batched_tokens,
-            "weight_version": self.runner.version,
-            "resumed": self.runner.is_resumed,
-        }
+        return {"total_tokens": self.total_tokens}
 
     async def shutdown(self):
         self.stopped = True
