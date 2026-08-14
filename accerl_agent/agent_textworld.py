@@ -686,16 +686,17 @@ def build_value_head(
     return value_head, loaded
 
 
-def validate_ppo_selected_forward_support(model, args) -> None:
-    """Reject PPO policies that cannot provide selected logits and hidden."""
-    if args.rl_algorithm != "ppo":
-        return
+def validate_selected_forward_support(model, args) -> None:
+    """Validate model capabilities required by the selected RL forward path."""
     forward_parameters = inspect.signature(model.forward).parameters
     if "logits_to_keep" not in forward_parameters:
         raise RuntimeError(
-            "PPO requires a model forward with explicit tensor "
+            f"{args.rl_algorithm.upper()} requires a model forward with "
+            "explicit tensor "
             "logits_to_keep support; no full-logits fallback is provided."
         )
+    if args.rl_algorithm != "ppo":
+        return
     lm_head = getattr(model, "lm_head", None)
     if not isinstance(lm_head, torch.nn.Module):
         raise RuntimeError(
@@ -903,8 +904,9 @@ class FSDPTrainWorker:
         self.tokenizer = build_tokenizer(args, log=rank == 0)
         torch_dtype = pick_dtype(args.dtype)
         model = build_model(args, self.device, torch_dtype, log=rank == 0)
-        # 验证取hidden_state和logits的forward是否支持selected_positions参数,同时计算 Policy logits 和 PPO value
-        validate_ppo_selected_forward_support(model, args)
+        # Validate selected-logit support for PPO/GRPO forwards and
+        # the model-native lm_head needed to capture PPO value features.
+        validate_selected_forward_support(model, args)
         configure_full_training(model)
         log_parameter_count(model, rank=rank)
 
@@ -1366,19 +1368,11 @@ class FSDPTrainWorker:
         if "moe" in model_type or hasattr(self.model.config, "num_experts"):
             model_kwargs["output_router_logits"] = False
 
-        if self.args.train_logprob_mode == "full_logits_ce":
-            outputs = self.model(**model_kwargs)
-            valid_logits = outputs.logits[0, prediction_indices, :]
-        elif self.args.train_logprob_mode == "response_only_lm_head":
-            outputs = self.model(
-                **model_kwargs,
-                logits_to_keep=prediction_indices,
-            )
-            valid_logits = outputs.logits.squeeze(0)
-        else:
-            raise ValueError(
-                f"Unsupported train_logprob_mode: {self.args.train_logprob_mode}"
-            )
+        outputs = self.model(
+            **model_kwargs,
+            logits_to_keep=prediction_indices,
+        )
+        valid_logits = outputs.logits.squeeze(0)
         valid_token_log_probs = -F.cross_entropy(
             valid_logits,
             valid_labels,
@@ -4463,7 +4457,7 @@ async def run_textworld_train(args: argparse.Namespace):
         f"max_length={args.max_length} "
         f"train_token_budget={args.train_token_budget} "
         f"train_pack_candidate_pool_size={args.train_pack_candidate_pool_size} "
-        f"train_logprob_mode={args.train_logprob_mode} "
+        "logprob_forward=response_only_lm_head "
         "ppo_forward_mode="
         f"{'selected_positions' if args.rl_algorithm == 'ppo' else 'inactive'} "
         "ppo_layout="
@@ -5104,20 +5098,6 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help=(
             "Fixed number of packs prepared per rank for each optimizer step."
-        ),
-    )
-    parser.add_argument(
-        "--train-logprob-mode",
-        type=str,
-        default="full_logits_ce",
-        choices=["full_logits_ce", "response_only_lm_head"],
-        help=(
-            "How GRPO computes per-token logprobs. PPO uses "
-            "the native selected-position logits_to_keep path. "
-            "'full_logits_ce' keeps the standard model forward but avoids "
-            "materializing full log_softmax; "
-            "'response_only_lm_head' passes packed prediction indices through "
-            "the model-native logits_to_keep API."
         ),
     )
     parser.add_argument(

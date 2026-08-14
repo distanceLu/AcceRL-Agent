@@ -56,12 +56,12 @@ This project targets Linux GPU environments. Exact package versions must match y
 
 Several parts of the current code assume a model layout close to Qwen/Qwen-MoE, such as `model.model.layers` and `lm_head`. If you use another HuggingFace model family, carefully check `build_model()`, `configure_full_training()`, the FSDP wrapping path, and `iter_vllm_loadable_weights()`.
 
-Packed training requires a GPU-supported `flash-attn`
-build. The `response_only_lm_head` logprob mode also requires a Transformers
-model that implements tensor `logits_to_keep`; packed GRPO with `full_logits_ce`
-does not require that API. Transformers 5.12.1 with Qwen/Qwen-MoE is the
-currently verified combination for response-only LM-head projection. Other
-Transformers versions or model classes may not support this API.
+Packed training requires a GPU-supported `flash-attn` build. PPO and GRPO use
+the `response_only_lm_head` logprob mode and therefore require a Transformers
+model that implements tensor `logits_to_keep`. Transformers 5.12.1 with
+Qwen/Qwen-MoE is the currently verified combination for response-only LM-head
+projection. Other Transformers versions or model classes may not support this
+API.
 
 ## Installation
 
@@ -163,7 +163,6 @@ python -m accerl_agent.run_agent_textworld \
   --rl-algorithm grpo \
   --train-token-budget 16384 \
   --train-pack-candidate-pool-size 64 \
-  --train-logprob-mode response_only_lm_head \
   --dtype bfloat16
 ```
 
@@ -372,7 +371,6 @@ trajectory-level advantage.
 | `--ppo-advantage-min-scale` | Positive scale floor for EMA normalization; defaults to `1e-3`. |
 | `--train-token-budget` | Maximum real tokens in a pack; required and must be at least `--max-length`. |
 | `--train-pack-candidate-pool-size` | Replay candidate pool used for length-aware packing; defaults to four times `--train-max-sequences-per-pack`. |
-| `--train-logprob-mode` | GRPO logprob mode. PPO always uses its native selected-position forward. |
 | `--grad-accum-steps` | Gradient accumulation steps. |
 | `--replay-capacity` | Maximum number of samples in each replay buffer. |
 | `--min-replay-size-per-rank` | Minimum replay size required before a trainer rank starts training. |
@@ -460,6 +458,5 @@ disable normalization with `--ppo-advantage-normalization none`.
 If packed model loading fails, verify that `flash_attn` imports in the trainer
 environment, the model supports `flash_attention_2`, and the dtype is
 `bfloat16`, `float16`, or `auto`. If
-`--train-logprob-mode response_only_lm_head` fails, also confirm that the model
-forward accepts tensor `logits_to_keep`; alternatively, use
-`--train-logprob-mode full_logits_ce` for GRPO.
+the selected-position logprob forward fails, also confirm that the model
+forward accepts tensor `logits_to_keep`.

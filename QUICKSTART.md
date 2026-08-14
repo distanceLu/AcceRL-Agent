@@ -195,7 +195,6 @@ python -m accerl_agent.run_agent_textworld \
   --rl-algorithm grpo \
   --train-token-budget 16384 \
   --train-pack-candidate-pool-size 64 \
-  --train-logprob-mode response_only_lm_head \
   --dtype bfloat16
 ```
 
@@ -392,9 +391,5 @@ This is the most important stability check. Every sample must guarantee:
   trainers.
 - Use `bfloat16`, `float16`, or `auto`.
 - Confirm that the model supports Transformers `flash_attention_2`.
-- When using `--train-logprob-mode response_only_lm_head`, confirm that the
-  CausalLM forward accepts tensor `logits_to_keep`; this is verified with
-  Transformers 5.12.1 Qwen/Qwen-MoE. Packed GRPO with `full_logits_ce` does not
-  require this API.
-- To diagnose response-only projection compatibility for GRPO,
-  switch to `--train-logprob-mode full_logits_ce`.
+- Confirm that the CausalLM forward accepts tensor `logits_to_keep`; this is verified with
+  Transformers 5.12.1 Qwen/Qwen-MoE. PPO and GRPO both require this API.
