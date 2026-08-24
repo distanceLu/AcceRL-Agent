@@ -1,0 +1,12 @@
+# Verified AcceRL-Agent training stack.
+# Install the CUDA-compatible PyTorch wheel first, then install this file with
+# --no-build-isolation so FlashAttention can import torch while building.
+torch==2.11.0
+transformers==5.12.1
+vllm==0.24.0
+flash-attn==2.8.3.post1
+ray[default]==2.56.0
+textworld==1.7.0
+tensorboard==2.21.0
+safetensors==0.8.0
+huggingface-hub==1.21.0
