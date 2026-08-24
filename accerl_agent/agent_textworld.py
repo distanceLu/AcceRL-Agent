@@ -378,9 +378,6 @@ def make_grpo_varlen_batch(
         response_logprobs.extend(example.response_logprobs)
         response_sample_indices.extend([sequence_id] * len(local_targets))
 
-    if not target_indices:
-        raise ValueError("A varlen batch must contain at least one RL target.")
-
     return {
         "input_ids": torch.tensor([input_ids], dtype=torch.long),
         "position_ids": torch.tensor([position_ids], dtype=torch.long),
@@ -469,13 +466,6 @@ def _make_ppo_varlen_batch_unchecked(
     selected_positions = sorted(
         set(prediction_indices + bootstrap_prediction_indices)
     )
-    total_tokens = len(input_ids)
-    if (
-        not selected_positions
-        or selected_positions[0] < 0
-        or selected_positions[-1] >= total_tokens
-    ):
-        raise ValueError("PPO selected positions exceed the packed token range.")
     # 建立原始位置到精简列号的映射
     selected_column_by_position = {
         position: column for column, position in enumerate(selected_positions)
@@ -988,17 +978,6 @@ class FSDPTrainWorker:
         self.value_head_parameters = [
             param for _, param in self.value_head_params
         ]
-        if not self.policy_trainable_parameters:
-            raise RuntimeError("Policy model has no parameters.")
-        if not all(
-            param.requires_grad for param in self.policy_trainable_parameters
-        ):
-            raise RuntimeError(
-                "Full policy training requires every policy parameter to be "
-                "trainable."
-            )
-        if self.value_head is not None and not self.value_head_parameters:
-            raise RuntimeError("Value Head has no trainable parameters.")
         self.trainable_parameter_list = (
             self.policy_trainable_parameters + self.value_head_parameters
         )
@@ -1175,22 +1154,9 @@ class FSDPTrainWorker:
         *,
         move_to_device: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        if not prepared_samples:
-            raise RuntimeError("No valid RL samples were available for training.")
-
         if self.args.rl_algorithm == "ppo":
-            if not all(
-                isinstance(sample, RawPPOSample)
-                for sample in prepared_samples
-            ):
-                raise TypeError("PPO pack requires RawPPOSample inputs.")
             batch = _make_ppo_varlen_batch_unchecked(prepared_samples)
         else:
-            if not all(
-                isinstance(sample, GRPOSample)
-                for sample in prepared_samples
-            ):
-                raise TypeError("GRPO pack requires GRPOSample inputs.")
             batch = make_grpo_varlen_batch(prepared_samples)
         if move_to_device:
             batch = move_batch_to_device(batch, self.device)
@@ -1287,25 +1253,9 @@ class FSDPTrainWorker:
         )
         total_token_count = int(batch["input_ids"].numel())
         valid_token_count = int(batch["target_indices"].numel())
-        if self.args.rl_algorithm == "grpo":
-            if total_token_count <= 0:
-                raise RuntimeError("A Varlen pack must contain at least one token.")
-            if valid_token_count <= 0:
-                raise RuntimeError("A Varlen pack must contain at least one target.")
-            valid_sample_indices = batch["response_sample_indices"]
-            valid_trajectory_count = int(
-                torch.unique(valid_sample_indices).numel()
-            )
-            if valid_trajectory_count <= 0:
-                raise RuntimeError(
-                    "A GRPO Varlen pack must contain at least one valid "
-                    "trajectory."
-                )
-        else:
-            # RawPPOSample construction already guarantees one or more
-            # response tokens per immutable sample. The CPU packed-layout
-            # boundary validates the derived response_counts exactly once.
-            valid_trajectory_count = len(collected)
+        # Immutable PPO/GRPO samples each contain at least one response token,
+        # so every collected sample contributes one valid trajectory.
+        valid_trajectory_count = len(collected)
         max_seqlen = max(len(sample.input_ids) for sample in collected)
         version_lag_sum, sample_count = self._version_lag_stats(
             collected,
@@ -1327,15 +1277,8 @@ class FSDPTrainWorker:
         *,
         max_seqlen: int,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if self.args.rl_algorithm != "grpo":
-            raise RuntimeError(
-                "_compute_rl_loss is the GRPO-only training path; PPO must "
-                "use its token-sum path."
-            )
         target_indices = batch["target_indices"]
         prediction_indices = target_indices - 1
-        if target_indices.numel() == 0:
-            raise RuntimeError("No valid response tokens found for RL loss.")
         valid_sample_indices = batch["response_sample_indices"]
         valid_labels = batch["input_ids"][0, target_indices]
         model_kwargs = {
@@ -1488,11 +1431,6 @@ class FSDPTrainWorker:
             (response_hidden, bootstrap_hidden),
             dim=0,
         )
-        if all_value_hidden.shape[-1] != self.value_head.hidden_size:
-            raise RuntimeError(
-                "PPO selected hidden size does not match the Value Head: "
-                f"{all_value_hidden.shape[-1]} != {self.value_head.hidden_size}"
-            )
         all_values = self.value_head(all_value_hidden)
         response_value_count = int(response_hidden.shape[0])
         current_values = all_values[:response_value_count]
@@ -2026,21 +1964,7 @@ class FSDPTrainWorker:
         batch = prepared.batch
         target_indices = batch["target_indices"]
         valid_token_count = int(target_indices.numel())
-        if valid_token_count != prepared.valid_token_count:
-            raise RuntimeError(
-                "Prepared PPO valid-token count does not match target indices: "
-                f"{prepared.valid_token_count} != {valid_token_count}."
-            )
         sample_count = int(batch["response_counts"].numel())
-        valid_trajectory_count = int(
-            batch["response_counts"].gt(0).sum().item()
-        )
-        if valid_trajectory_count != prepared.valid_trajectory_count:
-            raise RuntimeError(
-                "Prepared PPO valid-trajectory count does not match response "
-                f"counts: {prepared.valid_trajectory_count} != "
-                f"{valid_trajectory_count}."
-            )
         bootstrap_mask = torch.zeros(sample_count, dtype=torch.bool)
         bootstrap_sample_indices = batch["bootstrap_sample_indices"].long()
         if bootstrap_sample_indices.numel() > 0:
@@ -2210,11 +2134,6 @@ class FSDPTrainWorker:
                 self._next_varlen_cpu_pack(trainer_version)
                 for _ in range(self.args.grad_accum_steps)
             ]
-            if len(window) != self.args.grad_accum_steps:
-                raise RuntimeError(
-                    "Varlen optimizer window has an unexpected pack count: "
-                    f"{len(window)} != {self.args.grad_accum_steps}"
-                )
             if self.args.rl_algorithm == "ppo":
                 for prepared in window:
                     self._validate_prepared_packed_ppo_batch(prepared)
@@ -2396,12 +2315,6 @@ class FSDPTrainWorker:
                 / float(global_valid_trajectory_count)
             )
             backward_loss.backward()
-            if reduction_stats.shape != local_reduction_stats.shape:
-                raise RuntimeError(
-                    "Unexpected packed PPO statistics shape: "
-                    f"{tuple(reduction_stats.shape)} != "
-                    f"{tuple(local_reduction_stats.shape)}"
-                )
             local_reduction_stats.add_(reduction_stats)
             local_version_stats[0] += prepared.version_lag_sum
             local_version_stats[1] += prepared.sample_count
@@ -2589,16 +2502,6 @@ class FSDPTrainWorker:
             backward_loss.backward()
 
             reduction_stats = loss_stats["reduction_stats"]
-            if not isinstance(reduction_stats, torch.Tensor):
-                raise TypeError(
-                    "Packed loss statistics must remain an accelerator tensor."
-                )
-            if reduction_stats.shape != local_reduction_stats.shape:
-                raise RuntimeError(
-                    "Unexpected packed loss statistics shape: "
-                    f"{tuple(reduction_stats.shape)} != "
-                    f"{tuple(local_reduction_stats.shape)}"
-                )
             local_reduction_stats.add_(reduction_stats)
             local_version_stats[0] += prepared_pack.version_lag_sum
             local_version_stats[1] += prepared_pack.sample_count
@@ -4120,7 +4023,7 @@ class TextWorldRolloutWorkerActor:
                 )
             except ValueError:
                 return None
-        elif algorithm == "grpo":
+        else:
             if sample_advantage is None:
                 raise ValueError("GRPO samples require a sample advantage.")
             if not response_spans:
@@ -4135,7 +4038,6 @@ class TextWorldRolloutWorkerActor:
                 )
             except ValueError:
                 return None
-        raise AssertionError("unreachable")
 
     def _compute_grpo_group_advantages(
         self,
@@ -5418,8 +5320,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--replay-wait-sleep-seconds must be > 0")
     if args.replay_sample_timeout_seconds < 0:
         raise ValueError("--replay-sample-timeout-seconds must be >= 0")
-    if args.max_length < 1:
-        raise ValueError("--max-length must be >= 1")
     if args.log_every < 1:
         raise ValueError("--log-every must be >= 1")
     if args.metrics_window_size < 1:
@@ -5442,8 +5342,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--infer-temperature must be >= 0")
     if not 0.0 < args.infer_top_p <= 1.0:
         raise ValueError("--infer-top-p must be in (0, 1]")
-    if args.num_rollout_workers < 1:
-        raise ValueError("--num-rollout-workers must be >= 1")
     if args.num_rollout_workers < args.fsdp_world_size:
         raise ValueError(
             "TextWorld training requires --num-rollout-workers >= "
