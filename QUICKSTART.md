@@ -4,6 +4,10 @@ This guide takes a fresh checkout through the currently used end-to-end
 TextWorld training configuration. It also gives a recommended checklist for
 changing models or replacing the task.
 
+The canonical training entry point is
+`python -m accerl_agent.run_agent_textworld`; `agent_textworld.py` is its
+implementation module.
+
 All commands are intended to run from the repository root:
 
 ```bash
@@ -21,29 +25,28 @@ conda activate accerl-agent
 python -m pip install --upgrade pip setuptools wheel ninja packaging
 
 python -m pip install torch==2.11.0
-python -m pip install --no-build-isolation -r requirements.txt
+python -m pip install --no-build-isolation -r requirement.txt
 
 python -c "import flash_attn, ray, torch, transformers, vllm; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('transformers', transformers.__version__); print('vllm', vllm.__version__); print('flash-attn', flash_attn.__version__); print('ray', ray.__version__)"
 ```
 
-The required stack uses PyTorch 2.11.0, Transformers 5.12.1,
-vLLM 0.21.0 or newer, FlashAttention 2.8.3.post1, and Ray 2.56.0. The current
-local environment uses vLLM 0.24.0. PyTorch is installed first because
-FlashAttention imports it during its build. Keep `--no-build-isolation` on the
-second command. These packages are tightly coupled to the CUDA toolchain; if
-your cluster supplies a different validated stack, update all related pins
-together rather than changing only one package.
+`requirement.txt` pins the tested stack: PyTorch 2.11.0, Transformers 5.12.1,
+vLLM 0.24.0, FlashAttention 2.8.3.post1, Ray 2.56.0, TextWorld 1.7.0,
+TensorBoard 2.21.0, Safetensors 0.8.0, and Hugging Face Hub 1.21.0. PyTorch is
+installed first because FlashAttention imports it during its build. Keep
+`--no-build-isolation` on the second command. These packages are tightly
+coupled to CUDA and vLLM's weight-transfer API; update and validate the related
+pins together rather than changing only one package.
 
 ## 2. Download the Model and TextWorld Dataset
 
 The verified model is
 [Qwen/Qwen1.5-MoE-A2.7B-Chat](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat).
 It has approximately 14B total BF16 parameters and occupies about 27 GB after
-download. Install the Hugging Face CLI and download it into a repository-local
-artifact directory:
+download. The pinned Hugging Face Hub dependency provides the `hf` CLI. Use it
+to download the model into a repository-local artifact directory:
 
 ```bash
-python -m pip install --upgrade huggingface_hub
 command -v curl
 command -v unzip
 command -v hf
@@ -114,7 +117,10 @@ rollout actors.
 
 Start with the multi-trainer smoke test in `local_trainer.py`. It does not use TextWorld, vLLM, or rollout workers. It only validates tokenizer/model loading, response-only labels, Ray FSDP multi-trainer initialization, forward/backward, and optimizer steps.
 
-The example below starts 2 FSDP trainers and needs at least 2 visible GPUs:
+The example below starts 2 FSDP trainers and needs at least 2 visible GPUs.
+Each trainer first loads the complete model onto one GPU and only then shards
+the Transformer layers and root model with FSDP, so each trainer GPU must also
+fit the unsharded model initialization peak:
 
 ```bash
 python accerl_agent/local_trainer.py \
@@ -146,10 +152,14 @@ python accerl_agent/textworld_local_infer.py \
   --tensor-parallel-size 1 \
   --max-model-len 4096 \
   --vllm-max-num-seqs 4 \
-  --vllm-max-num-batched-tokens 2048
+  --vllm-max-num-batched-tokens 2048 \
+  --verbose
 ```
 
-Success criteria: episodes run until completion or the step limit, and logs show observations, model outputs, parsed actions, rewards, and done states.
+Success criteria: episodes run until completion or the step limit. With
+`--verbose`, logs show prompts, model outputs, parsed actions, selected actions,
+scores, and terminal states; the episode summary reports the final score and
+invalid-action count.
 
 ## 5. Run the Current End-to-End Training Configuration
 
@@ -163,6 +173,10 @@ The commonly used configuration below uses 3 FSDP trainer GPUs and one vLLM
 inference GPU, so at least 4 visible GPUs are required. It trains the full
 Qwen-MoE model with GRPO advantages, PPO-style policy clipping, FlashAttention
 packed training, and response-only LM-head projection:
+
+As in the smoke test, GPU count is only a placement requirement. Every trainer
+GPU must have enough memory for the full model before FSDP sharding, plus the
+initialization peak; the verified BF16 model is approximately 27 GB.
 
 ```bash
 python -m accerl_agent.run_agent_textworld \
@@ -291,7 +305,9 @@ For non-Qwen or non-Qwen-MoE style models, carefully check:
 - `build_tokenizer()`
 - `build_model()`
 - `configure_full_training()`
-- The `fully_shard(model.model.layers)` path in `FSDPTrainWorker.__init__()`
+- The loop that applies `fully_shard(layer)` to every
+  `model.model.layers` entry, then shards the PPO Value Head when present and
+  finally the root model
 - `iter_vllm_loadable_weights()`
 
 Common issues:
@@ -299,7 +315,9 @@ Common issues:
 - Transformer layers are not under `model.model.layers`.
 - The output head is not named `lm_head`.
 - HuggingFace parameter names do not match the names expected by the vLLM loader.
-- The tokenizer does not have a suitable chat template or pad token.
+- The tokenizer does not have a pad token. When it implements
+  `apply_chat_template`, the history transcript path specifically requires
+  Qwen `<|im_start|>` and `<|im_end|>` markers.
 
 ## 9. Change Tasks
 
@@ -308,7 +326,7 @@ For non-TextWorld tasks, prefer creating a new rollout actor instead of editing 
 The main system boundaries to keep are:
 
 ```python
-result = await infer_actor.request_batch.remote(...)
+result = await infer_actor.request_generation.remote(input_ids, infer_max_tokens)
 replay_buffer.add_samples.remote(samples)
 ```
 
@@ -345,7 +363,10 @@ This is the most important stability check. Every sample must guarantee:
   uses its final token as the bootstrap prediction position. TextWorld
   `step_limit` and `history_limit`
   samples are terminal failures and do not bootstrap.
-- GRPO retains token-aligned labels, logprobs, and output versions.
+- GRPO stores compact `response_spans`, response-aligned `response_logprobs`,
+  one trajectory-level `advantage`, and the maximum response-token
+  `behavior_version`. Labels are derived from `input_ids`; full-length labels,
+  logprobs, and per-token versions are not stored.
 - Rollout samples do not exceed `--tw-history-token-window`, and argument
   validation requires `--max-length >= --tw-history-token-window`.
 
@@ -362,7 +383,8 @@ This is the most important stability check. Every sample must guarantee:
 
 - Lower the temperature.
 - Reduce `--infer-max-tokens` or `--max-action-tokens`.
-- Enable more detailed inference logs.
+- Re-run `textworld_local_infer.py` with `--verbose`; the distributed training
+  launcher has no `--verbose` flag.
 - Confirm that the parser matches the output format.
 - Confirm that admissible commands are fully included in the prompt.
 

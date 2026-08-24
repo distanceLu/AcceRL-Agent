@@ -2,11 +2,15 @@
 
 AcceRL-Agent is an asynchronous framework for online reinforcement learning with language-model agents. The main example in this repository is a TextWorld training loop: the model samples actions online through vLLM, the environment returns rewards, an FSDP trainer asynchronously consumes rollout samples, and updated weights are hot-synced back into vLLM.
 
-Main entry point:
+Canonical entry point:
 
-```text
-accerl_agent/agent_textworld.py
+```bash
+python -m accerl_agent.run_agent_textworld --help
 ```
+
+`accerl_agent/run_agent_textworld.py` is the Ray-safe launcher.
+`accerl_agent/agent_textworld.py` contains the training implementation and is
+not the documented direct entry point.
 
 End-to-end loop:
 
@@ -40,13 +44,14 @@ If you only want to run the smallest working flow first, see [QUICKSTART.md](QUI
 | `accerl_agent/textworld_local_infer.py` | Checks vLLM inference and TextWorld environment interaction without training. |
 | `accerl_agent/local_trainer.py` | Local dummy SFT smoke test for tokenizer/model/FSDP training paths. |
 | `accerl_agent/vllm_*.py` | Experimental scripts for vLLM, NCCL, and rollout-engine work. |
+| `requirement.txt` | Pinned dependencies for the verified main training stack. |
 | `QUICKSTART.md` | Minimal run path, recommended scaling order, and troubleshooting checklist. |
 
 ## Requirements
 
 This project targets Linux GPU environments. Exact package versions must match your CUDA, PyTorch, and vLLM stack. The main training path requires at least:
 
-- Python >=3.10,<3.15. Python 3.10 is recommended for conda environments.
+- Python 3.10, which is the currently verified interpreter version.
 - NVIDIA GPUs and a CUDA-enabled PyTorch build.
 - PyTorch with FSDP2 support.
 - vLLM with the weight-transfer API around `WeightTransferConfig`.
@@ -54,7 +59,12 @@ This project targets Linux GPU environments. Exact package versions must match y
 - A local HuggingFace Causal LM model directory.
 - TextWorld `.z8` game files.
 
-Several parts of the current code assume a model layout close to Qwen/Qwen-MoE, such as `model.model.layers` and `lm_head`. If you use another HuggingFace model family, carefully check `build_model()`, `configure_full_training()`, the FSDP wrapping path, and `iter_vllm_loadable_weights()`.
+Several parts of the current code assume a model layout close to Qwen/Qwen-MoE,
+such as `model.model.layers` and `lm_head`. When history-window transcript
+formatting uses `apply_chat_template`, the template must also contain the Qwen
+`<|im_start|>` and `<|im_end|>` markers. If you use another HuggingFace model
+family, carefully check `build_model()`, `configure_full_training()`, the FSDP
+wrapping path, transcript formatting, and `iter_vllm_loadable_weights()`.
 
 Packed training requires a GPU-supported `flash-attn` build. PPO and GRPO use
 the `response_only_lm_head` logprob mode and therefore require a Transformers
@@ -68,7 +78,7 @@ API.
 The repository is not packaged as a pip package yet. Run scripts directly from the repository root.
 
 ```bash
-git clone <REPO_URL>
+git clone https://github.com/distanceLu/AcceRL-Agent.git
 cd AcceRL-Agent
 
 conda create -n accerl-agent python=3.10 -y
@@ -76,17 +86,18 @@ conda activate accerl-agent
 python -m pip install --upgrade pip setuptools wheel ninja packaging
 
 python -m pip install torch==2.11.0
-python -m pip install --no-build-isolation -r requirements.txt
+python -m pip install --no-build-isolation -r requirement.txt
 
 python -c "import flash_attn, ray, torch, transformers, vllm; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('transformers', transformers.__version__); print('vllm', vllm.__version__); print('flash-attn', flash_attn.__version__); print('ray', ray.__version__)"
 ```
 
-The required stack uses PyTorch 2.11.0, Transformers 5.12.1, vLLM 0.21.0 or
-newer, FlashAttention 2.8.3.post1, and Ray 2.56.0. The current local
-environment uses vLLM 0.24.0. Install PyTorch first because FlashAttention
-imports it while building, and keep `--no-build-isolation` on the requirements
-installation command. These packages are tightly coupled to CUDA; update the
-related pins together when using a different cluster-provided stack.
+`requirement.txt` records the tested stack: PyTorch 2.11.0, Transformers
+5.12.1, vLLM 0.24.0, FlashAttention 2.8.3.post1, Ray 2.56.0, TextWorld 1.7.0,
+TensorBoard 2.21.0, Safetensors 0.8.0, and Hugging Face Hub 1.21.0. Install
+PyTorch first because FlashAttention imports it while building, and keep
+`--no-build-isolation` on the dependency installation command. These packages
+are tightly coupled to CUDA and vLLM's weight-transfer API; update and validate
+the related pins together when using a different cluster-provided stack.
 
 ## Quickstart
 
@@ -98,6 +109,10 @@ export TEXTWORLD_GAME_DIR=<TEXTWORLD_Z8_GAME_DIR>
 ```
 
 First, run the local multi-trainer smoke test. It does not depend on vLLM or TextWorld; it only checks tokenizer/model loading, response-only labels, Ray FSDP multi-trainer initialization, forward/backward, and optimizer steps. The example below starts 2 FSDP trainers and needs at least 2 visible GPUs.
+
+Each trainer loads the complete model onto one GPU before FSDP sharding, so the
+GPU-count formula alone is not sufficient: every trainer GPU must also have
+enough memory for the unsharded initialization peak.
 
 ```bash
 python accerl_agent/local_trainer.py \
@@ -299,6 +314,9 @@ if lost:
     reward -= tw_lost_penalty
 ```
 
+An invalid non-abort action does not advance the environment and instead uses
+the separate `-tw_invalid_action_penalty` reward branch.
+
 PPO mode is enabled with `--rl-algorithm ppo`. Rollout stores compact response
 spans, response-aligned rewards and behavior logprobs, one boundary kind, the
 latest behavior version, and optional final-state context. The trainer derives
@@ -357,7 +375,7 @@ labels, logprobs, or per-token policy versions.
 | Argument | Description |
 | --- | --- |
 | `--model-path` | Local HuggingFace model path. |
-| `--dtype` | `auto`, `bfloat16`, or `float16`. |
+| `--dtype` | FSDP trainer model dtype: `auto`, `bfloat16`, or `float16`; it is not forwarded to the vLLM actor. |
 | `--tw-game-dir` | Directory containing TextWorld `.z8` games. |
 | `--tw-history-token-window` | Token limit for the episode transcript. |
 | `--max-length` | Maximum trainer-side sequence length; must be at least `--tw-history-token-window`. |
@@ -378,7 +396,7 @@ labels, logprobs, or per-token policy versions.
 | `--replay-capacity` | Maximum number of samples in each replay buffer. |
 | `--min-replay-size-per-rank` | Minimum replay size required before a trainer rank starts training. |
 | `--sync-every-optimizer-steps` | Number of optimizer steps between vLLM weight syncs. |
-| `--max-sync-rounds` | Maximum number of train/sync segments; useful for smoke tests. |
+| `--max-sync-rounds` | Maximum number of post-training weight synchronizations; `N` syncs can include up to `N+1` training segments. |
 | `--save-checkpoint` | Save a HuggingFace-format model checkpoint. |
 | `--checkpoint-every-sync-rounds` | Periodic checkpoint interval; `0` disables periodic saves. |
 
@@ -420,7 +438,7 @@ Saved checkpoint contents include model weights, config, tokenizer files, and `t
 | `Train/TokensPerSec` | Valid training tokens processed per second. |
 | `Train/PackTokenUtilization` | Fraction of `--train-token-budget` occupied by real tokens in a pack. |
 | `KL/OldNewK3TrajectoryMean` | PPO/GRPO KL penalty used by optimization: valid-token mean within each trajectory, then an equal mean across valid trajectories. |
-| `Clip/PPOClipFrac` | Fraction of global valid response tokens outside the PPO ratio clip interval; intentionally remains token-level for both algorithms. |
+| `Clip/PPOClipFrac` | With `--clip-mode ppo`, fraction of global valid response tokens outside the PPO ratio clip interval. |
 | `Infer/TokensPerSec` | vLLM generation throughput. |
 | `Infer/LengthRate` | Fraction of logical requests that exhaust their generation-token limit. |
 | `Sync/ElapsedSeconds` | Weight-sync latency. |
@@ -448,7 +466,11 @@ weight-sync, generation-limit, and context-window pressure respectively.
 
 If the trainer keeps waiting for replay, check `--num-rollout-workers`, `--min-replay-size-per-rank`, `--replay-capacity`, the TextWorld game path, and `TextWorld/InvalidActionRate`.
 
-If many actions are invalid, lower the temperature, reduce `--infer-max-tokens`, enable more detailed rollout logs, and confirm that the parser matches the task output format.
+If many actions are invalid, lower the temperature, reduce
+`--infer-max-tokens`, run `textworld_local_infer.py --verbose` to inspect model
+outputs, and confirm that the parser matches the task output format. The main
+training launcher does not provide a `--verbose` flag; use its console output
+and TensorBoard metrics for the distributed run.
 
 If vLLM weight sync fails, check GPU counts, vLLM weight-transfer API support, the NCCL environment, and the names/shapes/dtypes returned by `iter_vllm_loadable_weights()` for the full policy.
 
