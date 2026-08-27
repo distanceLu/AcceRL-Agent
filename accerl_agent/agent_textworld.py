@@ -81,84 +81,6 @@ def find_open_port() -> int:
         return sock.getsockname()[1]
 
 
-def wait_for_selected_ray_actor_debugger(role: str, rank: int) -> None:
-    """Wait for debugpy in the Ray actor selected through the environment."""
-    selected_role_value = os.environ.get("ACCERL_DEBUG_ROLE", "").strip().lower()
-    if not selected_role_value:
-        return
-
-    valid_roles = {"trainer", "infer", "rollout", "replay"}
-    if selected_role_value == "all":
-        selected_roles = valid_roles
-    else:
-        selected_roles = {
-            "replay" if item.strip() == "replaybuffer" else item.strip()
-            for item in selected_role_value.split(",")
-            if item.strip()
-        }
-    invalid_roles = selected_roles - valid_roles
-    if not selected_roles or invalid_roles:
-        raise ValueError(
-            "ACCERL_DEBUG_ROLE must be trainer, infer, rollout, replay "
-            "(or replaybuffer), all, or a comma-separated combination; "
-            f"got {selected_role_value!r}"
-        )
-    if role not in selected_roles:
-        return
-
-    if role == "infer":
-        selected_rank = 0
-    else:
-        debug_rank_value = os.environ.get("ACCERL_DEBUG_RANK", "0")
-        try:
-            selected_rank = int(debug_rank_value)
-        except ValueError as exc:
-            raise ValueError(
-                "ACCERL_DEBUG_RANK must be an integer, "
-                f"got {debug_rank_value!r}"
-            ) from exc
-    if rank != selected_rank:
-        return
-
-    try:
-        import debugpy
-    except ImportError as exc:
-        raise RuntimeError(
-            "ACCERL_DEBUG_ROLE is set, but debugpy is not installed in the "
-            "Ray actor environment. Install it with `python -m pip install "
-            "debugpy`."
-        ) from exc
-
-    debug_host = os.environ.get("ACCERL_DEBUG_HOST", "127.0.0.1")
-    default_ports = {
-        "trainer": 5678,
-        "infer": 5679,
-        "rollout": 5680,
-        "replay": 5681,
-    }
-    role_port_variable = f"ACCERL_DEBUG_{role.upper()}_PORT"
-    debug_port_value = os.environ.get(
-        role_port_variable,
-        os.environ.get("ACCERL_DEBUG_PORT", str(default_ports[role])),
-    )
-    try:
-        debug_port = int(debug_port_value)
-    except ValueError as exc:
-        raise ValueError(
-            "ACCERL_DEBUG_PORT must be an integer, "
-            f"got {debug_port_value!r}"
-        ) from exc
-
-    debugpy.listen((debug_host, debug_port))
-    print(
-        f"[debug] {role} rank {rank} waiting for debugger at "
-        f"{debug_host}:{debug_port}...",
-        flush=True,
-    )
-    debugpy.wait_for_client()
-    print(f"[debug] {role} rank {rank} debugger attached.", flush=True)
-
-
 @dataclass(frozen=True)
 class PreparedVarlenPack:
     """One CPU-resident pack prepared for a Varlen optimizer window."""
@@ -873,8 +795,6 @@ class FSDPTrainWorker:
         self.rank = rank
         self.fsdp_world_size = fsdp_world_size
         self.replay_buffer = replay_buffer
-
-        wait_for_selected_ray_actor_debugger("trainer", rank)
 
         os.environ["MASTER_ADDR"] = fsdp_master_addr
         os.environ["MASTER_PORT"] = str(fsdp_master_port)
@@ -3091,7 +3011,6 @@ class ReplayBufferActor:
 
     def __init__(self, capacity: int, rank: int):
         self.rank = int(rank)
-        wait_for_selected_ray_actor_debugger("replay", self.rank)
         self.samples = deque(maxlen=capacity)
 
     def add_samples(self, samples: List[RLSample]) -> None:
@@ -3303,7 +3222,6 @@ class VLLMInferenceActor:
     """GPU Ray actor that owns vLLM and consumes tokenized rollout requests."""
 
     def __init__(self, args: argparse.Namespace):
-        wait_for_selected_ray_actor_debugger("infer", 0)
         engine_kwargs = dict(
             model=args.model_path,
             trust_remote_code=args.trust_remote_code,
@@ -3696,7 +3614,6 @@ class TextWorldRolloutWorkerActor:
         self.worker_id = int(worker_id)
         self.replay_buffer = replay_buffer
         self.stats_actor = stats_actor
-        wait_for_selected_ray_actor_debugger("rollout", self.worker_id)
         self.tokenizer = build_tokenizer(args, log=False)
         self.game_files = load_textworld_game_files(args)
         request_infos = make_textworld_request_infos()
