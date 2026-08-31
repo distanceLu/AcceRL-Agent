@@ -169,14 +169,19 @@ The full framework uses both FSDP training GPUs and vLLM inference GPUs:
 total GPUs >= fsdp_world_size + infer_tp_size * infer_size
 ```
 
-The commonly used configuration below uses 3 FSDP trainer GPUs and one vLLM
-inference GPU, so at least 4 visible GPUs are required. It trains the full
+The commonly used configuration below uses 6 FSDP trainer GPUs and one vLLM
+inference GPU, so at least 7 visible GPUs are required. It trains the full
 Qwen-MoE model with GRPO advantages, PPO-style policy clipping, FlashAttention
 packed training, and response-only LM-head projection:
 
-As in the smoke test, GPU count is only a placement requirement. Every trainer
-GPU must have enough memory for the full model before FSDP sharding, plus the
-initialization peak; the verified BF16 model is approximately 27 GB.
+Unlike the separate local-trainer smoke test, the TextWorld trainer loads FP32
+policy storage on CPU and lets FSDP2 move and shard it. Forward/backward uses
+BF16/FP16, while gradients and AdamW states remain FP32. The verified 27 GiB
+BF16 checkpoint has roughly 14.3B parameters, so 3-way FP32 optimizer sharding
+is too small for typical 80 GiB GPUs once gradients, moments, and temporary
+buffers are included. Each trainer rank also holds a roughly 53 GiB FP32 CPU
+policy copy (about 320 GiB across six ranks), excluding loading overhead.
+Startup enforces the configured GPU static-memory limit.
 
 ```bash
 python -m accerl_agent.run_agent_textworld \
@@ -189,7 +194,7 @@ python -m accerl_agent.run_agent_textworld \
   --max-length 8192 \
   --gae-gamma 1.0 \
   --tw-lost-penalty 0.0 \
-  --fsdp-world-size 3 \
+  --fsdp-world-size 6 \
   --infer-size 1 \
   --infer-tp-size 1 \
   --num-rollout-workers 24 \
@@ -406,6 +411,22 @@ This is the most important stability check. Every sample must guarantee:
   single-forward steps, or `none` to disable normalization.
 - Increase `--old-new-kl-coef`.
 - Confirm that invalid, aborted, or empty outputs are not mistakenly marked as trainable tokens.
+
+### FP32 FSDP static-memory preflight fails
+
+- Increase `--fsdp-world-size`; the TextWorld trainer keeps policy shards,
+  gradients, and both AdamW moments in FP32.
+- Treat `--fsdp-static-memory-fraction-limit` as a capacity guard, not a way to
+  reclaim memory. Raise it only after measuring activation and optimizer peaks.
+- The first implementation does not automatically offload optimizer state.
+
+### FP16 optimizer steps are skipped
+
+- Monitor `Train/AMPScale` and `Train/OverflowSkippedSteps`.
+- A skip is synchronized across all FSDP2 ranks and does not advance the LR,
+  optimizer-step counter, PPO EMA, or weight-sync schedule.
+- Repeated skips beyond `--max-consecutive-overflow-skips` fail the run; prefer
+  BF16 on supported GPUs.
 
 ### Packed training or FlashAttention initialization fails
 

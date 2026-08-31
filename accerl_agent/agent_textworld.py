@@ -30,7 +30,7 @@ import textworld.gym
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -121,6 +121,16 @@ class FrozenPPOTargets:
     cuda_rng_state: torch.Tensor | None
 
 
+@dataclass(frozen=True)
+class OptimizerStepResult:
+    """Outcome of one globally synchronized optimizer-step attempt."""
+
+    succeeded: bool
+    current_lr: float
+    grad_scale: float
+    grad_norm: float
+
+
 class PackedTensorStats:
     """Named scalar statistics packed into one tensor for one all-reduce."""
 
@@ -204,6 +214,64 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _raise_if_nonfinite_tensors(
+    named_tensors: Iterable[Tuple[str, torch.Tensor]],
+    *,
+    context: str,
+    synchronize: bool = True,
+) -> None:
+    """Fail every trainer rank when any supplied tensor is non-finite."""
+    tensors = list(named_tensors)
+    if not tensors:
+        raise ValueError("named_tensors must be non-empty")
+    if not context:
+        raise ValueError("context must be non-empty")
+
+    local_tensors = []
+    for name, tensor in tensors:
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Finite-check field {name!r} must be a tensor.")
+        to_local = getattr(tensor, "to_local", None)
+        local_tensor = to_local() if callable(to_local) else tensor
+        local_tensors.append((str(name), local_tensor))
+
+    check_device = local_tensors[0][1].device
+    if any(tensor.device != check_device for _, tensor in local_tensors):
+        raise ValueError("Finite-check tensors must be on the same device.")
+    field_checks = []
+    for _, tensor in local_tensors:
+        if tensor.numel() == 0:
+            field_checks.append(
+                torch.ones((), device=check_device, dtype=torch.bool)
+            )
+            continue
+        # Checking only the reduction bounds avoids materializing a boolean
+        # tensor as large as the selected-logits matrix. amin/amax propagate
+        # NaN and preserve +/-Inf, so both bounds must be finite.
+        bounds = torch.stack((tensor.amin(), tensor.amax()))
+        field_checks.append(torch.isfinite(bounds).all())
+    local_all_finite = torch.stack(field_checks).all()
+    any_nonfinite = (~local_all_finite).to(dtype=torch.int32)
+    if synchronize and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(any_nonfinite, op=dist.ReduceOp.MAX)
+    if int(any_nonfinite.item()) == 0:
+        return
+
+    local_nonfinite_names = [
+        name
+        for (name, _), field_is_finite in zip(local_tensors, field_checks)
+        if not bool(field_is_finite.item())
+    ]
+    location = (
+        f"local fields={local_nonfinite_names[:8]}"
+        if local_nonfinite_names
+        else "a different distributed rank"
+    )
+    raise RuntimeError(
+        f"Non-finite tensor detected during {context}: {location}."
+    )
+
+
 def pick_dtype(dtype_name: str):
     if dtype_name == "float16":
         return torch.float16
@@ -212,6 +280,105 @@ def pick_dtype(dtype_name: str):
     if torch.cuda.is_available():
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return torch.float32
+
+
+def torch_dtype_name(dtype: torch.dtype) -> str:
+    """Return the canonical wire/config name for a supported torch dtype."""
+    names = {
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+        torch.float32: "float32",
+    }
+    try:
+        return names[dtype]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported training dtype: {dtype}") from exc
+
+
+def build_policy_mixed_precision_policy(
+    compute_dtype: torch.dtype,
+) -> MixedPrecisionPolicy:
+    """Keep FSDP2 shards in FP32 while computing in BF16 or FP16."""
+    if compute_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            "FSDP policy compute dtype must be bfloat16 or float16; got "
+            f"{compute_dtype}."
+        )
+    return MixedPrecisionPolicy(
+        param_dtype=compute_dtype,
+        reduce_dtype=torch.float32,
+    )
+
+
+def estimate_fsdp_static_memory_bytes(
+    *,
+    total_parameter_numel: int,
+    largest_fsdp_group_numel: int,
+    largest_fp32_group_numel: int = 0,
+    world_size: int,
+    compute_dtype: torch.dtype,
+) -> Dict[str, int]:
+    """Estimate the per-rank static/optimizer peak for full-policy AdamW."""
+    if total_parameter_numel < 1:
+        raise ValueError("total_parameter_numel must be positive.")
+    if largest_fsdp_group_numel < 1:
+        raise ValueError("largest_fsdp_group_numel must be positive.")
+    if largest_fsdp_group_numel > total_parameter_numel:
+        raise ValueError(
+            "largest_fsdp_group_numel cannot exceed total_parameter_numel."
+        )
+    if not 0 <= largest_fp32_group_numel <= total_parameter_numel:
+        raise ValueError(
+            "largest_fp32_group_numel must be between zero and "
+            "total_parameter_numel."
+        )
+    if world_size < 1:
+        raise ValueError("world_size must be positive.")
+    if compute_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("compute_dtype must be bfloat16 or float16.")
+
+    fp32_shard_bytes = math.ceil(
+        total_parameter_numel * torch.float32.itemsize / world_size
+    )
+    persistent_bytes = fp32_shard_bytes * 4
+    optimizer_temporary_bytes = fp32_shard_bytes
+    largest_compute_group_bytes = max(
+        largest_fsdp_group_numel * compute_dtype.itemsize,
+        largest_fp32_group_numel * torch.float32.itemsize,
+    )
+    total_bytes = (
+        persistent_bytes
+        + optimizer_temporary_bytes
+        + largest_compute_group_bytes
+    )
+    return {
+        "fp32_parameter_gradient_moment_bytes": persistent_bytes,
+        "optimizer_temporary_bytes": optimizer_temporary_bytes,
+        "largest_compute_group_bytes": largest_compute_group_bytes,
+        "total_bytes": total_bytes,
+    }
+
+
+def get_fsdp_static_memory_limit_bytes(
+    free_device_bytes: int,
+    fraction_limit: float,
+) -> int:
+    """Convert a free-memory fraction into a deterministic byte limit."""
+    if free_device_bytes < 1:
+        raise ValueError("free_device_bytes must be positive.")
+    if not 0.0 < fraction_limit <= 1.0:
+        raise ValueError("fraction_limit must be in (0, 1].")
+    return int(free_device_bytes * fraction_limit)
+
+
+def prepare_weight_for_transfer(
+    tensor: torch.Tensor,
+    transfer_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Detach and cast one full policy tensor for the vLLM payload."""
+    if transfer_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("vLLM transfer dtype must be bfloat16 or float16.")
+    return tensor.detach().to(dtype=transfer_dtype)
 
 
 # # 每个 trajectory 的 token 先平均，之后再对所有 trajectory 求和，确保每条 trajectory 对 loss 等权
@@ -539,14 +706,16 @@ def build_tokenizer(args: argparse.Namespace, log: bool = True):
     return tokenizer
 
 
-def build_model(args: argparse.Namespace, device, torch_dtype, log: bool = True):
+def build_model(args: argparse.Namespace, device, compute_dtype, log: bool = True):
     if log:
         print(
             f"[init] Loading model from {args.model_path} "
-            f"(device={device}, dtype={torch_dtype})"
+            f"(storage_device=cpu, storage_dtype={torch.float32}, "
+            f"target_device={device}, compute_dtype={compute_dtype})"
         )
     model_kwargs = {
-        "torch_dtype": torch_dtype,
+        "dtype": torch.float32,
+        "low_cpu_mem_usage": True,
         "local_files_only": True,
         "trust_remote_code": args.trust_remote_code,
     }
@@ -563,9 +732,12 @@ def build_model(args: argparse.Namespace, device, torch_dtype, log: bool = True)
             "flash_attention_2; got "
             f"{attention_implementation!r}."
         )
-    model.to(device)
     model.train()
     model.config.use_cache = False
+    if hasattr(model.config, "dtype"):
+        model.config.dtype = torch.float32
+    if hasattr(model.config, "torch_dtype"):
+        model.config.torch_dtype = torch.float32
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -721,7 +893,11 @@ def iter_vllm_loadable_weights(name: str, tensor: torch.Tensor):
         yield name, tensor
 
 
-def get_vllm_weight_metadata(named_parameters):
+def get_vllm_weight_metadata(
+    named_parameters,
+    *,
+    transfer_dtype: torch.dtype | None = None,
+):
     """Return names, dtypes, and shapes matching iter_vllm_loadable_weights."""
     names = []
     dtype_names = []
@@ -729,7 +905,12 @@ def get_vllm_weight_metadata(named_parameters):
     for name, param in named_parameters:
         for load_name, load_tensor in iter_vllm_loadable_weights(name, param):
             names.append(load_name)
-            dtype_names.append(str(load_tensor.dtype).split(".")[-1])
+            metadata_dtype = (
+                load_tensor.dtype
+                if transfer_dtype is None
+                else transfer_dtype
+            )
+            dtype_names.append(torch_dtype_name(metadata_dtype))
             shapes.append(list(load_tensor.shape))
     return names, dtype_names, shapes
 
@@ -776,9 +957,29 @@ def numel_from_shape(shape):
     return numel
 
 
+def get_transformer_fsdp_group_numels(model) -> List[int]:
+    """Return bottom-up FSDP2 group sizes before sharding the model."""
+    assigned_parameter_ids = set()
+    group_numels = []
+    for layer in model.model.layers:
+        layer_parameters = list(layer.parameters())
+        group_numels.append(sum(param.numel() for param in layer_parameters))
+        assigned_parameter_ids.update(id(param) for param in layer_parameters)
+    root_numel = sum(
+        param.numel()
+        for param in model.parameters()
+        if id(param) not in assigned_parameter_ids
+    )
+    if root_numel > 0:
+        group_numels.append(root_numel)
+    if not group_numels or any(numel < 1 for numel in group_numels):
+        raise RuntimeError("Every policy FSDP group must contain parameters.")
+    return group_numels
+
+
 class FSDPTrainWorker:
     """
-    One FSDP2 training worker per GPU.  Four of these form the FSDP group.
+    One FSDP2 training worker per GPU; all workers form one FSDP group.
     Rank 0 additionally handles weight transfer to the vLLM engine.
     """
 
@@ -799,18 +1000,55 @@ class FSDPTrainWorker:
         os.environ["MASTER_ADDR"] = fsdp_master_addr
         os.environ["MASTER_PORT"] = str(fsdp_master_port)
 
-        dist.init_process_group(backend="nccl", rank=rank, world_size=fsdp_world_size)
         if hasattr(torch, "accelerator"):
             torch.accelerator.set_device_index(0)
         else:
             torch.cuda.set_device(0)
         self.device = torch.device("cuda:0")
+        dist.init_process_group(backend="nccl", rank=rank, world_size=fsdp_world_size)
 
         set_seed(args.seed + rank)
 
+        self.compute_dtype = pick_dtype(args.dtype)
+        if self.compute_dtype not in (torch.bfloat16, torch.float16):
+            raise RuntimeError(
+                "CUDA TextWorld training requires a BF16 or FP16 compute dtype; "
+                f"resolved {self.compute_dtype}."
+            )
+        dtype_code = {
+            torch.float16: 1,
+            torch.bfloat16: 2,
+        }[self.compute_dtype]
+        local_dtype_code = torch.tensor(
+            dtype_code,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        gathered_dtype_codes = [
+            torch.empty_like(local_dtype_code)
+            for _ in range(self.fsdp_world_size)
+        ]
+        dist.all_gather(gathered_dtype_codes, local_dtype_code)
+        resolved_codes = {int(item.item()) for item in gathered_dtype_codes}
+        if len(resolved_codes) != 1:
+            raise RuntimeError(
+                "All FSDP ranks must resolve the same compute dtype; got "
+                f"{sorted(resolved_codes)}."
+            )
+        self.compute_dtype_name = torch_dtype_name(self.compute_dtype)
+        self.transfer_dtype = self.compute_dtype
+        self.transfer_dtype_name = self.compute_dtype_name
+        self.policy_mp_policy = build_policy_mixed_precision_policy(
+            self.compute_dtype
+        )
+
         self.tokenizer = build_tokenizer(args, log=rank == 0)
-        torch_dtype = pick_dtype(args.dtype)
-        model = build_model(args, self.device, torch_dtype, log=rank == 0)
+        model = build_model(
+            args,
+            self.device,
+            self.compute_dtype,
+            log=rank == 0,
+        )
         # Validate selected-logit support for PPO/GRPO forwards and
         # the model-native lm_head needed to capture PPO value features.
         validate_selected_forward_support(model, args)
@@ -828,9 +1066,12 @@ class FSDPTrainWorker:
             if value_head is not None
             else []
         )
-        if rank == 0 and value_head is not None:
-            policy_total, policy_trainable = count_parameters(model)
+        policy_total, policy_trainable = count_parameters(model)
+        value_total = 0
+        value_trainable = 0
+        if value_head is not None:
             value_total, value_trainable = count_parameters(value_head)
+        if rank == 0 and value_head is not None:
             print(
                 "[train] Parameter groups: "
                 f"policy_total={policy_total:,} "
@@ -845,14 +1086,63 @@ class FSDPTrainWorker:
         # Hugging Face policy model rather than the PPO Value Head.
         named_parameters = list(model.named_parameters())
         policy_param_names = [name for name, _ in named_parameters]
-        self.weight_metadata = get_vllm_weight_metadata(named_parameters)
+        self.weight_metadata = get_vllm_weight_metadata(
+            named_parameters,
+            transfer_dtype=self.transfer_dtype,
+        )
         validate_vllm_policy_weight_names(self.weight_metadata[0])
 
+        policy_group_numels = get_transformer_fsdp_group_numels(model)
+        memory_estimate = estimate_fsdp_static_memory_bytes(
+            total_parameter_numel=policy_total + value_total,
+            largest_fsdp_group_numel=max(policy_group_numels),
+            largest_fp32_group_numel=value_total,
+            world_size=self.fsdp_world_size,
+            compute_dtype=self.compute_dtype,
+        )
+        local_free_device_bytes, total_device_bytes = torch.cuda.mem_get_info(
+            self.device
+        )
+        min_free_device_bytes_tensor = torch.tensor(
+            local_free_device_bytes,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        dist.all_reduce(min_free_device_bytes_tensor, op=dist.ReduceOp.MIN)
+        min_free_device_bytes = int(min_free_device_bytes_tensor.item())
+        memory_limit_bytes = get_fsdp_static_memory_limit_bytes(
+            min_free_device_bytes,
+            self.args.fsdp_static_memory_fraction_limit,
+        )
+        if self.rank == 0:
+            print(
+                "[train] FSDP precision/memory contract: "
+                "storage=float32 optimizer=float32 reduce=float32 "
+                f"compute={self.compute_dtype_name} "
+                f"transfer={self.transfer_dtype_name} "
+                f"estimated_static_peak={memory_estimate['total_bytes'] / 1024**3:.3f}GiB "
+                f"persistent={memory_estimate['fp32_parameter_gradient_moment_bytes'] / 1024**3:.3f}GiB "
+                f"optimizer_temporary={memory_estimate['optimizer_temporary_bytes'] / 1024**3:.3f}GiB "
+                f"largest_compute_group={memory_estimate['largest_compute_group_bytes'] / 1024**3:.3f}GiB "
+                f"minimum_free_device={min_free_device_bytes / 1024**3:.3f}GiB "
+                f"total_device={total_device_bytes / 1024**3:.3f}GiB "
+                f"limit_fraction={self.args.fsdp_static_memory_fraction_limit:.3f}"
+            )
+        if memory_estimate["total_bytes"] > memory_limit_bytes:
+            raise RuntimeError(
+                "Estimated FP32 FSDP/AdamW static peak exceeds the configured "
+                "free-GPU-memory limit: "
+                f"rank={self.rank} estimated={memory_estimate['total_bytes'] / 1024**3:.3f}GiB "
+                f"limit={memory_limit_bytes / 1024**3:.3f}GiB. Increase "
+                "--fsdp-world-size or adjust "
+                "--fsdp-static-memory-fraction-limit after capacity validation."
+            )
+
         for layer in model.model.layers:
-            fully_shard(layer)
+            fully_shard(layer, mp_policy=self.policy_mp_policy)
         if value_head is not None:
             fully_shard(value_head)
-        fully_shard(model)
+        fully_shard(model, mp_policy=self.policy_mp_policy)
 
         self.model = model
         self.value_head = value_head
@@ -901,6 +1191,8 @@ class FSDPTrainWorker:
         self.trainable_parameter_list = (
             self.policy_trainable_parameters + self.value_head_parameters
         )
+        self._validate_fp32_parameter_storage()
+        self._require_finite_parameters("FSDP initialization parameter check")
 
         optimizer_groups = [
             {
@@ -922,9 +1214,18 @@ class FSDPTrainWorker:
             weight_decay=args.weight_decay,
         )
         self.optimizer.zero_grad(set_to_none=True)
+        self.grad_scaler = (
+            torch.amp.GradScaler("cuda")
+            if self.compute_dtype == torch.float16
+            else None
+        )
 
         self.train_micro_step = 0
         self.optimizer_step = 0
+        self.overflow_skipped_steps_total = 0
+        self.consecutive_overflow_skips = 0
+        self._gradient_precision_validated = False
+        self._optimizer_precision_validated = False
         self.ppo_adv_ema_mean: float | None = None
         self.ppo_adv_ema_variance: float | None = None
         self.pending_prepared_samples: List[RLSample] = []
@@ -939,8 +1240,169 @@ class FSDPTrainWorker:
     def get_rank(self):
         return self.rank
 
+    def get_compute_dtype_name(self) -> str:
+        return self.compute_dtype_name
+
     def get_replay_stats(self):
         return ray.get(self.replay_buffer.get_stats.remote())
+
+    def _validate_fp32_parameter_storage(self) -> None:
+        invalid = [
+            (name, str(param.dtype))
+            for name, param in (
+                [(f"policy.{name}", param) for name, param in self.policy_params]
+                + [
+                    (f"value_head.{name}", param)
+                    for name, param in self.value_head_params
+                ]
+            )
+            if param.is_floating_point() and param.dtype != torch.float32
+        ]
+        if invalid:
+            raise RuntimeError(
+                "FSDP sharded parameters must remain FP32 for AdamW; got "
+                f"{invalid[:8]}."
+            )
+
+    def _require_finite_parameters(self, context: str) -> None:
+        _raise_if_nonfinite_tensors(
+            [
+                (f"policy.{name}", param)
+                for name, param in self.policy_params
+            ]
+            + [
+                (f"value_head.{name}", param)
+                for name, param in self.value_head_params
+            ],
+            context=context,
+        )
+
+    def _validate_fp32_gradients_once(self) -> None:
+        if self._gradient_precision_validated:
+            return
+        present_gradient_count = 0
+        invalid = []
+        for name, param in (
+            [(f"policy.{name}", param) for name, param in self.policy_params]
+            + [
+                (f"value_head.{name}", param)
+                for name, param in self.value_head_params
+            ]
+        ):
+            if param.grad is None:
+                continue
+            present_gradient_count += 1
+            if param.grad.dtype != torch.float32:
+                invalid.append((name, str(param.grad.dtype)))
+        if present_gradient_count == 0:
+            raise RuntimeError("Optimizer window produced no gradients.")
+        if invalid:
+            raise RuntimeError(
+                "FSDP reduced gradients must be FP32 before AdamW; got "
+                f"{invalid[:8]}."
+            )
+        self._gradient_precision_validated = True
+
+    def _validate_fp32_optimizer_state_once(self) -> None:
+        if self._optimizer_precision_validated:
+            return
+        checked_state_count = 0
+        invalid = []
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                state = self.optimizer.state.get(param, {})
+                for state_name in ("exp_avg", "exp_avg_sq"):
+                    state_tensor = state.get(state_name)
+                    if state_tensor is None:
+                        continue
+                    checked_state_count += 1
+                    if state_tensor.dtype != torch.float32:
+                        invalid.append((state_name, str(state_tensor.dtype)))
+        if checked_state_count == 0:
+            raise RuntimeError("AdamW created no moment state after a successful step.")
+        if invalid:
+            raise RuntimeError(
+                "AdamW exp_avg/exp_avg_sq must remain FP32; got "
+                f"{invalid[:8]}."
+            )
+        self._optimizer_precision_validated = True
+
+    def _backward(self, loss: torch.Tensor) -> None:
+        if self.grad_scaler is None:
+            loss.backward()
+        else:
+            self.grad_scaler.scale(loss).backward()
+
+    def _finalize_optimizer_step(self) -> OptimizerStepResult:
+        """Unscale, clip, and apply one optimizer update consistently."""
+        self._validate_fp32_gradients_once()
+        if self.grad_scaler is not None:
+            self.grad_scaler.unscale_(self.optimizer)
+
+        self._require_finite_parameters("optimizer pre-step parameter check")
+
+        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+            self.trainable_parameter_list,
+            max_norm=1.0,
+            error_if_nonfinite=True,
+        )
+        grad_norm = float(grad_norm_tensor.item())
+        current_lr = self._get_current_lr(
+            self.optimizer_step,
+            self.args.learning_rate,
+            self.args.lr_warmup_steps,
+            self.args.max_steps,
+        )
+        previous_lrs = [
+            float(param_group["lr"])
+            for param_group in self.optimizer.param_groups
+        ]
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = current_lr
+
+        if self.grad_scaler is None:
+            self.optimizer.step()
+            step_succeeded = True
+            grad_scale = 1.0
+        else:
+            previous_scale = float(self.grad_scaler.get_scale())
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+            grad_scale = float(self.grad_scaler.get_scale())
+            step_succeeded = grad_scale >= previous_scale
+
+        self.optimizer.zero_grad(set_to_none=True)
+        if step_succeeded:
+            self._require_finite_parameters(
+                "optimizer post-step parameter check"
+            )
+            self.consecutive_overflow_skips = 0
+            self.optimizer_step += 1
+            self._validate_fp32_optimizer_state_once()
+        else:
+            self.overflow_skipped_steps_total += 1
+            self.consecutive_overflow_skips += 1
+            for param_group, previous_lr in zip(
+                self.optimizer.param_groups,
+                previous_lrs,
+            ):
+                param_group["lr"] = previous_lr
+            if (
+                self.consecutive_overflow_skips
+                > self.args.max_consecutive_overflow_skips
+            ):
+                raise RuntimeError(
+                    "FP16 training exceeded the consecutive overflow watchdog: "
+                    f"{self.consecutive_overflow_skips} > "
+                    f"{self.args.max_consecutive_overflow_skips}."
+                )
+
+        return OptimizerStepResult(
+            succeeded=step_succeeded,
+            current_lr=current_lr,
+            grad_scale=grad_scale,
+            grad_norm=grad_norm,
+        )
 
     def _get_current_lr(
         self,
@@ -1287,6 +1749,20 @@ class FSDPTrainWorker:
         loss = policy_trajectory_sum + (
             self.args.old_new_kl_coef * old_new_kl_k3_trajectory_sum
         )
+        _raise_if_nonfinite_tensors(
+            [
+                ("logits", valid_logits),
+                ("current_logprobs", valid_token_log_probs),
+                ("old_logprobs", valid_old_token_log_probs),
+                ("log_ratio", valid_log_ratio),
+                ("ratio", valid_ratio),
+                ("advantages", valid_adv),
+                ("objective", valid_objective),
+                ("old_new_kl", old_new_kl_k3),
+                ("loss", loss),
+            ],
+            context="GRPO forward/loss",
+        )
         with torch.no_grad():
             if self.args.clip_mode == "ppo":
                 clipped_mask = (
@@ -1370,11 +1846,24 @@ class FSDPTrainWorker:
                 response_value_count:
             ]
             bootstrap_mask[bootstrap_sample_indices] = True
+        old_logprobs = batch["response_logprobs"].float()
+        rewards = batch["response_rewards"].float()
+        _raise_if_nonfinite_tensors(
+            [
+                ("logits", valid_logits),
+                ("current_logprobs", current_logprobs),
+                ("old_logprobs", old_logprobs),
+                ("current_values", current_values),
+                ("rewards", rewards),
+                ("bootstrap_values", bootstrap_values),
+            ],
+            context="PPO forward",
+        )
         return PPOFlatTokenView(
             current_logprobs=current_logprobs,
-            old_logprobs=batch["response_logprobs"].float(),
+            old_logprobs=old_logprobs,
             current_values=current_values,
-            rewards=batch["response_rewards"].float(),
+            rewards=rewards,
             terminated=batch["response_terminated"],
             truncated=batch["response_truncated"],
             response_sample_indices=response_sample_indices,
@@ -1773,6 +2262,23 @@ class FSDPTrainWorker:
             policy_trajectory_sum
             + self.args.value_loss_coef * value_loss_trajectory_sum
             + self.args.old_new_kl_coef * kl_trajectory_sum
+        )
+        _raise_if_nonfinite_tensors(
+            [
+                ("current_logprobs", view.current_logprobs),
+                ("old_logprobs", view.old_logprobs),
+                ("log_ratio", valid_log_ratio),
+                ("ratio", valid_ratio),
+                ("raw_advantages", raw_advantages),
+                ("actor_advantages", actor_advantages),
+                ("returns", returns),
+                ("objective", valid_objective),
+                ("value_residuals", residuals),
+                ("value_loss", value_loss_tokens),
+                ("old_new_kl", old_new_kl),
+                ("loss", trajectory_loss_sum),
+            ],
+            context="PPO ratio/loss",
         )
 
         with torch.no_grad():
@@ -2234,7 +2740,7 @@ class FSDPTrainWorker:
                 float(self.fsdp_world_size)
                 / float(global_valid_trajectory_count)
             )
-            backward_loss.backward()
+            self._backward(backward_loss)
             local_reduction_stats.add_(reduction_stats)
             local_version_stats[0] += prepared.version_lag_sum
             local_version_stats[1] += prepared.sample_count
@@ -2311,26 +2817,12 @@ class FSDPTrainWorker:
                     "Updated PPO advantage EMA moments must be finite."
                 )
 
-        torch.nn.utils.clip_grad_norm_(
-            self.trainable_parameter_list,
-            max_norm=1.0,
-        )
-        current_lr = self._get_current_lr(
-            self.optimizer_step,
-            self.args.learning_rate,
-            self.args.lr_warmup_steps,
-            self.args.max_steps,
-        )
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = current_lr
-        self.optimizer.step()
-        if ema_mode:
+        optimizer_result = self._finalize_optimizer_step()
+        if ema_mode and optimizer_result.succeeded:
             assert candidate_ema_mean is not None
             assert candidate_ema_variance is not None
             self.ppo_adv_ema_mean = candidate_ema_mean
             self.ppo_adv_ema_variance = candidate_ema_variance
-        self.optimizer.zero_grad(set_to_none=True)
-        self.optimizer_step += 1
 
         token_count = float(global_valid_token_count)
         trajectory_count = float(global_valid_trajectory_count)
@@ -2363,7 +2855,10 @@ class FSDPTrainWorker:
             "kl_trajectory_mean": kl_trajectory_mean,
             "kl_token_mean": kl_token_mean,
             "clip_fraction": stats["clip_count"] / token_count,
-            "current_lr": current_lr,
+            "current_lr": optimizer_result.current_lr,
+            "optimizer_step_succeeded": optimizer_result.succeeded,
+            "grad_scale": optimizer_result.grad_scale,
+            "grad_norm": optimizer_result.grad_norm,
         }
 
     def _run_grpo_optimizer_step(
@@ -2419,7 +2914,7 @@ class FSDPTrainWorker:
                 float(self.fsdp_world_size)
                 / float(global_valid_trajectory_count)
             )
-            backward_loss.backward()
+            self._backward(backward_loss)
 
             reduction_stats = loss_stats["reduction_stats"]
             local_reduction_stats.add_(reduction_stats)
@@ -2454,21 +2949,7 @@ class FSDPTrainWorker:
             )
         global_version_lag_sum, global_sample_count = local_version_stats.tolist()
 
-        torch.nn.utils.clip_grad_norm_(
-            self.trainable_parameter_list,
-            max_norm=1.0,
-        )
-        current_lr = self._get_current_lr(
-            self.optimizer_step,
-            self.args.learning_rate,
-            self.args.lr_warmup_steps,
-            self.args.max_steps,
-        )
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = current_lr
-        self.optimizer.step()
-        self.optimizer.zero_grad(set_to_none=True)
-        self.optimizer_step += 1
+        optimizer_result = self._finalize_optimizer_step()
 
         token_count = float(global_valid_token_count)
         trajectory_count = float(global_valid_trajectory_count)
@@ -2497,7 +2978,10 @@ class FSDPTrainWorker:
             "kl_trajectory_mean": kl_trajectory_mean,
             "kl_token_mean": kl_token_mean,
             "clip_fraction": global_clip_count / token_count,
-            "current_lr": current_lr,
+            "current_lr": optimizer_result.current_lr,
+            "optimizer_step_succeeded": optimizer_result.succeeded,
+            "grad_scale": optimizer_result.grad_scale,
+            "grad_norm": optimizer_result.grad_norm,
         }
 
     def train_until_next_sync(
@@ -2512,6 +2996,7 @@ class FSDPTrainWorker:
             self.optimizer_step + num_optimizer_steps,
             self.args.max_steps,
         )
+        overflow_skips_at_start = self.overflow_skipped_steps_total
 
         global_steps = []
         aggregate_ppo_stats = {
@@ -2523,10 +3008,20 @@ class FSDPTrainWorker:
             )
             if self.args.rl_algorithm == "ppo":
                 step_stats = self._run_ppo_optimizer_step(trainer_version)
-                for name, value in step_stats["global_ppo_stats"].items():
-                    aggregate_ppo_stats[name] += value
             else:
                 step_stats = self._run_grpo_optimizer_step(trainer_version)
+            if not step_stats["optimizer_step_succeeded"]:
+                if self.rank == 0:
+                    print(
+                        "[train] FP16 overflow skipped optimizer update: "
+                        f"total={self.overflow_skipped_steps_total} "
+                        f"consecutive={self.consecutive_overflow_skips} "
+                        f"new_scale={step_stats['grad_scale']:.1f}"
+                    )
+                continue
+            if self.args.rl_algorithm == "ppo":
+                for name, value in step_stats["global_ppo_stats"].items():
+                    aggregate_ppo_stats[name] += value
             global_steps.append(step_stats)
             if (
                 self.rank == 0
@@ -2575,6 +3070,16 @@ class FSDPTrainWorker:
                 version_lag_sum / sample_count if sample_count else 0.0
             ),
             "learning_rate": self.optimizer.param_groups[0]["lr"],
+            "grad_scale": (
+                float(self.grad_scaler.get_scale())
+                if self.grad_scaler is not None
+                else 1.0
+            ),
+            "overflow_skipped_steps_total": self.overflow_skipped_steps_total,
+            "consecutive_overflow_skips": self.consecutive_overflow_skips,
+            "segment_overflow_skipped_steps": (
+                self.overflow_skipped_steps_total - overflow_skips_at_start
+            ),
         }
         pack_token_count = sum(
             float(step["global_pack_token_count"])
@@ -2764,12 +3269,16 @@ class FSDPTrainWorker:
         if self.rank == 0:
             def _full_param_iter():
                 for name, param in self.policy_params:
-                    full_param = param.full_tensor().detach()
+                    full_param = prepare_weight_for_transfer(
+                        param.full_tensor(),
+                        self.transfer_dtype,
+                    )
                     yield from iter_vllm_loadable_weights(name, full_param)
 
             trainer_args = NCCLTrainerSendWeightsArgs(
                 group=self.model_update_group,
                 packed=packed,
+                packed_num_buffers=1,
             )
             NCCLWeightTransferEngine.trainer_send_weights(
                 iterator=_full_param_iter(),
@@ -2815,7 +3324,9 @@ class FSDPTrainWorker:
                 full_param = param.full_tensor().detach()
                 if self.rank == 0:
                     assert state_dict is not None
-                    state_dict[name] = full_param.cpu().contiguous()
+                    state_dict[name] = (
+                        full_param.cpu().float().contiguous()
+                    )
                 del full_param
 
             # full_tensor() is collective. Every rank must traverse the
@@ -2851,6 +3362,12 @@ class FSDPTrainWorker:
                 "rl_algorithm": self.args.rl_algorithm,
                 "max_steps": self.args.max_steps,
                 "sync_every_optimizer_steps": self.args.sync_every_optimizer_steps,
+                "checkpoint_kind": "fp32_model_weights",
+                "policy_storage_dtype": "float32",
+                "policy_compute_dtype": self.compute_dtype_name,
+                "gradient_reduce_dtype": "float32",
+                "vllm_transfer_dtype": self.transfer_dtype_name,
+                "grad_scaler_enabled": self.grad_scaler is not None,
             }
             if self.value_head is not None:
                 assert value_head_state_dict is not None
@@ -3221,9 +3738,19 @@ class InterruptibleGenerationRunner:
 class VLLMInferenceActor:
     """GPU Ray actor that owns vLLM and consumes tokenized rollout requests."""
 
-    def __init__(self, args: argparse.Namespace):
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        resolved_compute_dtype_name: str,
+    ):
+        if resolved_compute_dtype_name not in {"bfloat16", "float16"}:
+            raise ValueError(
+                "vLLM policy dtype must be bfloat16 or float16; got "
+                f"{resolved_compute_dtype_name!r}."
+            )
         engine_kwargs = dict(
             model=args.model_path,
+            dtype=resolved_compute_dtype_name,
             trust_remote_code=args.trust_remote_code,
             enforce_eager=True,
             tensor_parallel_size=args.infer_tp_size,
@@ -3292,6 +3819,21 @@ class VLLMInferenceActor:
             output_versions=list(completed_state.output_versions),
             stop_reason=completed_state.stop_reason,
         )
+        if len(result.output_logprobs) != len(result.output_tokens):
+            raise RuntimeError(
+                "Inference output token/logprob lengths differ: "
+                f"{len(result.output_tokens)} != {len(result.output_logprobs)}."
+            )
+        nonfinite_logprob_indices = [
+            index
+            for index, logprob in enumerate(result.output_logprobs)
+            if not math.isfinite(float(logprob))
+        ]
+        if nonfinite_logprob_indices:
+            raise RuntimeError(
+                "Inference produced non-finite output logprobs at indices "
+                f"{nonfinite_logprob_indices[:8]}."
+            )
         self.total_tokens += len(result.output_tokens)
         self.interval_request_count += 1
         self.interval_length_count += result.stop_reason == "length"
@@ -3363,6 +3905,7 @@ class VLLMInferenceActor:
                         dtype_names=dtype_names,
                         shapes=shapes,
                         packed=packed,
+                        packed_num_buffers=1,
                     )
                 )
             )
@@ -4226,9 +4769,9 @@ def save_fsdp_checkpoint(
 
 async def run_textworld_train(args: argparse.Namespace):
     if args.ray_address:
-        ray.init(address=args.ray_address)
+        ray.init(address=args.ray_address, _temp_dir="/mnt/data/lcx4/ray_tmp")
     else:
-        ray.init()
+        ray.init(_temp_dir="/mnt/data/lcx4/ray_tmp")
 
     save_run_config(args)
     writer = SummaryWriter(args.log_dir)
@@ -4317,10 +4860,23 @@ async def run_textworld_train(args: argparse.Namespace):
         ray.get([w.get_rank.remote() for w in fsdp_workers])
         print(f"[init] {args.fsdp_world_size} FSDP training workers ready.")
 
+        resolved_compute_dtype_name = ray.get(
+            fsdp_workers[0].get_compute_dtype_name.remote()
+        )
+        print(
+            "[init] Resolved policy precision: "
+            "storage=float32 optimizer=float32 reduce=float32 "
+            f"compute={resolved_compute_dtype_name} "
+            f"vllm_transfer={resolved_compute_dtype_name}."
+        )
+
         remote_infer_actor = ray.remote(
             num_gpus=args.infer_tp_size * args.infer_size,
         )(VLLMInferenceActor)
-        infer_actor = remote_infer_actor.remote(args)
+        infer_actor = remote_infer_actor.remote(
+            args,
+            resolved_compute_dtype_name,
+        )
 
         remote_rollout_worker = ray.remote(
             num_gpus=0,
@@ -4549,6 +5105,16 @@ async def run_textworld_train(args: argparse.Namespace):
             writer.add_scalar(
                 "Train/LearningRate",
                 rank0_summary["learning_rate"],
+                tb_step,
+            )
+            writer.add_scalar(
+                "Train/AMPScale",
+                rank0_summary["grad_scale"],
+                tb_step,
+            )
+            writer.add_scalar(
+                "Train/OverflowSkippedSteps",
+                rank0_summary["overflow_skipped_steps_total"],
                 tb_step,
             )
             writer.add_scalar("Train/TokensPerSec", train_tokens_per_sec, tb_step)
@@ -4888,6 +5454,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-consecutive-overflow-skips",
+        type=int,
+        default=8,
+        help=(
+            "Fail after this many consecutive FP16 GradScaler overflow skips. "
+            "BF16 training does not use this watchdog."
+        ),
+    )
+    parser.add_argument(
         "--clip-mode",
         type=str,
         default="ppo",
@@ -5048,6 +5623,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--fsdp-world-size", type=int, default=6)
+    parser.add_argument(
+        "--fsdp-static-memory-fraction-limit",
+        type=float,
+        default=0.75,
+        help=(
+            "Maximum fraction of initially free trainer-GPU memory allowed "
+            "for the estimated FP32 FSDP/AdamW static peak."
+        ),
+    )
     parser.add_argument("--fsdp-master-addr", default=None)
     parser.add_argument("--fsdp-master-port", type=int, default=None)
     parser.add_argument(
@@ -5209,6 +5793,8 @@ def validate_args(args: argparse.Namespace) -> None:
     load_textworld_game_files(args)
     if args.grad_accum_steps < 1:
         raise ValueError("--grad-accum-steps must be >= 1")
+    if args.max_consecutive_overflow_skips < 1:
+        raise ValueError("--max-consecutive-overflow-skips must be >= 1")
     if args.max_steps < 1:
         raise ValueError("--max-steps must be >= 1")
     if args.learning_rate < 0:
@@ -5247,6 +5833,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--checkpoint-every-sync-rounds must be >= 0")
     if args.fsdp_world_size < 1:
         raise ValueError("--fsdp-world-size must be >= 1")
+    if not 0.0 < args.fsdp_static_memory_fraction_limit <= 1.0:
+        raise ValueError(
+            "--fsdp-static-memory-fraction-limit must be in (0, 1]"
+        )
     if args.sync_every_optimizer_steps < 1:
         raise ValueError("--sync-every-optimizer-steps must be >= 1")
     if args.infer_size < 1:

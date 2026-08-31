@@ -143,9 +143,19 @@ python accerl_agent/textworld_local_infer.py \
   --vllm-max-num-batched-tokens 2048
 ```
 
-Third, run the current long-running end-to-end configuration. It uses 3 FSDP
-trainer GPUs and 1 vLLM inference GPU, so it needs at least 4 visible GPUs. The
+Third, run the current long-running end-to-end configuration. It uses 6 FSDP
+trainer GPUs and 1 vLLM inference GPU, so it needs at least 7 visible GPUs. The
 rollout algorithm is GRPO, while the policy objective uses PPO-style clipping:
+
+The TextWorld trainer loads FP32 policy storage on CPU, lets FSDP2 move and
+shard it, computes in BF16/FP16, reduces gradients in FP32, and keeps AdamW
+moments in FP32. For the approximately 14.3B-parameter Qwen-MoE example, the
+FP32 parameter, gradient, and optimizer-state floor makes the former 3-way
+trainer layout too small for typical 80 GiB GPUs. Startup rejects an estimated
+static peak above the configured free-memory fraction before sharding. Each
+trainer rank also loads its own roughly 53 GiB FP32 CPU policy copy (about
+320 GiB across six ranks), so reserve additional host RAM for loading peaks and
+the rest of the process.
 
 ```bash
 python -m accerl_agent.run_agent_textworld \
@@ -158,7 +168,7 @@ python -m accerl_agent.run_agent_textworld \
   --max-length 8192 \
   --gae-gamma 1.0 \
   --tw-lost-penalty 0.0 \
-  --fsdp-world-size 3 \
+  --fsdp-world-size 6 \
   --infer-size 1 \
   --infer-tp-size 1 \
   --num-rollout-workers 24 \
@@ -182,7 +192,9 @@ python -m accerl_agent.run_agent_textworld \
 ```
 
 The command above is the full GRPO packed configuration and is intended for
-long-running training. For a much smaller 2-GPU PPO validation run, use:
+long-running training. The smaller PPO command below requires a smaller policy
+whose FP32 optimizer-state estimate fits one trainer GPU; it is not suitable
+for the default 14.3B-parameter Qwen-MoE checkpoint with `--fsdp-world-size 1`.
 
 ```bash
 python -m accerl_agent.run_agent_textworld \
@@ -375,11 +387,12 @@ labels, logprobs, or per-token policy versions.
 | Argument | Description |
 | --- | --- |
 | `--model-path` | Local HuggingFace model path. |
-| `--dtype` | FSDP trainer model dtype: `auto`, `bfloat16`, or `float16`; it is not forwarded to the vLLM actor. |
+| `--dtype` | FSDP compute and vLLM transfer dtype: `auto`, `bfloat16`, or `float16`; policy storage, gradients, and AdamW moments remain FP32. |
 | `--tw-game-dir` | Directory containing TextWorld `.z8` games. |
 | `--tw-history-token-window` | Token limit for the episode transcript. |
 | `--max-length` | Maximum trainer-side sequence length; must be at least `--tw-history-token-window`. |
 | `--fsdp-world-size` | Number of FSDP trainer GPUs. |
+| `--fsdp-static-memory-fraction-limit` | Maximum fraction of initially free trainer-GPU memory allowed for the estimated FP32 FSDP/AdamW static peak; defaults to `0.75`. |
 | `--infer-size` | vLLM data-parallel size. |
 | `--infer-tp-size` | vLLM tensor-parallel size. |
 | `--num-rollout-workers` | Number of CPU rollout actors; must be at least `--fsdp-world-size`. |
@@ -393,11 +406,12 @@ labels, logprobs, or per-token policy versions.
 | `--train-token-budget` | Maximum real tokens in a pack; required and must be at least `--max-length`. |
 | `--train-pack-candidate-pool-size` | Replay candidate pool used for length-aware packing; defaults to four times `--train-max-sequences-per-pack`. |
 | `--grad-accum-steps` | Gradient accumulation steps. |
+| `--max-consecutive-overflow-skips` | FP16 fail-fast threshold for consecutive globally synchronized AMP overflow skips; defaults to `8`. |
 | `--replay-capacity` | Maximum number of samples in each replay buffer. |
 | `--min-replay-size-per-rank` | Minimum replay size required before a trainer rank starts training. |
 | `--sync-every-optimizer-steps` | Number of optimizer steps between vLLM weight syncs. |
 | `--max-sync-rounds` | Maximum number of post-training weight synchronizations; `N` syncs can include up to `N+1` training segments. |
-| `--save-checkpoint` | Save a HuggingFace-format model checkpoint. |
+| `--save-checkpoint` | Save FP32 HuggingFace policy/Value Head weights; optimizer, AMP scaler, EMA, RNG, and replay state are not resumable. |
 | `--checkpoint-every-sync-rounds` | Periodic checkpoint interval; `0` disables periodic saves. |
 
 ## Checkpoints
@@ -417,7 +431,10 @@ Default output path:
 Periodic and final saves both overwrite `latest`, so only the newest model is
 retained.
 
-Saved checkpoint contents include model weights, config, tokenizer files, and `trainer_state.json`. Optimizer state and replay-buffer contents are not saved yet, so these checkpoints are mainly for inference/evaluation rather than full training resume.
+Saved checkpoint contents include FP32 model weights, config, tokenizer files,
+and `trainer_state.json`. Optimizer, AMP scaler, PPO EMA, RNG, and replay state
+are not saved, so these are weight checkpoints for inference/evaluation rather
+than full training resume.
 
 ## Key Metrics
 
@@ -435,6 +452,8 @@ Saved checkpoint contents include model weights, config, tokenizer files, and `t
 | `Rollout/HistoryLimitRate` | Fraction of episodes stopped by the history-token limit. |
 | `Train/PolicyLoss` | Trajectory-equal policy loss used by optimization. |
 | `Train/LearningRate` | Current optimizer learning rate. |
+| `Train/AMPScale` | Current FP16 GradScaler scale; always `1` for BF16. |
+| `Train/OverflowSkippedSteps` | Cumulative globally synchronized FP16 overflow skips. |
 | `Train/TokensPerSec` | Valid training tokens processed per second. |
 | `Train/PackTokenUtilization` | Fraction of `--train-token-budget` occupied by real tokens in a pack. |
 | `KL/OldNewK3TrajectoryMean` | PPO/GRPO KL penalty used by optimization: valid-token mean within each trajectory, then an equal mean across valid trajectories. |
