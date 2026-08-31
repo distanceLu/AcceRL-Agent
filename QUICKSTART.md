@@ -176,7 +176,7 @@ packed training, and response-only LM-head projection:
 
 Unlike the separate local-trainer smoke test, the TextWorld trainer loads FP32
 policy storage on CPU and lets FSDP2 move and shard it. Forward/backward uses
-BF16/FP16, while gradients and AdamW states remain FP32. The verified 27 GiB
+BF16, while gradients and AdamW states remain FP32. The verified 27 GiB
 BF16 checkpoint has roughly 14.3B parameters, so 3-way FP32 optimizer sharding
 is too small for typical 80 GiB GPUs once gradients, moments, and temporary
 buffers are included. Each trainer rank also holds a roughly 53 GiB FP32 CPU
@@ -420,19 +420,18 @@ This is the most important stability check. Every sample must guarantee:
   reclaim memory. Raise it only after measuring activation and optimizer peaks.
 - The first implementation does not automatically offload optimizer state.
 
-### FP16 optimizer steps are skipped
+### BF16 training reports non-finite gradients
 
-- Monitor `Train/AMPScale` and `Train/OverflowSkippedSteps`.
-- A skip is synchronized across all FSDP2 ranks and does not advance the LR,
-  optimizer-step counter, PPO EMA, or weight-sync schedule.
-- Repeated skips beyond `--max-consecutive-overflow-skips` fail the run; prefer
-  BF16 on supported GPUs.
+- BF16 does not use loss scaling or recoverable overflow skips. Non-finite
+  gradients fail the optimizer step immediately.
+- Check the loss, rewards, advantages, learning rate, and input data before
+  restarting the run.
 
 ### Packed training or FlashAttention initialization fails
 
 - Confirm that `flash_attn` imports in the same environment used by Ray
   trainers.
-- Use `bfloat16`, `float16`, or `auto`.
+- Use `bfloat16`; every trainer GPU must support native BF16.
 - Confirm that the model supports Transformers `flash_attention_2`.
 - Confirm that the CausalLM forward accepts tensor `logits_to_keep`; this is verified with
   Transformers 5.12.1 Qwen/Qwen-MoE. PPO and GRPO both require this API.

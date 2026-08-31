@@ -110,7 +110,7 @@ def _validate_value_head_config(
                 f"Invalid Value Head config field {key!r}: "
                 f"expected {expected_value!r}, got {config.get(key)!r}"
             )
-    if config["saved_dtype"] not in {"float16", "bfloat16", "float32"}:
+    if config["saved_dtype"] not in {"bfloat16", "float32"}:
         raise ValueError(
             "Invalid Value Head saved_dtype: "
             f"{config['saved_dtype']!r}"

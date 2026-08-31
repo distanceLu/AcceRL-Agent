@@ -121,16 +121,6 @@ class FrozenPPOTargets:
     cuda_rng_state: torch.Tensor | None
 
 
-@dataclass(frozen=True)
-class OptimizerStepResult:
-    """Outcome of one globally synchronized optimizer-step attempt."""
-
-    succeeded: bool
-    current_lr: float
-    grad_scale: float
-    grad_norm: float
-
-
 class PackedTensorStats:
     """Named scalar statistics packed into one tensor for one all-reduce."""
 
@@ -272,20 +262,19 @@ def _raise_if_nonfinite_tensors(
     )
 
 
-def pick_dtype(dtype_name: str):
-    if dtype_name == "float16":
-        return torch.float16
-    if dtype_name == "bfloat16":
-        return torch.bfloat16
-    if torch.cuda.is_available():
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    return torch.float32
+def pick_dtype(dtype_name: str) -> torch.dtype:
+    """Resolve the only supported training compute dtype."""
+    if dtype_name != "bfloat16":
+        raise ValueError(
+            "TextWorld training only supports bfloat16; got "
+            f"{dtype_name!r}."
+        )
+    return torch.bfloat16
 
 
 def torch_dtype_name(dtype: torch.dtype) -> str:
     """Return the canonical wire/config name for a supported torch dtype."""
     names = {
-        torch.float16: "float16",
         torch.bfloat16: "bfloat16",
         torch.float32: "float32",
     }
@@ -298,10 +287,10 @@ def torch_dtype_name(dtype: torch.dtype) -> str:
 def build_policy_mixed_precision_policy(
     compute_dtype: torch.dtype,
 ) -> MixedPrecisionPolicy:
-    """Keep FSDP2 shards in FP32 while computing in BF16 or FP16."""
-    if compute_dtype not in (torch.bfloat16, torch.float16):
+    """Keep FSDP2 shards in FP32 while computing exclusively in BF16."""
+    if compute_dtype is not torch.bfloat16:
         raise ValueError(
-            "FSDP policy compute dtype must be bfloat16 or float16; got "
+            "FSDP policy compute dtype must be bfloat16; got "
             f"{compute_dtype}."
         )
     return MixedPrecisionPolicy(
@@ -334,8 +323,8 @@ def estimate_fsdp_static_memory_bytes(
         )
     if world_size < 1:
         raise ValueError("world_size must be positive.")
-    if compute_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("compute_dtype must be bfloat16 or float16.")
+    if compute_dtype is not torch.bfloat16:
+        raise ValueError("compute_dtype must be bfloat16.")
 
     fp32_shard_bytes = math.ceil(
         total_parameter_numel * torch.float32.itemsize / world_size
@@ -376,8 +365,8 @@ def prepare_weight_for_transfer(
     transfer_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Detach and cast one full policy tensor for the vLLM payload."""
-    if transfer_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("vLLM transfer dtype must be bfloat16 or float16.")
+    if transfer_dtype is not torch.bfloat16:
+        raise ValueError("vLLM transfer dtype must be bfloat16.")
     return tensor.detach().to(dtype=transfer_dtype)
 
 
@@ -736,8 +725,6 @@ def build_model(args: argparse.Namespace, device, compute_dtype, log: bool = Tru
     model.config.use_cache = False
     if hasattr(model.config, "dtype"):
         model.config.dtype = torch.float32
-    if hasattr(model.config, "torch_dtype"):
-        model.config.torch_dtype = torch.float32
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -936,8 +923,6 @@ def dtype_nbytes(dtype_name: str) -> int:
         "float32": 4,
         "float": 4,
         "bfloat16": 2,
-        "float16": 2,
-        "half": 2,
         "int64": 8,
         "long": 8,
         "int32": 4,
@@ -1010,35 +995,20 @@ class FSDPTrainWorker:
         set_seed(args.seed + rank)
 
         self.compute_dtype = pick_dtype(args.dtype)
-        if self.compute_dtype not in (torch.bfloat16, torch.float16):
-            raise RuntimeError(
-                "CUDA TextWorld training requires a BF16 or FP16 compute dtype; "
-                f"resolved {self.compute_dtype}."
-            )
-        dtype_code = {
-            torch.float16: 1,
-            torch.bfloat16: 2,
-        }[self.compute_dtype]
-        local_dtype_code = torch.tensor(
-            dtype_code,
+        local_bf16_supported = torch.tensor(
+            int(torch.cuda.is_bf16_supported()),
             device=self.device,
             dtype=torch.int32,
         )
-        gathered_dtype_codes = [
-            torch.empty_like(local_dtype_code)
-            for _ in range(self.fsdp_world_size)
-        ]
-        dist.all_gather(gathered_dtype_codes, local_dtype_code)
-        resolved_codes = {int(item.item()) for item in gathered_dtype_codes}
-        if len(resolved_codes) != 1:
+        dist.all_reduce(local_bf16_supported, op=dist.ReduceOp.MIN)
+        if int(local_bf16_supported.item()) != 1:
             raise RuntimeError(
-                "All FSDP ranks must resolve the same compute dtype; got "
-                f"{sorted(resolved_codes)}."
+                "Every FSDP trainer GPU must support native bfloat16 training."
             )
         self.compute_dtype_name = torch_dtype_name(self.compute_dtype)
         self.transfer_dtype = self.compute_dtype
         self.transfer_dtype_name = self.compute_dtype_name
-        self.policy_mp_policy = build_policy_mixed_precision_policy(
+        policy_mp_policy = build_policy_mixed_precision_policy(
             self.compute_dtype
         )
 
@@ -1060,7 +1030,6 @@ class FSDPTrainWorker:
             model,
             self.device,
         )
-        self.value_head_loaded = value_head_loaded
         value_head_param_names = (
             [name for name, _ in value_head.named_parameters()]
             if value_head is not None
@@ -1139,10 +1108,10 @@ class FSDPTrainWorker:
             )
 
         for layer in model.model.layers:
-            fully_shard(layer, mp_policy=self.policy_mp_policy)
+            fully_shard(layer, mp_policy=policy_mp_policy)
         if value_head is not None:
             fully_shard(value_head)
-        fully_shard(model, mp_policy=self.policy_mp_policy)
+        fully_shard(model, mp_policy=policy_mp_policy)
 
         self.model = model
         self.value_head = value_head
@@ -1214,16 +1183,9 @@ class FSDPTrainWorker:
             weight_decay=args.weight_decay,
         )
         self.optimizer.zero_grad(set_to_none=True)
-        self.grad_scaler = (
-            torch.amp.GradScaler("cuda")
-            if self.compute_dtype == torch.float16
-            else None
-        )
 
         self.train_micro_step = 0
         self.optimizer_step = 0
-        self.overflow_skipped_steps_total = 0
-        self.consecutive_overflow_skips = 0
         self._gradient_precision_validated = False
         self._optimizer_precision_validated = False
         self.ppo_adv_ema_mean: float | None = None
@@ -1327,82 +1289,32 @@ class FSDPTrainWorker:
             )
         self._optimizer_precision_validated = True
 
-    def _backward(self, loss: torch.Tensor) -> None:
-        if self.grad_scaler is None:
-            loss.backward()
-        else:
-            self.grad_scaler.scale(loss).backward()
-
-    def _finalize_optimizer_step(self) -> OptimizerStepResult:
-        """Unscale, clip, and apply one optimizer update consistently."""
+    def _finalize_optimizer_step(self) -> float:
+        """Clip and apply one fail-fast BF16 optimizer update."""
         self._validate_fp32_gradients_once()
-        if self.grad_scaler is not None:
-            self.grad_scaler.unscale_(self.optimizer)
 
-        self._require_finite_parameters("optimizer pre-step parameter check")
-
-        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+        torch.nn.utils.clip_grad_norm_(
             self.trainable_parameter_list,
             max_norm=1.0,
             error_if_nonfinite=True,
         )
-        grad_norm = float(grad_norm_tensor.item())
         current_lr = self._get_current_lr(
             self.optimizer_step,
             self.args.learning_rate,
             self.args.lr_warmup_steps,
             self.args.max_steps,
         )
-        previous_lrs = [
-            float(param_group["lr"])
-            for param_group in self.optimizer.param_groups
-        ]
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = current_lr
 
-        if self.grad_scaler is None:
-            self.optimizer.step()
-            step_succeeded = True
-            grad_scale = 1.0
-        else:
-            previous_scale = float(self.grad_scaler.get_scale())
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-            grad_scale = float(self.grad_scaler.get_scale())
-            step_succeeded = grad_scale >= previous_scale
-
+        self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
-        if step_succeeded:
-            self._require_finite_parameters(
-                "optimizer post-step parameter check"
-            )
-            self.consecutive_overflow_skips = 0
-            self.optimizer_step += 1
-            self._validate_fp32_optimizer_state_once()
-        else:
-            self.overflow_skipped_steps_total += 1
-            self.consecutive_overflow_skips += 1
-            for param_group, previous_lr in zip(
-                self.optimizer.param_groups,
-                previous_lrs,
-            ):
-                param_group["lr"] = previous_lr
-            if (
-                self.consecutive_overflow_skips
-                > self.args.max_consecutive_overflow_skips
-            ):
-                raise RuntimeError(
-                    "FP16 training exceeded the consecutive overflow watchdog: "
-                    f"{self.consecutive_overflow_skips} > "
-                    f"{self.args.max_consecutive_overflow_skips}."
-                )
-
-        return OptimizerStepResult(
-            succeeded=step_succeeded,
-            current_lr=current_lr,
-            grad_scale=grad_scale,
-            grad_norm=grad_norm,
+        self._require_finite_parameters(
+            "optimizer post-step parameter check"
         )
+        self.optimizer_step += 1
+        self._validate_fp32_optimizer_state_once()
+        return current_lr
 
     def _get_current_lr(
         self,
@@ -1693,7 +1605,7 @@ class FSDPTrainWorker:
 
         # Ratio-based RL objectives are numerically sensitive. Keep the
         # subtraction, exponentiation, clipping/gating, and KL construction in
-        # FP32 even when the model forward and logits use BF16/FP16.
+        # FP32 even though the model forward and logits use BF16.
         valid_token_log_probs = valid_token_log_probs.float()
         valid_old_token_log_probs = valid_old_token_log_probs.float()
         valid_log_ratio = valid_token_log_probs - valid_old_token_log_probs
@@ -1751,13 +1663,9 @@ class FSDPTrainWorker:
         )
         _raise_if_nonfinite_tensors(
             [
-                ("logits", valid_logits),
-                ("current_logprobs", valid_token_log_probs),
                 ("old_logprobs", valid_old_token_log_probs),
-                ("log_ratio", valid_log_ratio),
-                ("ratio", valid_ratio),
                 ("advantages", valid_adv),
-                ("objective", valid_objective),
+                ("ratio", valid_ratio),
                 ("old_new_kl", old_new_kl_k3),
                 ("loss", loss),
             ],
@@ -1848,17 +1756,6 @@ class FSDPTrainWorker:
             bootstrap_mask[bootstrap_sample_indices] = True
         old_logprobs = batch["response_logprobs"].float()
         rewards = batch["response_rewards"].float()
-        _raise_if_nonfinite_tensors(
-            [
-                ("logits", valid_logits),
-                ("current_logprobs", current_logprobs),
-                ("old_logprobs", old_logprobs),
-                ("current_values", current_values),
-                ("rewards", rewards),
-                ("bootstrap_values", bootstrap_values),
-            ],
-            context="PPO forward",
-        )
         return PPOFlatTokenView(
             current_logprobs=current_logprobs,
             old_logprobs=old_logprobs,
@@ -2265,15 +2162,11 @@ class FSDPTrainWorker:
         )
         _raise_if_nonfinite_tensors(
             [
-                ("current_logprobs", view.current_logprobs),
                 ("old_logprobs", view.old_logprobs),
-                ("log_ratio", valid_log_ratio),
-                ("ratio", valid_ratio),
                 ("raw_advantages", raw_advantages),
                 ("actor_advantages", actor_advantages),
                 ("returns", returns),
-                ("objective", valid_objective),
-                ("value_residuals", residuals),
+                ("ratio", valid_ratio),
                 ("value_loss", value_loss_tokens),
                 ("old_new_kl", old_new_kl),
                 ("loss", trajectory_loss_sum),
@@ -2352,11 +2245,6 @@ class FSDPTrainWorker:
             raise ValueError(
                 "Unsupported PPO advantage normalization mode: "
                 f"{mode!r}."
-            )
-        if not torch.isfinite(actor_advantages).all():
-            raise RuntimeError(
-                "PPO actor advantages contain non-finite values after "
-                f"{mode} normalization."
             )
         return self._compute_ppo_loss_from_targets_unchecked(
             view,
@@ -2496,6 +2384,13 @@ class FSDPTrainWorker:
                     )
                     raw_advantages, returns = (
                         self._compute_ppo_raw_targets_unchecked(view)
+                    )
+                    _raise_if_nonfinite_tensors(
+                        [
+                            ("raw_advantages", raw_advantages),
+                            ("returns", returns),
+                        ],
+                        context="PPO target prepass",
                     )
                 if buffer_snapshots is not None:
                     self._validate_ppo_forward_buffers_unchanged(
@@ -2740,7 +2635,7 @@ class FSDPTrainWorker:
                 float(self.fsdp_world_size)
                 / float(global_valid_trajectory_count)
             )
-            self._backward(backward_loss)
+            backward_loss.backward()
             local_reduction_stats.add_(reduction_stats)
             local_version_stats[0] += prepared.version_lag_sum
             local_version_stats[1] += prepared.sample_count
@@ -2817,8 +2712,8 @@ class FSDPTrainWorker:
                     "Updated PPO advantage EMA moments must be finite."
                 )
 
-        optimizer_result = self._finalize_optimizer_step()
-        if ema_mode and optimizer_result.succeeded:
+        current_lr = self._finalize_optimizer_step()
+        if ema_mode:
             assert candidate_ema_mean is not None
             assert candidate_ema_variance is not None
             self.ppo_adv_ema_mean = candidate_ema_mean
@@ -2855,10 +2750,7 @@ class FSDPTrainWorker:
             "kl_trajectory_mean": kl_trajectory_mean,
             "kl_token_mean": kl_token_mean,
             "clip_fraction": stats["clip_count"] / token_count,
-            "current_lr": optimizer_result.current_lr,
-            "optimizer_step_succeeded": optimizer_result.succeeded,
-            "grad_scale": optimizer_result.grad_scale,
-            "grad_norm": optimizer_result.grad_norm,
+            "current_lr": current_lr,
         }
 
     def _run_grpo_optimizer_step(
@@ -2914,7 +2806,7 @@ class FSDPTrainWorker:
                 float(self.fsdp_world_size)
                 / float(global_valid_trajectory_count)
             )
-            self._backward(backward_loss)
+            backward_loss.backward()
 
             reduction_stats = loss_stats["reduction_stats"]
             local_reduction_stats.add_(reduction_stats)
@@ -2949,7 +2841,7 @@ class FSDPTrainWorker:
             )
         global_version_lag_sum, global_sample_count = local_version_stats.tolist()
 
-        optimizer_result = self._finalize_optimizer_step()
+        current_lr = self._finalize_optimizer_step()
 
         token_count = float(global_valid_token_count)
         trajectory_count = float(global_valid_trajectory_count)
@@ -2978,10 +2870,7 @@ class FSDPTrainWorker:
             "kl_trajectory_mean": kl_trajectory_mean,
             "kl_token_mean": kl_token_mean,
             "clip_fraction": global_clip_count / token_count,
-            "current_lr": optimizer_result.current_lr,
-            "optimizer_step_succeeded": optimizer_result.succeeded,
-            "grad_scale": optimizer_result.grad_scale,
-            "grad_norm": optimizer_result.grad_norm,
+            "current_lr": current_lr,
         }
 
     def train_until_next_sync(
@@ -2996,8 +2885,6 @@ class FSDPTrainWorker:
             self.optimizer_step + num_optimizer_steps,
             self.args.max_steps,
         )
-        overflow_skips_at_start = self.overflow_skipped_steps_total
-
         global_steps = []
         aggregate_ppo_stats = {
             name: 0.0 for name in PPOReductionStats.names()
@@ -3010,15 +2897,6 @@ class FSDPTrainWorker:
                 step_stats = self._run_ppo_optimizer_step(trainer_version)
             else:
                 step_stats = self._run_grpo_optimizer_step(trainer_version)
-            if not step_stats["optimizer_step_succeeded"]:
-                if self.rank == 0:
-                    print(
-                        "[train] FP16 overflow skipped optimizer update: "
-                        f"total={self.overflow_skipped_steps_total} "
-                        f"consecutive={self.consecutive_overflow_skips} "
-                        f"new_scale={step_stats['grad_scale']:.1f}"
-                    )
-                continue
             if self.args.rl_algorithm == "ppo":
                 for name, value in step_stats["global_ppo_stats"].items():
                     aggregate_ppo_stats[name] += value
@@ -3070,16 +2948,6 @@ class FSDPTrainWorker:
                 version_lag_sum / sample_count if sample_count else 0.0
             ),
             "learning_rate": self.optimizer.param_groups[0]["lr"],
-            "grad_scale": (
-                float(self.grad_scaler.get_scale())
-                if self.grad_scaler is not None
-                else 1.0
-            ),
-            "overflow_skipped_steps_total": self.overflow_skipped_steps_total,
-            "consecutive_overflow_skips": self.consecutive_overflow_skips,
-            "segment_overflow_skipped_steps": (
-                self.overflow_skipped_steps_total - overflow_skips_at_start
-            ),
         }
         pack_token_count = sum(
             float(step["global_pack_token_count"])
@@ -3367,7 +3235,6 @@ class FSDPTrainWorker:
                 "policy_compute_dtype": self.compute_dtype_name,
                 "gradient_reduce_dtype": "float32",
                 "vllm_transfer_dtype": self.transfer_dtype_name,
-                "grad_scaler_enabled": self.grad_scaler is not None,
             }
             if self.value_head is not None:
                 assert value_head_state_dict is not None
@@ -3743,9 +3610,9 @@ class VLLMInferenceActor:
         args: argparse.Namespace,
         resolved_compute_dtype_name: str,
     ):
-        if resolved_compute_dtype_name not in {"bfloat16", "float16"}:
+        if resolved_compute_dtype_name != "bfloat16":
             raise ValueError(
-                "vLLM policy dtype must be bfloat16 or float16; got "
+                "vLLM policy dtype must be bfloat16; got "
                 f"{resolved_compute_dtype_name!r}."
             )
         engine_kwargs = dict(
@@ -4652,6 +4519,7 @@ async def sync_weights_to_vllm(
         f"[sync] full-policy metadata: tensors={len(names)}, "
         f"logical_payload={model_gib:.3f} GiB, "
         f"aggregate_infer_payload={infer_payload_gib:.3f} GiB, "
+        f"packed={packed}, "
         "critic_in_vllm_payload=False"
     )
 
@@ -4769,9 +4637,9 @@ def save_fsdp_checkpoint(
 
 async def run_textworld_train(args: argparse.Namespace):
     if args.ray_address:
-        ray.init(address=args.ray_address, _temp_dir="/mnt/data/lcx4/ray_tmp")
+        ray.init(address=args.ray_address, _temp_dir=args.ray_temp_dir)
     else:
-        ray.init(_temp_dir="/mnt/data/lcx4/ray_tmp")
+        ray.init(_temp_dir=args.ray_temp_dir)
 
     save_run_config(args)
     writer = SummaryWriter(args.log_dir)
@@ -5107,16 +4975,6 @@ async def run_textworld_train(args: argparse.Namespace):
                 rank0_summary["learning_rate"],
                 tb_step,
             )
-            writer.add_scalar(
-                "Train/AMPScale",
-                rank0_summary["grad_scale"],
-                tb_step,
-            )
-            writer.add_scalar(
-                "Train/OverflowSkippedSteps",
-                rank0_summary["overflow_skipped_steps_total"],
-                tb_step,
-            )
             writer.add_scalar("Train/TokensPerSec", train_tokens_per_sec, tb_step)
             writer.add_scalar(
                 "Train/PackTokenUtilization",
@@ -5313,8 +5171,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dtype",
-        default="auto",
-        choices=("auto", "bfloat16", "float16"),
+        default="bfloat16",
+        choices=("bfloat16",),
+        help="Training compute and vLLM transfer dtype; only bfloat16 is supported.",
     )
     parser.add_argument(
         "--tw-game-dir",
@@ -5451,15 +5310,6 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help=(
             "Fixed number of packs prepared per rank for each optimizer step."
-        ),
-    )
-    parser.add_argument(
-        "--max-consecutive-overflow-skips",
-        type=int,
-        default=8,
-        help=(
-            "Fail after this many consecutive FP16 GradScaler overflow skips. "
-            "BF16 training does not use this watchdog."
         ),
     )
     parser.add_argument(
@@ -5640,6 +5490,13 @@ def parse_args() -> argparse.Namespace:
         help="Optional Ray cluster address. Defaults to local ray.init().",
     )
     parser.add_argument(
+        "--ray-temp-dir",
+        default="/mnt/data/lcx4/ray_tmp",
+        help=(
+            "Ray temporary directory. Defaults to /mnt/data/lcx4/ray_tmp."
+        ),
+    )
+    parser.add_argument(
         "--sync-every-optimizer-steps",
         type=int,
         default=8,
@@ -5773,6 +5630,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    pick_dtype(args.dtype)
     if args.tw_game_limit is not None and args.tw_game_limit < 1:
         raise ValueError("--tw-game-limit must be >= 1 when set")
     if args.tw_max_episode_steps < 1:
@@ -5793,8 +5651,6 @@ def validate_args(args: argparse.Namespace) -> None:
     load_textworld_game_files(args)
     if args.grad_accum_steps < 1:
         raise ValueError("--grad-accum-steps must be >= 1")
-    if args.max_consecutive_overflow_skips < 1:
-        raise ValueError("--max-consecutive-overflow-skips must be >= 1")
     if args.max_steps < 1:
         raise ValueError("--max-steps must be >= 1")
     if args.learning_rate < 0:
@@ -5837,6 +5693,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--fsdp-static-memory-fraction-limit must be in (0, 1]"
         )
+    if not args.ray_temp_dir:
+        raise ValueError("--ray-temp-dir must be non-empty")
     if args.sync_every_optimizer_steps < 1:
         raise ValueError("--sync-every-optimizer-steps must be >= 1")
     if args.infer_size < 1:
