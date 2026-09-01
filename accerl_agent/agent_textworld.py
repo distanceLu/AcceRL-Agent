@@ -81,6 +81,83 @@ def find_open_port() -> int:
         return sock.getsockname()[1]
 
 
+def wait_for_selected_ray_actor_debugger(role: str, rank: int) -> None:
+    """Wait for debugpy in the Ray actor selected through the environment."""
+    selected_role_value = os.environ.get("ACCERL_DEBUG_ROLE", "").strip().lower()
+    if not selected_role_value:
+        return
+
+    valid_roles = {"trainer", "infer", "rollout", "replay"}
+    if selected_role_value == "all":
+        selected_roles = valid_roles
+    else:
+        selected_roles = {
+            "replay" if item.strip() == "replaybuffer" else item.strip()
+            for item in selected_role_value.split(",")
+            if item.strip()
+        }
+    invalid_roles = selected_roles - valid_roles
+    if not selected_roles or invalid_roles:
+        raise ValueError(
+            "ACCERL_DEBUG_ROLE must be trainer, infer, rollout, replay "
+            "(or replaybuffer), all, or a comma-separated combination; "
+            f"got {selected_role_value!r}"
+        )
+    if role not in selected_roles:
+        return
+
+    if role == "infer":
+        selected_rank = 0
+    else:
+        debug_rank_value = os.environ.get("ACCERL_DEBUG_RANK", "0")
+        try:
+            selected_rank = int(debug_rank_value)
+        except ValueError as exc:
+            raise ValueError(
+                "ACCERL_DEBUG_RANK must be an integer, "
+                f"got {debug_rank_value!r}"
+            ) from exc
+    if rank != selected_rank:
+        return
+
+    try:
+        import debugpy
+    except ImportError as exc:
+        raise RuntimeError(
+            "ACCERL_DEBUG_ROLE is set, but debugpy is not installed in the "
+            "Ray actor environment."
+        ) from exc
+
+    debug_host = os.environ.get("ACCERL_DEBUG_HOST", "127.0.0.1")
+    default_ports = {
+        "trainer": 5678,
+        "infer": 5679,
+        "rollout": 5680,
+        "replay": 5681,
+    }
+    role_port_variable = f"ACCERL_DEBUG_{role.upper()}_PORT"
+    debug_port_value = os.environ.get(
+        role_port_variable,
+        os.environ.get("ACCERL_DEBUG_PORT", str(default_ports[role])),
+    )
+    try:
+        debug_port = int(debug_port_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{role_port_variable} must be an integer, "
+            f"got {debug_port_value!r}"
+        ) from exc
+
+    debugpy.listen((debug_host, debug_port))
+    print(
+        f"[debug] {role} rank {rank} waiting for debugger at "
+        f"{debug_host}:{debug_port}...",
+        flush=True,
+    )
+    debugpy.wait_for_client()
+    print(f"[debug] {role} rank {rank} debugger attached.", flush=True)
+
+
 @dataclass(frozen=True)
 class PreparedVarlenPack:
     """One CPU-resident pack prepared for a Varlen optimizer window."""
@@ -259,6 +336,18 @@ def _raise_if_nonfinite_tensors(
     )
     raise RuntimeError(
         f"Non-finite tensor detected during {context}: {location}."
+    )
+
+
+def _compute_token_logprobs_fp32(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Compute token logprobs before BF16 output quantization can occur."""
+    return -F.cross_entropy(
+        logits.float(),
+        labels,
+        reduction="none",
     )
 
 
@@ -982,6 +1071,8 @@ class FSDPTrainWorker:
         self.fsdp_world_size = fsdp_world_size
         self.replay_buffer = replay_buffer
 
+        wait_for_selected_ray_actor_debugger("trainer", rank)
+
         os.environ["MASTER_ADDR"] = fsdp_master_addr
         os.environ["MASTER_PORT"] = str(fsdp_master_port)
 
@@ -1051,12 +1142,11 @@ class FSDPTrainWorker:
                 f"value_head_loaded={value_head_loaded}"
             )
 
-        # vLLM metadata must remain policy-only. Keep this list rooted at the
-        # Hugging Face policy model rather than the PPO Value Head.
-        named_parameters = list(model.named_parameters())
-        policy_param_names = [name for name, _ in named_parameters]
+        # vLLM metadata must remain policy-only. Persist names and serialized
+        # metadata without retaining pre-FSDP Parameter objects.
+        policy_param_names = [name for name, _ in model.named_parameters()]
         self.weight_metadata = get_vllm_weight_metadata(
-            named_parameters,
+            model.named_parameters(),
             transfer_dtype=self.transfer_dtype,
         )
         validate_vllm_policy_weight_names(self.weight_metadata[0])
@@ -1594,10 +1684,9 @@ class FSDPTrainWorker:
             logits_to_keep=prediction_indices,
         )
         valid_logits = outputs.logits.squeeze(0)
-        valid_token_log_probs = -F.cross_entropy(
+        valid_token_log_probs = _compute_token_logprobs_fp32(
             valid_logits,
             valid_labels,
-            reduction="none",
         )
         valid_old_token_log_probs = batch["response_logprobs"].to(
             torch.float32
@@ -1606,7 +1695,6 @@ class FSDPTrainWorker:
         # Ratio-based RL objectives are numerically sensitive. Keep the
         # subtraction, exponentiation, clipping/gating, and KL construction in
         # FP32 even though the model forward and logits use BF16.
-        valid_token_log_probs = valid_token_log_probs.float()
         valid_old_token_log_probs = valid_old_token_log_probs.float()
         valid_log_ratio = valid_token_log_probs - valid_old_token_log_probs
         valid_ratio = torch.exp(valid_log_ratio)
@@ -1719,11 +1807,10 @@ class FSDPTrainWorker:
             },
         )
         valid_logits = outputs.logits[0, response_columns]
-        current_logprobs = -F.cross_entropy(
+        current_logprobs = _compute_token_logprobs_fp32(
             valid_logits,
             batch["input_ids"][0, target_indices],
-            reduction="none",
-        ).float()
+        )
         response_hidden = selected_hidden[0, response_columns]
         if bootstrap_columns.numel() > 0:
             bootstrap_hidden = selected_hidden[0, bootstrap_columns]
@@ -3395,6 +3482,7 @@ class ReplayBufferActor:
 
     def __init__(self, capacity: int, rank: int):
         self.rank = int(rank)
+        wait_for_selected_ray_actor_debugger("replay", self.rank)
         self.samples = deque(maxlen=capacity)
 
     def add_samples(self, samples: List[RLSample]) -> None:
@@ -3610,6 +3698,7 @@ class VLLMInferenceActor:
         args: argparse.Namespace,
         resolved_compute_dtype_name: str,
     ):
+        wait_for_selected_ray_actor_debugger("infer", 0)
         if resolved_compute_dtype_name != "bfloat16":
             raise ValueError(
                 "vLLM policy dtype must be bfloat16; got "
@@ -4024,6 +4113,7 @@ class TextWorldRolloutWorkerActor:
         self.worker_id = int(worker_id)
         self.replay_buffer = replay_buffer
         self.stats_actor = stats_actor
+        wait_for_selected_ray_actor_debugger("rollout", self.worker_id)
         self.tokenizer = build_tokenizer(args, log=False)
         self.game_files = load_textworld_game_files(args)
         request_infos = make_textworld_request_infos()
@@ -5535,7 +5625,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-rollout-workers",
         type=int,
-        default=None,
+        default=24,
         help=(
             "Number of CPU TextWorldRolloutWorkerActor instances to launch. "
             "Defaults to --fsdp-world-size."
