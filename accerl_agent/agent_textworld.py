@@ -1435,102 +1435,14 @@ class FSDPTrainWorker:
             dist.destroy_process_group()
 
     def _prepare_rl_sample(self, sample: RLSample) -> RLSample | None:
-        if self.args.rl_algorithm == "ppo" and isinstance(sample, RawPPOSample):
-            return self._prepare_ppo_sample(sample)
-        if self.args.rl_algorithm == "grpo" and isinstance(sample, GRPOSample):
-            return self._prepare_grpo_sample(sample)
-        return None
-
-    def _prepare_ppo_sample(
-        self,
-        sample: RawPPOSample,
-    ) -> RawPPOSample | None:
-        original_length = len(sample.input_ids)
-        max_length = self.args.max_length
-        if original_length <= max_length:
-            return sample
-        if max_length < 2:
-            return None
-
-        truncate_offset = original_length - max_length
-        kept_positions: List[int] = []
-        kept_logprobs: List[float] = []
-        kept_rewards: List[float] = []
-        response_index = 0
-        for start, end in sample.response_spans:
-            for position in range(start, end):
-                if position > truncate_offset:
-                    kept_positions.append(position - truncate_offset)
-                    kept_logprobs.append(
-                        sample.response_logprobs[response_index]
-                    )
-                    kept_rewards.append(sample.response_rewards[response_index])
-                response_index += 1
-        if not kept_positions:
-            return None
-
-        response_spans: List[Tuple[int, int]] = []
-        span_start = kept_positions[0]
-        previous_position = span_start
-        for position in kept_positions[1:]:
-            if position != previous_position + 1:
-                response_spans.append((span_start, previous_position + 1))
-                span_start = position
-            previous_position = position
-        response_spans.append((span_start, previous_position + 1))
-
-        return RawPPOSample(
-            input_ids=list(sample.input_ids[-max_length:]),
-            response_spans=response_spans,
-            response_logprobs=kept_logprobs,
-            response_rewards=kept_rewards,
-            boundary_kind=sample.boundary_kind,
-            behavior_version=sample.behavior_version,
+        algorithm_matches = (
+            self.args.rl_algorithm == "ppo" and isinstance(sample, RawPPOSample)
+        ) or (
+            self.args.rl_algorithm == "grpo" and isinstance(sample, GRPOSample)
         )
-
-    def _prepare_grpo_sample(
-        self,
-        sample: GRPOSample,
-    ) -> GRPOSample | None:
-        original_length = len(sample.input_ids)
-        max_length = self.args.max_length
-        if original_length <= max_length:
-            return sample
-        if max_length < 2:
+        if not algorithm_matches or len(sample.input_ids) > self.args.max_length:
             return None
-
-        truncate_offset = original_length - max_length
-        kept_positions: List[int] = []
-        kept_logprobs: List[float] = []
-        response_index = 0
-        for start, end in sample.response_spans:
-            for position in range(start, end):
-                if position > truncate_offset:
-                    kept_positions.append(position - truncate_offset)
-                    kept_logprobs.append(
-                        sample.response_logprobs[response_index]
-                    )
-                response_index += 1
-        if not kept_positions:
-            return None
-
-        response_spans: List[Tuple[int, int]] = []
-        span_start = kept_positions[0]
-        previous_position = span_start
-        for position in kept_positions[1:]:
-            if position != previous_position + 1:
-                response_spans.append((span_start, previous_position + 1))
-                span_start = position
-            previous_position = position
-        response_spans.append((span_start, previous_position + 1))
-
-        return GRPOSample(
-            input_ids=sample.input_ids[-max_length:],
-            response_spans=response_spans,
-            response_logprobs=kept_logprobs,
-            advantage=sample.advantage,
-            behavior_version=sample.behavior_version,
-        )
+        return sample
 
     def _collate_prepared_rl_samples(
         self,
