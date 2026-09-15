@@ -39,6 +39,7 @@ If you only want to run the smallest working flow first, see [QUICKSTART.md](QUI
 | --- | --- |
 | `accerl_agent/run_agent_textworld.py` | Canonical launcher for Ray-safe TextWorld training startup. |
 | `accerl_agent/agent_textworld.py` | Full Ray + vLLM + FSDP online RL training implementation. |
+| `accerl_agent/moe_ep.py` | Qwen2-MoE routed-expert DTensor sharding and ragged expert-parallel dispatcher. |
 | `accerl_agent/rl_data.py` | Canonical replay schemas, strict PPO validation, and detached batched token GAE. |
 | `accerl_agent/ppo_value.py` | Shared-backbone FP32 Value Head and Critic checkpoint helpers. |
 | `accerl_agent/textworld_local_infer.py` | Checks vLLM inference and TextWorld environment interaction without training. |
@@ -195,6 +196,18 @@ The command above is the full GRPO packed configuration and is intended for
 long-running training. The smaller PPO command below requires a smaller policy
 whose FP32 optimizer-state estimate fits one trainer GPU; it is not suitable
 for the default 14.3B-parameter Qwen-MoE checkpoint with `--fsdp-world-size 1`.
+
+For the Qwen2-MoE expert-parallel PoC, use the same number of trainer and EP
+ranks, for example `--fsdp-world-size 3 --train-ep-size 3`. Dense parameters,
+the router, and shared experts remain FSDP3; the 60 routed experts are owned 20
+per rank and use ragged token all-to-all. This mode is intentionally
+E-FSDP1: `--train-ep-size` must be either `1` or exactly
+`--fsdp-world-size`, and the routed-expert count must be divisible by it.
+
+The portable three-rank dispatcher test runs on Gloo/CPU as part of normal
+test discovery. On a host with three free CUDA devices, set
+`ACCERL_TEST_EP_NCCL=1` when running `accerl_agent.test_moe_ep` to additionally
+exercise NCCL A2A and old-vs-SUM FSDP gradient/Adam-step parity.
 
 ```bash
 python -m accerl_agent.run_agent_textworld \
@@ -392,6 +405,7 @@ labels, logprobs, or per-token policy versions.
 | `--tw-history-token-window` | Token limit for the episode transcript. |
 | `--max-length` | Maximum trainer-side sequence length; must be at least `--tw-history-token-window`. |
 | `--fsdp-world-size` | Number of FSDP trainer GPUs. |
+| `--train-ep-size` | Trainer expert-parallel degree. `1` keeps pure FSDP; the PyTorch 2.11 PoC otherwise requires it to equal `--fsdp-world-size`. |
 | `--fsdp-static-memory-fraction-limit` | Maximum fraction of initially free trainer-GPU memory allowed for the estimated FP32 FSDP/AdamW static peak; defaults to `0.75`. |
 | `--infer-size` | vLLM data-parallel size. |
 | `--infer-tp-size` | vLLM tensor-parallel size. |
