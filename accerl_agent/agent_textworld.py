@@ -70,7 +70,6 @@ from accerl_agent.rl_data import (
     _compute_batched_token_gae_unchecked,
     classify_textworld_termination_reason,
     textworld_ppo_boundary_is_terminal,
-    validate_raw_ppo_sample,
 )
 
 
@@ -585,19 +584,6 @@ def make_grpo_varlen_batch(
     }
 
 
-def make_ppo_varlen_batch(
-    examples: List[RawPPOSample],
-) -> Dict[str, torch.Tensor]:
-    """Validate and pack PPO samples through the checked public API."""
-    if not examples:
-        raise ValueError("At least one PPO sample is required for varlen packing.")
-    if not all(isinstance(example, RawPPOSample) for example in examples):
-        raise TypeError("PPO varlen packing only accepts RawPPOSample inputs.")
-    for example in examples:
-        validate_raw_ppo_sample(example)
-    return _make_ppo_varlen_batch_unchecked(examples)
-
-
 def _make_ppo_varlen_batch_unchecked(
     examples: List[RawPPOSample],
 ) -> Dict[str, torch.Tensor]:
@@ -1027,33 +1013,6 @@ def validate_vllm_policy_weight_names(names: Iterable[str]) -> None:
         )
 
 
-def dtype_nbytes(dtype_name: str) -> int:
-    """Return bytes per element for dtype names emitted by get_vllm_weight_metadata."""
-    return {
-        "float64": 8,
-        "double": 8,
-        "float32": 4,
-        "float": 4,
-        "bfloat16": 2,
-        "int64": 8,
-        "long": 8,
-        "int32": 4,
-        "int": 4,
-        "int16": 2,
-        "short": 2,
-        "int8": 1,
-        "uint8": 1,
-        "bool": 1,
-    }[dtype_name]
-
-
-def numel_from_shape(shape):
-    numel = 1
-    for dim in shape:
-        numel *= dim
-    return numel
-
-
 def get_transformer_fsdp_group_numels(
     model,
     ignored_parameter_ids: set[int] | None = None,
@@ -1459,16 +1418,12 @@ class FSDPTrainWorker:
         if setup is None:
             return {}
         local_count_rows = []
-        local_send_assignments = 0
-        local_recv_assignments = 0
         for module in setup.expert_modules:
             stats = module.last_dispatch_stats
             counts = stats.get("local_expert_counts")
             if counts is None:
                 return {}
             local_count_rows.append(list(counts))
-            local_send_assignments += int(stats["send_assignments"])
-            local_recv_assignments += int(stats["recv_assignments"])
         local_counts = torch.tensor(
             local_count_rows,
             device=self.device,
@@ -1480,17 +1435,9 @@ class FSDPTrainWorker:
         ]
         dist.all_gather(gathered_counts, local_counts, group=self.ep_pg)
         global_counts = torch.cat(gathered_counts, dim=1)
-        local_totals = torch.tensor(
-            [local_send_assignments, local_recv_assignments],
-            device=self.device,
-            dtype=torch.int64,
+        recv_totals = torch.stack(
+            [rank_counts.sum() for rank_counts in gathered_counts]
         )
-        gathered_totals = [
-            torch.empty_like(local_totals)
-            for _ in range(self.args.train_ep_size)
-        ]
-        dist.all_gather(gathered_totals, local_totals, group=self.ep_pg)
-        totals = torch.stack(gathered_totals)
         mean_load = global_counts.double().mean()
         max_load = global_counts.max().double()
         max_mean = (
@@ -1498,19 +1445,15 @@ class FSDPTrainWorker:
             if float(mean_load.item()) > 0.0
             else torch.zeros_like(mean_load)
         )
-        recv_mean = totals[:, 1].double().mean()
+        recv_mean = recv_totals.double().mean()
         recv_imbalance = (
-            totals[:, 1].max().double() / recv_mean
+            recv_totals.max().double() / recv_mean
             if float(recv_mean.item()) > 0.0
             else torch.zeros_like(recv_mean)
         )
-        global_send_assignments = int(totals[:, 0].sum().item())
-        hidden_bytes = int(self.model.config.hidden_size) * self.compute_dtype.itemsize
+        global_send_assignments = int(global_counts.sum().item())
         return {
             "ep_last_forward_assignment_count": float(global_send_assignments),
-            "ep_last_forward_a2a_bytes": float(
-                2 * global_send_assignments * hidden_bytes
-            ),
             "ep_last_forward_load_max_over_mean": float(max_mean.item()),
             "ep_last_forward_recv_max_over_mean": float(
                 recv_imbalance.item()
@@ -2085,15 +2028,6 @@ class FSDPTrainWorker:
                 "PPO bootstrap mask must exactly match truncated samples."
             )
 
-    def _compute_ppo_raw_targets(
-        self,
-        view: PPOFlatTokenView,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Checked helper for independently supplied PPO token views."""
-        self._validate_ppo_flat_token_view(view)
-        self._validate_ppo_boundary_layout(view)
-        return self._compute_ppo_raw_targets_unchecked(view)
-
     def _compute_ppo_raw_targets_unchecked(
         self,
         view: PPOFlatTokenView,
@@ -2259,53 +2193,6 @@ class FSDPTrainWorker:
                 f"value shape {tuple(expected_shape)}."
             )
 
-    def _compute_ppo_loss_from_targets(
-        self,
-        view: PPOFlatTokenView,
-        *,
-        raw_advantages: torch.Tensor,
-        actor_advantages: torch.Tensor,
-        returns: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Checked helper for independently supplied PPO targets."""
-        self._validate_ppo_flat_token_view(view)
-        self._validate_ppo_boundary_layout(view)
-        self._validate_ppo_target_tensors(
-            view,
-            raw_advantages=raw_advantages,
-            actor_advantages=actor_advantages,
-            returns=returns,
-        )
-        return self._compute_ppo_loss_from_targets_unchecked(
-            view,
-            raw_advantages=raw_advantages,
-            actor_advantages=actor_advantages,
-            returns=returns,
-        )
-
-    @staticmethod
-    def _validate_ppo_target_tensors(
-        view: PPOFlatTokenView,
-        *,
-        raw_advantages: torch.Tensor,
-        actor_advantages: torch.Tensor,
-        returns: torch.Tensor,
-    ) -> None:
-        expected_shape = view.current_values.shape
-        target_fields = {
-            "raw_advantages": raw_advantages,
-            "actor_advantages": actor_advantages,
-            "returns": returns,
-        }
-        for name, tensor in target_fields.items():
-            if tensor.shape != expected_shape:
-                raise RuntimeError(
-                    f"PPO {name} shape must be {tuple(expected_shape)}, "
-                    f"got {tuple(tensor.shape)}."
-                )
-            if tensor.requires_grad:
-                raise RuntimeError(f"PPO {name} must be detached.")
-
     def _compute_ppo_loss_from_targets_unchecked(
         self,
         view: PPOFlatTokenView,
@@ -2426,22 +2313,6 @@ class FSDPTrainWorker:
                 truncated_count=view.truncated.sum(),
             ).pack()
         return trajectory_loss_sum, stats
-
-    def _compute_ppo_reduction_sums(
-        self,
-        view: PPOFlatTokenView,
-        *,
-        ema_mean: float | None = None,
-        ema_scale: float | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Checked single-forward PPO objective for standalone callers."""
-        self._validate_ppo_flat_token_view(view)
-        self._validate_ppo_boundary_layout(view)
-        return self._compute_ppo_reduction_sums_unchecked(
-            view,
-            ema_mean=ema_mean,
-            ema_scale=ema_scale,
-        )
 
     def _compute_ppo_reduction_sums_unchecked(
         self,
@@ -2719,25 +2590,36 @@ class FSDPTrainWorker:
         assert window is not None
         return window
 
-    def _reduce_varlen_pack_stats(
+    def _reduce_varlen_window_counts(
         self,
         window: List[PreparedVarlenPack],
-    ) -> Dict[str, float]:
-        """Aggregate the token count needed for pack utilization."""
-        global_token_count = torch.tensor(
-            sum(pack.total_token_count for pack in window),
+    ) -> Tuple[int, int, Dict[str, float]]:
+        """Reduce valid counts and packed-token utilization in one collective."""
+        global_counts = torch.tensor(
+            [
+                sum(pack.valid_token_count for pack in window),
+                sum(pack.valid_trajectory_count for pack in window),
+                sum(pack.total_token_count for pack in window),
+            ],
             device=self.device,
-            dtype=torch.float64,
+            dtype=torch.int64,
         )
         dist.all_reduce(
-            global_token_count,
+            global_counts,
             op=dist.ReduceOp.SUM,
             group=self.loss_pg,
         )
-        return {
-            "global_pack_token_count": float(global_token_count.item()),
-            "global_pack_count": float(len(window) * self.fsdp_world_size),
-        }
+        valid_tokens, valid_trajectories, packed_tokens = (
+            int(value) for value in global_counts.tolist()
+        )
+        return (
+            valid_tokens,
+            valid_trajectories,
+            {
+                "global_pack_token_count": float(packed_tokens),
+                "global_pack_count": float(len(window) * self.fsdp_world_size),
+            },
+        )
 
     def _run_ppo_optimizer_step(
         self,
@@ -2745,27 +2627,11 @@ class FSDPTrainWorker:
     ) -> Dict[str, object]:
         """Run one globally trajectory-normalized packed PPO optimizer step."""
         window = self._prepare_varlen_optimizer_window(trainer_version)
-        pack_stats = self._reduce_varlen_pack_stats(window)
-        local_valid_token_count = sum(
-            prepared.valid_token_count for prepared in window
-        )
-        local_valid_trajectory_count = sum(
-            prepared.valid_trajectory_count for prepared in window
-        )  # 让每条 trajectory 对 loss等权，因此最终 loss 要除以全局 trajectory 数
-        global_reduction_counts = torch.tensor(
-            [local_valid_token_count, local_valid_trajectory_count],
-            device=self.device,
-            dtype=torch.int64,
-        )
-        dist.all_reduce(
-            global_reduction_counts,
-            op=dist.ReduceOp.SUM,
-            group=self.loss_pg,
-        )
         (
             global_valid_token_count,
             global_valid_trajectory_count,
-        ) = (int(value) for value in global_reduction_counts.tolist())
+            pack_stats,
+        ) = self._reduce_varlen_window_counts(window)
         if global_valid_token_count <= 0:
             raise RuntimeError(
                 "Global packed PPO optimizer window contains no valid "
@@ -3014,27 +2880,11 @@ class FSDPTrainWorker:
     ) -> Dict[str, float]:
         """Run one globally trajectory-normalized packed GRPO step."""
         window = self._prepare_varlen_optimizer_window(trainer_version)
-        pack_stats = self._reduce_varlen_pack_stats(window)
-        local_valid_token_count = sum(
-            pack.valid_token_count for pack in window
-        )
-        local_valid_trajectory_count = sum(
-            pack.valid_trajectory_count for pack in window
-        )
-        global_reduction_counts = torch.tensor(
-            [local_valid_token_count, local_valid_trajectory_count],
-            device=self.device,
-            dtype=torch.int64,
-        )
-        dist.all_reduce(
-            global_reduction_counts,
-            op=dist.ReduceOp.SUM,
-            group=self.loss_pg,
-        )
         (
             global_valid_token_count,
             global_valid_trajectory_count,
-        ) = (int(value) for value in global_reduction_counts.tolist())
+            pack_stats,
+        ) = self._reduce_varlen_window_counts(window)
         if global_valid_token_count <= 0:
             raise RuntimeError(
                 "Global Varlen optimizer window contains no valid "
@@ -3244,10 +3094,6 @@ class FSDPTrainWorker:
                 {
                     "segment_ep_assignment_count": sum(
                         float(step["ep_last_forward_assignment_count"])
-                        for step in global_steps
-                    ),
-                    "segment_ep_a2a_bytes": sum(
-                        float(step["ep_last_forward_a2a_bytes"])
                         for step in global_steps
                     ),
                     "segment_ep_load_max_over_mean": sum(
@@ -4883,7 +4729,7 @@ class TextWorldRolloutWorkerActor:
 
 def summarize_weight_payload(dtype_names: List[str], shapes: List[List[int]]) -> float:
     total_weight_bytes = sum(
-        numel_from_shape(shape) * dtype_nbytes(dtype_name)
+        math.prod(shape) * getattr(torch, dtype_name).itemsize
         for dtype_name, shape in zip(dtype_names, shapes)
     )
     return total_weight_bytes / 1024**3
@@ -5398,7 +5244,6 @@ async def run_textworld_train(args: argparse.Namespace):
             if args.train_ep_size > 1:
                 ep_tags = {
                     "EP/AssignmentCount": "segment_ep_assignment_count",
-                    "EP/A2ABytes": "segment_ep_a2a_bytes",
                     "EP/LoadMaxOverMean": "segment_ep_load_max_over_mean",
                     "EP/ReceiveMaxOverMean": "segment_ep_recv_max_over_mean",
                     "EP/ZeroExpertFraction": "segment_ep_zero_expert_fraction",

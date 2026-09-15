@@ -271,9 +271,9 @@ class Qwen2MoeEPExperts(nn.Module):
         self,
         hidden_states: torch.Tensor,
         local_expert_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, tuple[int, ...]]:
         if hidden_states.shape[0] == 0:
-            return hidden_states
+            return hidden_states, (0,) * self.local_num_experts
         expert_permutation = torch.argsort(local_expert_ids, stable=True)
         expert_inverse = _inverse_permutation(expert_permutation)
         expert_hidden = hidden_states.index_select(0, expert_permutation)
@@ -282,6 +282,7 @@ class Qwen2MoeEPExperts(nn.Module):
             expert_ids,
             minlength=self.local_num_experts,
         )
+        local_expert_counts = tuple(int(count) for count in expert_counts.tolist())
 
         # FSDP mixed precision does not apply to ignored parameters. Keep the
         # registered DTensor/master shard in FP32 and create differentiable
@@ -290,7 +291,7 @@ class Qwen2MoeEPExperts(nn.Module):
         down = self.down_proj.to_local().to(self.compute_dtype)
         outputs = []
         offset = 0
-        for expert_idx, count in enumerate(expert_counts.tolist()):
+        for expert_idx, count in enumerate(local_expert_counts):
             if count == 0:
                 continue
             current = expert_hidden.narrow(0, offset, count)
@@ -299,13 +300,9 @@ class Qwen2MoeEPExperts(nn.Module):
             current = F.linear(current, down[expert_idx])
             outputs.append(current)
             offset += count
-        if offset != hidden_states.shape[0]:
-            raise RuntimeError(
-                "Local expert counts do not cover all received assignments"
-            )
         expert_output = torch.cat(outputs, dim=0)
         # Restore the A2A received/source-major order before reverse A2A.
-        return expert_output.index_select(0, expert_inverse)
+        return expert_output.index_select(0, expert_inverse), local_expert_counts
 
     def forward(
         self,
@@ -382,7 +379,7 @@ class Qwen2MoeEPExperts(nn.Module):
             output_split_sizes=output_splits,
             group=self.ep_group,
         )
-        received_output = self._compute_local_experts(
+        received_output, local_expert_counts = self._compute_local_experts(
             received_hidden,
             received_local_experts,
         )
@@ -403,17 +400,7 @@ class Qwen2MoeEPExperts(nn.Module):
         final_hidden_states.index_add_(0, assignment_tokens, weighted_output)
 
         self.last_dispatch_stats = {
-            "send_assignments": int(assignment_experts.numel()),
-            "recv_assignments": int(received_local_experts.numel()),
-            "input_splits": tuple(input_splits),
-            "output_splits": tuple(output_splits),
-            "local_expert_counts": tuple(
-                int(value)
-                for value in torch.bincount(
-                    received_local_experts,
-                    minlength=self.local_num_experts,
-                ).tolist()
-            ),
+            "local_expert_counts": local_expert_counts,
         }
         return final_hidden_states
 
