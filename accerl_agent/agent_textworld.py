@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 from collections import deque
-from dataclasses import asdict, dataclass, field, fields as dataclass_fields
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields, replace
 from typing import Any, Dict, Iterable, List, Literal, Tuple
 
 # Keep direct script execution import-compatible, then delegate to the
@@ -72,10 +72,6 @@ from accerl_agent.rl_data import (
     textworld_ppo_boundary_is_terminal,
     validate_raw_ppo_sample,
 )
-
-
-WEIGHT_SYNC_PACKED_BUFFER_BYTES = 1 << 30
-WEIGHT_SYNC_SAFETY_BYTES = 256 << 20
 
 
 def get_local_ip() -> str:
@@ -1105,6 +1101,10 @@ class FSDPTrainWorker:
         self.rank = rank
         self.fsdp_world_size = fsdp_world_size
         self.replay_buffer = replay_buffer
+        self.weight_sync_packed_buffer_bytes = (
+            args.weight_sync_packed_buffer_bytes
+        )
+        self.weight_sync_safety_bytes = args.weight_sync_safety_bytes
 
         wait_for_selected_ray_actor_debugger("trainer", rank)
 
@@ -3448,8 +3448,8 @@ class FSDPTrainWorker:
             )
             local_required_bytes += largest_transfer_bytes
             if packed:
-                local_required_bytes += WEIGHT_SYNC_PACKED_BUFFER_BYTES
-        local_required_bytes += WEIGHT_SYNC_SAFETY_BYTES
+                local_required_bytes += self.weight_sync_packed_buffer_bytes
+        local_required_bytes += self.weight_sync_safety_bytes
 
         min_free = torch.tensor(
             free_bytes,
@@ -3504,7 +3504,9 @@ class FSDPTrainWorker:
             trainer_args = NCCLTrainerSendWeightsArgs(
                 group=self.model_update_group,
                 packed=packed,
-                packed_buffer_size_bytes=WEIGHT_SYNC_PACKED_BUFFER_BYTES,
+                packed_buffer_size_bytes=(
+                    self.weight_sync_packed_buffer_bytes
+                ),
                 packed_num_buffers=1,
             )
             NCCLWeightTransferEngine.trainer_send_weights(
@@ -4013,6 +4015,9 @@ class VLLMInferenceActor:
         self.interval_started_at = time.perf_counter()
         self.next_request_index = 0
         self.stopped = False
+        self.weight_sync_packed_buffer_bytes = (
+            args.weight_sync_packed_buffer_bytes
+        )
 
     async def request_generation(
         self,
@@ -4137,7 +4142,9 @@ class VLLMInferenceActor:
                         dtype_names=dtype_names,
                         shapes=shapes,
                         packed=packed,
-                        packed_buffer_size_bytes=WEIGHT_SYNC_PACKED_BUFFER_BYTES,
+                        packed_buffer_size_bytes=(
+                            self.weight_sync_packed_buffer_bytes
+                        ),
                         packed_num_buffers=1,
                     )
                 )
@@ -4749,6 +4756,32 @@ class TextWorldRolloutWorkerActor:
             for reward in rewards
         ]
 
+    def _build_valid_grpo_group_samples(
+        self,
+        states: List[TextWorldTrajectoryState],
+    ) -> List[GRPOSample]:
+        """Filter invalid trajectories before normalizing group rewards."""
+        valid_samples = []
+        valid_returns = []
+        for state in states:
+            sample = self._build_textworld_episode_rl_sample(
+                state=state,
+                algorithm="grpo",
+                sample_advantage=0.0,
+            )
+            if sample is None:
+                continue
+            valid_samples.append(sample)
+            valid_returns.append(
+                sum(record.reward for record in state.step_records)
+            )
+
+        _, _, advantages = self._compute_grpo_group_advantages(valid_returns)
+        return [
+            replace(sample, advantage=advantage)
+            for sample, advantage in zip(valid_samples, advantages)
+        ]
+
     async def _run_textworld_batch(self, game_file: str) -> None:
         algorithm = self.args.rl_algorithm
         if algorithm == "ppo":
@@ -4798,25 +4831,16 @@ class TextWorldRolloutWorkerActor:
                     state.termination_reason = "step_limit"
 
             if algorithm == "ppo":
-                advantages = [None] * len(states)
+                samples = []
+                for state in states:
+                    sample = self._build_textworld_episode_rl_sample(
+                        state=state,
+                        algorithm="ppo",
+                    )
+                    if sample is not None:
+                        samples.append(sample)
             else:
-                raw_returns = [
-                    sum(record.reward for record in state.step_records)
-                    for state in states
-                ]
-                _, _, advantages = self._compute_grpo_group_advantages(
-                    raw_returns
-                )
-
-            samples = []
-            for state, advantage in zip(states, advantages):
-                sample = self._build_textworld_episode_rl_sample(
-                    state=state,
-                    algorithm=algorithm,
-                    sample_advantage=advantage,
-                )
-                if sample is not None:
-                    samples.append(sample)
+                samples = self._build_valid_grpo_group_samples(states)
 
             if samples:
                 self.replay_buffer.add_samples.remote(samples)
@@ -5916,6 +5940,25 @@ def parse_args() -> argparse.Namespace:
         help="Sync full policy weights after this many optimizer steps.",
     )
     parser.add_argument(
+        "--weight-sync-packed-buffer-bytes",
+        type=int,
+        default=1024**3,
+        help=(
+            "Packed NCCL weight-transfer buffer size in bytes. Larger values "
+            "can reduce collective overhead at the cost of higher peak GPU "
+            "memory. Defaults to 1 GiB."
+        ),
+    )
+    parser.add_argument(
+        "--weight-sync-safety-bytes",
+        type=int,
+        default=256 * 1024**2,
+        help=(
+            "Additional trainer GPU-memory headroom required by the "
+            "weight-sync preflight, in bytes. Defaults to 256 MiB."
+        ),
+    )
+    parser.add_argument(
         "--infer-size",
         type=int,
         default=2,
@@ -6119,6 +6162,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--ray-temp-dir must be non-empty")
     if args.sync_every_optimizer_steps < 1:
         raise ValueError("--sync-every-optimizer-steps must be >= 1")
+    if args.weight_sync_packed_buffer_bytes < 1:
+        raise ValueError("--weight-sync-packed-buffer-bytes must be >= 1")
+    if args.weight_sync_safety_bytes < 0:
+        raise ValueError("--weight-sync-safety-bytes must be >= 0")
     if args.infer_size < 1:
         raise ValueError("--infer-size must be >= 1")
     if args.infer_tp_size < 1:

@@ -423,6 +423,8 @@ labels, logprobs, or per-token policy versions.
 | `--replay-capacity` | Maximum number of samples in each replay buffer. |
 | `--min-replay-size-per-rank` | Minimum replay size required before a trainer rank starts training. |
 | `--sync-every-optimizer-steps` | Number of optimizer steps between vLLM weight syncs. |
+| `--weight-sync-packed-buffer-bytes` | Packed NCCL weight-transfer buffer size; defaults to 1 GiB. Larger values reduce collective overhead but increase peak GPU memory. |
+| `--weight-sync-safety-bytes` | Extra trainer GPU-memory headroom required by the weight-sync preflight; defaults to 256 MiB. |
 | `--max-sync-rounds` | Maximum number of post-training weight synchronizations; `N` syncs can include up to `N+1` training segments. |
 | `--save-checkpoint` | Save FP32 HuggingFace policy/Value Head weights; optimizer, EMA, RNG, and replay state are not resumable. |
 | `--checkpoint-every-sync-rounds` | Periodic checkpoint interval; `0` disables periodic saves. |

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping
 
 import torch
@@ -9,22 +10,71 @@ import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 
 
-VALUE_HEAD_FORMAT_VERSION = 1
-VALUE_HEAD_ARCHITECTURE = "TokenValueHead"
-VALUE_HEAD_DIRECTORY = "critic"
-VALUE_HEAD_WEIGHTS_NAME = "value_head.safetensors"
-VALUE_HEAD_CONFIG_NAME = "value_head_config.json"
-VALUE_HEAD_STATE_KEYS = frozenset({"weight", "bias"})
-VALUE_HEAD_CONFIG_KEYS = frozenset(
-    {
-        "format_version",
-        "architecture",
-        "hidden_size",
-        "out_features",
-        "bias",
-        "saved_dtype",
-    }
-)
+@dataclass(frozen=True)
+class ValueHeadCheckpointConfig:
+    """Typed manifest for the standalone Value Head checkpoint."""
+
+    hidden_size: int
+    bias: bool
+    format_version: int = 1
+    architecture: str = "TokenValueHead"
+    out_features: int = 1
+    saved_dtype: str = "float32"
+
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: Mapping[str, Any],
+    ) -> "ValueHeadCheckpointConfig":
+        expected_keys = {field.name for field in fields(cls)}
+        actual_keys = set(raw)
+        if actual_keys != expected_keys:
+            raise ValueError(
+                "Invalid Value Head config keys: "
+                f"expected {sorted(expected_keys)}, "
+                f"got {sorted(actual_keys)}"
+            )
+        try:
+            config = cls(**dict(raw))
+        except TypeError as exc:
+            raise ValueError(f"Invalid Value Head config: {exc}") from exc
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if type(self.format_version) is not int or self.format_version != 1:
+            raise ValueError(
+                "Invalid Value Head config field 'format_version': "
+                f"expected 1, got {self.format_version!r}"
+            )
+        if self.architecture != "TokenValueHead":
+            raise ValueError(
+                "Invalid Value Head config field 'architecture': "
+                f"expected 'TokenValueHead', got {self.architecture!r}"
+            )
+        if type(self.hidden_size) is not int or self.hidden_size < 1:
+            raise ValueError(
+                "Invalid Value Head config field 'hidden_size': "
+                f"expected a positive integer, got {self.hidden_size!r}"
+            )
+        if type(self.out_features) is not int or self.out_features != 1:
+            raise ValueError(
+                "Invalid Value Head config field 'out_features': "
+                f"expected 1, got {self.out_features!r}"
+            )
+        if type(self.bias) is not bool:
+            raise ValueError(
+                "Invalid Value Head config field 'bias': "
+                f"expected a boolean, got {self.bias!r}"
+            )
+        if self.saved_dtype not in {"bfloat16", "float32"}:
+            raise ValueError(
+                "Invalid Value Head saved_dtype: "
+                f"{self.saved_dtype!r}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 class TokenValueHead(torch.nn.Module):
@@ -62,10 +112,10 @@ class TokenValueHead(torch.nn.Module):
 
 
 def value_head_checkpoint_paths(checkpoint_root: str) -> tuple[str, str]:
-    critic_dir = os.path.join(checkpoint_root, VALUE_HEAD_DIRECTORY)
+    critic_dir = os.path.join(checkpoint_root, "critic")
     return (
-        os.path.join(critic_dir, VALUE_HEAD_WEIGHTS_NAME),
-        os.path.join(critic_dir, VALUE_HEAD_CONFIG_NAME),
+        os.path.join(critic_dir, "value_head.safetensors"),
+        os.path.join(critic_dir, "value_head_config.json"),
     )
 
 
@@ -75,14 +125,13 @@ def build_value_head_config(
     bias: bool,
     saved_dtype: str = "float32",
 ) -> dict[str, Any]:
-    return {
-        "format_version": VALUE_HEAD_FORMAT_VERSION,
-        "architecture": VALUE_HEAD_ARCHITECTURE,
-        "hidden_size": int(hidden_size),
-        "out_features": 1,
-        "bias": bool(bias),
-        "saved_dtype": str(saved_dtype),
-    }
+    config = ValueHeadCheckpointConfig(
+        hidden_size=int(hidden_size),
+        bias=bool(bias),
+        saved_dtype=str(saved_dtype),
+    )
+    config.validate()
+    return config.to_dict()
 
 
 def _validate_value_head_config(
@@ -91,30 +140,18 @@ def _validate_value_head_config(
     hidden_size: int,
     bias: bool,
 ) -> None:
-    if frozenset(config) != VALUE_HEAD_CONFIG_KEYS:
-        raise ValueError(
-            "Invalid Value Head config keys: "
-            f"expected {sorted(VALUE_HEAD_CONFIG_KEYS)}, "
-            f"got {sorted(config)}"
-        )
-    expected = {
-        "format_version": VALUE_HEAD_FORMAT_VERSION,
-        "architecture": VALUE_HEAD_ARCHITECTURE,
+    manifest = ValueHeadCheckpointConfig.from_mapping(config)
+    expected_runtime_fields = {
         "hidden_size": int(hidden_size),
-        "out_features": 1,
         "bias": bool(bias),
     }
-    for key, expected_value in expected.items():
-        if config.get(key) != expected_value:
+    for key, expected_value in expected_runtime_fields.items():
+        if getattr(manifest, key) != expected_value:
             raise ValueError(
                 f"Invalid Value Head config field {key!r}: "
-                f"expected {expected_value!r}, got {config.get(key)!r}"
+                f"expected {expected_value!r}, "
+                f"got {getattr(manifest, key)!r}"
             )
-    if config["saved_dtype"] not in {"bfloat16", "float32"}:
-        raise ValueError(
-            "Invalid Value Head saved_dtype: "
-            f"{config['saved_dtype']!r}"
-        )
 
 
 def _validate_value_head_state(
@@ -123,17 +160,16 @@ def _validate_value_head_state(
     hidden_size: int,
     bias: bool,
 ) -> None:
-    expected_keys = VALUE_HEAD_STATE_KEYS if bias else frozenset({"weight"})
-    actual_keys = frozenset(state_dict)
-    if actual_keys != expected_keys:
-        raise ValueError(
-            "Invalid Value Head tensor keys: "
-            f"expected {sorted(expected_keys)}, got {sorted(actual_keys)}"
-        )
-
     expected_shapes = {"weight": (1, int(hidden_size))}
     if bias:
         expected_shapes["bias"] = (1,)
+    actual_keys = set(state_dict)
+    if actual_keys != set(expected_shapes):
+        raise ValueError(
+            "Invalid Value Head tensor keys: "
+            f"expected {sorted(expected_shapes)}, got {sorted(actual_keys)}"
+        )
+
     for key, expected_shape in expected_shapes.items():
         actual_shape = tuple(state_dict[key].shape)
         if actual_shape != expected_shape:
