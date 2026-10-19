@@ -1,0 +1,3170 @@
+[
+  {
+    "request": {
+      "request_id": "near_end_71",
+      "prefix_tokens": 12,
+      "remaining": {
+        "mean": 9.66666666666667,
+        "p90": 18,
+        "support": 6,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.024596387181260178,
+        "standard_error": 0.004525738726300578
+      },
+      "cache_risk": {
+        "mean_kl": 0.000547212902741689,
+        "standard_error": 0.000294263790602211
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.5,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "old_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.014500000000000004,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.2815138837730874,
+          "retention_seconds": 0.0,
+          "score": 0.2960138837730874
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.00966666666666667,
+          "queue_seconds": 0.5,
+          "risk_nats": 0.00813427470232437,
+          "retention_seconds": 0.0,
+          "score": 0.5178009413689911
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.0322,
+          "queue_seconds": 0.5,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.5322
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "mild_update_long_prefix_71",
+      "prefix_tokens": 48,
+      "remaining": {
+        "mean": 20.999999999999975,
+        "p90": 36,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.031499999999999966,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.6408408112058992,
+          "retention_seconds": 0.0,
+          "score": 0.6723408112058992
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.020999999999999977,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.009796632293397741,
+          "retention_seconds": 0.0,
+          "score": 0.03079663229339772
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.17099999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.17099999999999999
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "large_update_short_prefix_71",
+      "prefix_tokens": 12,
+      "remaining": {
+        "mean": 49.99999999999994,
+        "p90": 72,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.1971481524038964,
+        "standard_error": 0.030279782464600776
+      },
+      "cache_risk": {
+        "mean_kl": 0.009935505002504364,
+        "standard_error": 0.003832426729661704
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.07499999999999991,
+          "queue_seconds": 0.0,
+          "risk_nats": 11.371396743424846,
+          "retention_seconds": 0.0,
+          "score": 11.446396743424845
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.04999999999999995,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.6883965866083026,
+          "retention_seconds": 0.0,
+          "score": 0.7383965866083025
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.07253333333333328,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.07253333333333328
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "large_update_long_prefix_71",
+      "prefix_tokens": 48,
+      "remaining": {
+        "mean": 20.999999999999975,
+        "p90": 36,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.22479838897980978,
+        "standard_error": 0.013635141693267565
+      },
+      "cache_risk": {
+        "mean_kl": 0.007941362673625052,
+        "standard_error": 0.001356798923978047
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.031499999999999966,
+          "queue_seconds": 0.0,
+          "risk_nats": 5.007104144134618,
+          "retention_seconds": 0.0,
+          "score": 5.038604144134618
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.020999999999999977,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.19526139354966482,
+          "retention_seconds": 0.0,
+          "score": 0.21626139354966478
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.17099999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.17099999999999999
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "old_engine_gone_71",
+      "prefix_tokens": 24,
+      "remaining": {
+        "mean": 38.000000000000014,
+        "p90": 60,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.020224838652432974,
+        "standard_error": 0.0010610982230744163
+      },
+      "cache_risk": {
+        "mean_kl": 0.0005915474223835885,
+        "standard_error": 0.0002316635286683052
+      },
+      "old_weights_available": false,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_weights_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03800000000000001,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.031282016139971974,
+          "retention_seconds": 0.0,
+          "score": 0.06928201613997198
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.09300000000000001,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.09300000000000001
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "old_engine_expiring_71",
+      "prefix_tokens": 12,
+      "remaining": {
+        "mean": 9.66666666666667,
+        "p90": 18,
+        "support": 6,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.024596387181260178,
+        "standard_error": 0.004525738726300578
+      },
+      "cache_risk": {
+        "mean_kl": 0.000547212902741689,
+        "standard_error": 0.000294263790602211
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.2,
+      "old_deadline_seconds": 0.001,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_engine_deadline",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.00966666666666667,
+          "queue_seconds": 0.2,
+          "risk_nats": 0.00813427470232437,
+          "retention_seconds": 0.0,
+          "score": 0.21780094136899103
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.0322,
+          "queue_seconds": 0.2,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.23220000000000002
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "cache_evicted_71",
+      "prefix_tokens": 24,
+      "remaining": {
+        "mean": 38.000000000000014,
+        "p90": 60,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.17566975275601165,
+        "standard_error": 0.014815482447891215
+      },
+      "cache_risk": {
+        "mean_kl": 0.014735170352292767,
+        "standard_error": 0.0006303928403540158
+      },
+      "old_weights_available": true,
+      "cache_available": false,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "matching_old_cache_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": false,
+          "reason": "cache_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.09300000000000001,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.09300000000000001
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "length_cold_start_71",
+      "prefix_tokens": 24,
+      "remaining": {
+        "mean": 60.0,
+        "p90": 60,
+        "support": 0,
+        "cold_start": true
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.020224838652432974,
+        "standard_error": 0.0010610982230744163
+      },
+      "cache_risk": {
+        "mean_kl": 0.0005915474223835885,
+        "standard_error": 0.0002316635286683052
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.09,
+          "queue_seconds": 0.0,
+          "risk_nats": 1.2771562125304434,
+          "retention_seconds": 0.0,
+          "score": 1.3671562125304435
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.06,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.049392657063113625,
+          "retention_seconds": 0.0,
+          "score": 0.10939265706311363
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.11499999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.11499999999999999
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_0_71",
+      "prefix_tokens": 28,
+      "remaining": {
+        "mean": 34.00000000000002,
+        "p90": 56,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.17566975275601165,
+        "standard_error": 0.014815482447891215
+      },
+      "cache_risk": {
+        "mean_kl": 0.014735170352292767,
+        "standard_error": 0.0006303928403540158
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.5846285753670679,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.05100000000000003,
+          "queue_seconds": 0.0,
+          "risk_nats": 6.476497996932702,
+          "retention_seconds": 0.0,
+          "score": 6.527497996932702
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03400000000000002,
+          "queue_seconds": 0.5846285753670679,
+          "risk_nats": 0.5224291485499909,
+          "retention_seconds": 0.0,
+          "score": 1.1410577239170587
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.10150000000000003,
+          "queue_seconds": 0.5846285753670679,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.686128575367068
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_1_71",
+      "prefix_tokens": 29,
+      "remaining": {
+        "mean": 33.00000000000002,
+        "p90": 55,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.17566975275601165,
+        "standard_error": 0.014815482447891215
+      },
+      "cache_risk": {
+        "mean_kl": 0.014735170352292767,
+        "standard_error": 0.0006303928403540158
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.17231071499566766,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.04950000000000003,
+          "queue_seconds": 0.0,
+          "risk_nats": 6.286012761728799,
+          "retention_seconds": 0.0,
+          "score": 6.335512761728799
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03300000000000002,
+          "queue_seconds": 0.17231071499566766,
+          "risk_nats": 0.5070635853573442,
+          "retention_seconds": 0.0,
+          "score": 0.7123743003530119
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.10362500000000002,
+          "queue_seconds": 0.17231071499566766,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.2759357149956677
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_2_71",
+      "prefix_tokens": 51,
+      "remaining": {
+        "mean": 17.999999999999996,
+        "p90": 33,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.22479838897980978,
+        "standard_error": 0.013635141693267565
+      },
+      "cache_risk": {
+        "mean_kl": 0.007941362673625052,
+        "standard_error": 0.001356798923978047
+      },
+      "old_weights_available": false,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.06011920006120736,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_weights_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.017999999999999995,
+          "queue_seconds": 0.06011920006120736,
+          "risk_nats": 0.16736690875685573,
+          "retention_seconds": 0.0,
+          "score": 0.2454861088180631
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.181125,
+          "queue_seconds": 0.06011920006120736,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.24124420006120736
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_3_71",
+      "prefix_tokens": 24,
+      "remaining": {
+        "mean": 38.000000000000014,
+        "p90": 60,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.020224838652432974,
+        "standard_error": 0.0010610982230744163
+      },
+      "cache_risk": {
+        "mean_kl": 0.0005915474223835885,
+        "standard_error": 0.0002316635286683052
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.001257462599937531,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.05700000000000002,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.8088656012692812,
+          "retention_seconds": 0.0,
+          "score": 0.8658656012692812
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03800000000000001,
+          "queue_seconds": 0.001257462599937531,
+          "risk_nats": 0.031282016139971974,
+          "retention_seconds": 0.0,
+          "score": 0.07053947873990951
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.09300000000000001,
+          "queue_seconds": 0.001257462599937531,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.09425746259993754
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_4_71",
+      "prefix_tokens": 16,
+      "remaining": {
+        "mean": 9.0,
+        "p90": 14,
+        "support": 4,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.020224838652432974,
+        "standard_error": 0.0010610982230744163
+      },
+      "cache_risk": {
+        "mean_kl": 0.0005915474223835885,
+        "standard_error": 0.0002316635286683052
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.15873664345797825,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.0135,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.19157343187956652,
+          "retention_seconds": 0.0,
+          "score": 0.20507343187956653
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.009000000000000001,
+          "queue_seconds": 0.15873664345797825,
+          "risk_nats": 0.007408898559467044,
+          "retention_seconds": 0.0,
+          "score": 0.1751455420174453
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03899999999999999,
+          "queue_seconds": 0.15873664345797825,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.19773664345797826
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_5_71",
+      "prefix_tokens": 41,
+      "remaining": {
+        "mean": 27.999999999999993,
+        "p90": 43,
+        "support": 4,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.06413740335563627,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.04199999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.8544544149411998,
+          "retention_seconds": 0.0,
+          "score": 0.8964544149411998
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.027999999999999994,
+          "queue_seconds": 0.06413740335563627,
+          "risk_nats": 0.013062176391197002,
+          "retention_seconds": 0.0,
+          "score": 0.10519957974683326
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.147375,
+          "queue_seconds": 0.06413740335563627,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.21151240335563626
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_6_71",
+      "prefix_tokens": 48,
+      "remaining": {
+        "mean": 20.999999999999975,
+        "p90": 36,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.007179036437654496,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.031499999999999966,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.6408408112058992,
+          "retention_seconds": 0.0,
+          "score": 0.6723408112058992
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.020999999999999977,
+          "queue_seconds": 0.007179036437654496,
+          "risk_nats": 0.009796632293397741,
+          "retention_seconds": 0.0,
+          "score": 0.037975668731052216
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.17099999999999999,
+          "queue_seconds": 0.007179036437654496,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.17817903643765448
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_7_71",
+      "prefix_tokens": 39,
+      "remaining": {
+        "mean": 29.999999999999996,
+        "p90": 45,
+        "support": 4,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.22479838897980978,
+        "standard_error": 0.013635141693267565
+      },
+      "cache_risk": {
+        "mean_kl": 0.007941362673625052,
+        "standard_error": 0.001356798923978047
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.3150131051488375,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.045,
+          "queue_seconds": 0.0,
+          "risk_nats": 7.15300592019232,
+          "retention_seconds": 0.0,
+          "score": 7.19800592019232
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.029999999999999995,
+          "queue_seconds": 0.3150131051488375,
+          "risk_nats": 0.27894484792809293,
+          "retention_seconds": 0.0,
+          "score": 0.6239579530769304
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.140625,
+          "queue_seconds": 0.3150131051488375,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.4556381051488375
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "near_end_72",
+      "prefix_tokens": 12,
+      "remaining": {
+        "mean": 9.66666666666667,
+        "p90": 18,
+        "support": 6,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.024596387181260178,
+        "standard_error": 0.004525738726300578
+      },
+      "cache_risk": {
+        "mean_kl": 0.000547212902741689,
+        "standard_error": 0.000294263790602211
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.5,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "old_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.014500000000000004,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.2815138837730874,
+          "retention_seconds": 0.0,
+          "score": 0.2960138837730874
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.00966666666666667,
+          "queue_seconds": 0.5,
+          "risk_nats": 0.00813427470232437,
+          "retention_seconds": 0.0,
+          "score": 0.5178009413689911
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.0322,
+          "queue_seconds": 0.5,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.5322
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "mild_update_long_prefix_72",
+      "prefix_tokens": 48,
+      "remaining": {
+        "mean": 20.999999999999975,
+        "p90": 36,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.031499999999999966,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.6408408112058992,
+          "retention_seconds": 0.0,
+          "score": 0.6723408112058992
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.020999999999999977,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.009796632293397741,
+          "retention_seconds": 0.0,
+          "score": 0.03079663229339772
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.17099999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.17099999999999999
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "large_update_short_prefix_72",
+      "prefix_tokens": 12,
+      "remaining": {
+        "mean": 49.99999999999994,
+        "p90": 72,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.1971481524038964,
+        "standard_error": 0.030279782464600776
+      },
+      "cache_risk": {
+        "mean_kl": 0.009935505002504364,
+        "standard_error": 0.003832426729661704
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.07499999999999991,
+          "queue_seconds": 0.0,
+          "risk_nats": 11.371396743424846,
+          "retention_seconds": 0.0,
+          "score": 11.446396743424845
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.04999999999999995,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.6883965866083026,
+          "retention_seconds": 0.0,
+          "score": 0.7383965866083025
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.07253333333333328,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.07253333333333328
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "large_update_long_prefix_72",
+      "prefix_tokens": 48,
+      "remaining": {
+        "mean": 20.999999999999975,
+        "p90": 36,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.22479838897980978,
+        "standard_error": 0.013635141693267565
+      },
+      "cache_risk": {
+        "mean_kl": 0.007941362673625052,
+        "standard_error": 0.001356798923978047
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.031499999999999966,
+          "queue_seconds": 0.0,
+          "risk_nats": 5.007104144134618,
+          "retention_seconds": 0.0,
+          "score": 5.038604144134618
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.020999999999999977,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.19526139354966482,
+          "retention_seconds": 0.0,
+          "score": 0.21626139354966478
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.17099999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.17099999999999999
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "old_engine_gone_72",
+      "prefix_tokens": 24,
+      "remaining": {
+        "mean": 38.000000000000014,
+        "p90": 60,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.020224838652432974,
+        "standard_error": 0.0010610982230744163
+      },
+      "cache_risk": {
+        "mean_kl": 0.0005915474223835885,
+        "standard_error": 0.0002316635286683052
+      },
+      "old_weights_available": false,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_weights_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03800000000000001,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.031282016139971974,
+          "retention_seconds": 0.0,
+          "score": 0.06928201613997198
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.09300000000000001,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.09300000000000001
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "old_engine_expiring_72",
+      "prefix_tokens": 12,
+      "remaining": {
+        "mean": 9.66666666666667,
+        "p90": 18,
+        "support": 6,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.024596387181260178,
+        "standard_error": 0.004525738726300578
+      },
+      "cache_risk": {
+        "mean_kl": 0.000547212902741689,
+        "standard_error": 0.000294263790602211
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.2,
+      "old_deadline_seconds": 0.001,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_engine_deadline",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.00966666666666667,
+          "queue_seconds": 0.2,
+          "risk_nats": 0.00813427470232437,
+          "retention_seconds": 0.0,
+          "score": 0.21780094136899103
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.0322,
+          "queue_seconds": 0.2,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.23220000000000002
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "cache_evicted_72",
+      "prefix_tokens": 24,
+      "remaining": {
+        "mean": 38.000000000000014,
+        "p90": 60,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.17566975275601165,
+        "standard_error": 0.014815482447891215
+      },
+      "cache_risk": {
+        "mean_kl": 0.014735170352292767,
+        "standard_error": 0.0006303928403540158
+      },
+      "old_weights_available": true,
+      "cache_available": false,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "matching_old_cache_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": false,
+          "reason": "cache_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.09300000000000001,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.09300000000000001
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "length_cold_start_72",
+      "prefix_tokens": 24,
+      "remaining": {
+        "mean": 60.0,
+        "p90": 60,
+        "support": 0,
+        "cold_start": true
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.020224838652432974,
+        "standard_error": 0.0010610982230744163
+      },
+      "cache_risk": {
+        "mean_kl": 0.0005915474223835885,
+        "standard_error": 0.0002316635286683052
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.09,
+          "queue_seconds": 0.0,
+          "risk_nats": 1.2771562125304434,
+          "retention_seconds": 0.0,
+          "score": 1.3671562125304435
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.06,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.049392657063113625,
+          "retention_seconds": 0.0,
+          "score": 0.10939265706311363
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.11499999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.11499999999999999
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_0_72",
+      "prefix_tokens": 55,
+      "remaining": {
+        "mean": 21.5,
+        "p90": 29,
+        "support": 2,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.3672778574374964,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03225,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.6560989257584214,
+          "retention_seconds": 0.0,
+          "score": 0.6883489257584214
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.021500000000000002,
+          "queue_seconds": 0.3672778574374964,
+          "risk_nats": 0.010029885443240558,
+          "retention_seconds": 0.0,
+          "score": 0.398807742880737
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.202125,
+          "queue_seconds": 0.3672778574374964,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.5694028574374964
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_1_72",
+      "prefix_tokens": 52,
+      "remaining": {
+        "mean": 17.0,
+        "p90": 32,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.22479838897980978,
+        "standard_error": 0.013635141693267565
+      },
+      "cache_risk": {
+        "mean_kl": 0.007941362673625052,
+        "standard_error": 0.001356798923978047
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.39474676968995404,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.025500000000000002,
+          "queue_seconds": 0.0,
+          "risk_nats": 4.053370021442315,
+          "retention_seconds": 0.0,
+          "score": 4.078870021442315
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.017,
+          "queue_seconds": 0.39474676968995404,
+          "risk_nats": 0.15806874715925268,
+          "retention_seconds": 0.0,
+          "score": 0.5698155168492067
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.1845,
+          "queue_seconds": 0.39474676968995404,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.579246769689954
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_2_72",
+      "prefix_tokens": 34,
+      "remaining": {
+        "mean": 35.000000000000036,
+        "p90": 50,
+        "support": 4,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": false,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.08221319916355607,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_weights_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03500000000000004,
+          "queue_seconds": 0.08221319916355607,
+          "risk_nats": 0.016327720488996274,
+          "retention_seconds": 0.0,
+          "score": 0.13354091965255238
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.12375000000000003,
+          "queue_seconds": 0.08221319916355607,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.2059631991635561
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_3_72",
+      "prefix_tokens": 47,
+      "remaining": {
+        "mean": 21.99999999999998,
+        "p90": 37,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.20736753258149415,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03299999999999997,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.6713570403109421,
+          "retention_seconds": 0.0,
+          "score": 0.704357040310942
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.021999999999999978,
+          "queue_seconds": 0.20736753258149415,
+          "risk_nats": 0.010263138593083351,
+          "retention_seconds": 0.0,
+          "score": 0.23963067117457748
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.16762499999999997,
+          "queue_seconds": 0.20736753258149415,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.3749925325814941
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_4_72",
+      "prefix_tokens": 49,
+      "remaining": {
+        "mean": 19.999999999999982,
+        "p90": 35,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": false,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.492979819612459,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_weights_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.019999999999999983,
+          "queue_seconds": 0.492979819612459,
+          "risk_nats": 0.009330125993712138,
+          "retention_seconds": 0.0,
+          "score": 0.5223099456061712
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.174375,
+          "queue_seconds": 0.492979819612459,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.667354819612459
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_5_72",
+      "prefix_tokens": 46,
+      "remaining": {
+        "mean": 22.99999999999998,
+        "p90": 38,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.22479838897980978,
+        "standard_error": 0.013635141693267565
+      },
+      "cache_risk": {
+        "mean_kl": 0.007941362673625052,
+        "standard_error": 0.001356798923978047
+      },
+      "old_weights_available": false,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.2659575427684978,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_weights_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.02299999999999998,
+          "queue_seconds": 0.2659575427684978,
+          "risk_nats": 0.21385771674487106,
+          "retention_seconds": 0.0,
+          "score": 0.5028152595133688
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.16425,
+          "queue_seconds": 0.2659575427684978,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.4302075427684978
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_6_72",
+      "prefix_tokens": 9,
+      "remaining": {
+        "mean": 12.666666666666671,
+        "p90": 21,
+        "support": 6,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.024596387181260178,
+        "standard_error": 0.004525738726300578
+      },
+      "cache_risk": {
+        "mean_kl": 0.000547212902741689,
+        "standard_error": 0.000294263790602211
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.5556744385302148,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "old_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.019000000000000006,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.3688802614957697,
+          "retention_seconds": 0.0,
+          "score": 0.3878802614957697
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.012666666666666672,
+          "queue_seconds": 0.5556744385302148,
+          "risk_nats": 0.01065870478235607,
+          "retention_seconds": 0.0,
+          "score": 0.5789998099792376
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.0296,
+          "queue_seconds": 0.5556744385302148,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.5852744385302148
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_7_72",
+      "prefix_tokens": 55,
+      "remaining": {
+        "mean": 21.5,
+        "p90": 29,
+        "support": 2,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": false,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.1633548392783086,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_weights_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.021500000000000002,
+          "queue_seconds": 0.1633548392783086,
+          "risk_nats": 0.010029885443240558,
+          "retention_seconds": 0.0,
+          "score": 0.19488472472154916
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.202125,
+          "queue_seconds": 0.1633548392783086,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.3654798392783086
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "near_end_73",
+      "prefix_tokens": 12,
+      "remaining": {
+        "mean": 9.66666666666667,
+        "p90": 18,
+        "support": 6,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.024596387181260178,
+        "standard_error": 0.004525738726300578
+      },
+      "cache_risk": {
+        "mean_kl": 0.000547212902741689,
+        "standard_error": 0.000294263790602211
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.5,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "old_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.014500000000000004,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.2815138837730874,
+          "retention_seconds": 0.0,
+          "score": 0.2960138837730874
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.00966666666666667,
+          "queue_seconds": 0.5,
+          "risk_nats": 0.00813427470232437,
+          "retention_seconds": 0.0,
+          "score": 0.5178009413689911
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.0322,
+          "queue_seconds": 0.5,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.5322
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "mild_update_long_prefix_73",
+      "prefix_tokens": 48,
+      "remaining": {
+        "mean": 20.999999999999975,
+        "p90": 36,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.031499999999999966,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.6408408112058992,
+          "retention_seconds": 0.0,
+          "score": 0.6723408112058992
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.020999999999999977,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.009796632293397741,
+          "retention_seconds": 0.0,
+          "score": 0.03079663229339772
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.17099999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.17099999999999999
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "large_update_short_prefix_73",
+      "prefix_tokens": 12,
+      "remaining": {
+        "mean": 49.99999999999994,
+        "p90": 72,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.1971481524038964,
+        "standard_error": 0.030279782464600776
+      },
+      "cache_risk": {
+        "mean_kl": 0.009935505002504364,
+        "standard_error": 0.003832426729661704
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.07499999999999991,
+          "queue_seconds": 0.0,
+          "risk_nats": 11.371396743424846,
+          "retention_seconds": 0.0,
+          "score": 11.446396743424845
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.04999999999999995,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.6883965866083026,
+          "retention_seconds": 0.0,
+          "score": 0.7383965866083025
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.07253333333333328,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.07253333333333328
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "large_update_long_prefix_73",
+      "prefix_tokens": 48,
+      "remaining": {
+        "mean": 20.999999999999975,
+        "p90": 36,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.22479838897980978,
+        "standard_error": 0.013635141693267565
+      },
+      "cache_risk": {
+        "mean_kl": 0.007941362673625052,
+        "standard_error": 0.001356798923978047
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.031499999999999966,
+          "queue_seconds": 0.0,
+          "risk_nats": 5.007104144134618,
+          "retention_seconds": 0.0,
+          "score": 5.038604144134618
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.020999999999999977,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.19526139354966482,
+          "retention_seconds": 0.0,
+          "score": 0.21626139354966478
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.17099999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.17099999999999999
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "old_engine_gone_73",
+      "prefix_tokens": 24,
+      "remaining": {
+        "mean": 38.000000000000014,
+        "p90": 60,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.020224838652432974,
+        "standard_error": 0.0010610982230744163
+      },
+      "cache_risk": {
+        "mean_kl": 0.0005915474223835885,
+        "standard_error": 0.0002316635286683052
+      },
+      "old_weights_available": false,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_weights_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03800000000000001,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.031282016139971974,
+          "retention_seconds": 0.0,
+          "score": 0.06928201613997198
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.09300000000000001,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.09300000000000001
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "old_engine_expiring_73",
+      "prefix_tokens": 12,
+      "remaining": {
+        "mean": 9.66666666666667,
+        "p90": 18,
+        "support": 6,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.024596387181260178,
+        "standard_error": 0.004525738726300578
+      },
+      "cache_risk": {
+        "mean_kl": 0.000547212902741689,
+        "standard_error": 0.000294263790602211
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.2,
+      "old_deadline_seconds": 0.001,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_engine_deadline",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.00966666666666667,
+          "queue_seconds": 0.2,
+          "risk_nats": 0.00813427470232437,
+          "retention_seconds": 0.0,
+          "score": 0.21780094136899103
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.0322,
+          "queue_seconds": 0.2,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.23220000000000002
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "cache_evicted_73",
+      "prefix_tokens": 24,
+      "remaining": {
+        "mean": 38.000000000000014,
+        "p90": 60,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.17566975275601165,
+        "standard_error": 0.014815482447891215
+      },
+      "cache_risk": {
+        "mean_kl": 0.014735170352292767,
+        "standard_error": 0.0006303928403540158
+      },
+      "old_weights_available": true,
+      "cache_available": false,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "matching_old_cache_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": false,
+          "reason": "cache_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.09300000000000001,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.09300000000000001
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "length_cold_start_73",
+      "prefix_tokens": 24,
+      "remaining": {
+        "mean": 60.0,
+        "p90": 60,
+        "support": 0,
+        "cold_start": true
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.020224838652432974,
+        "standard_error": 0.0010610982230744163
+      },
+      "cache_risk": {
+        "mean_kl": 0.0005915474223835885,
+        "standard_error": 0.0002316635286683052
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.09,
+          "queue_seconds": 0.0,
+          "risk_nats": 1.2771562125304434,
+          "retention_seconds": 0.0,
+          "score": 1.3671562125304435
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.06,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.049392657063113625,
+          "retention_seconds": 0.0,
+          "score": 0.10939265706311363
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.11499999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.11499999999999999
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_0_73",
+      "prefix_tokens": 13,
+      "remaining": {
+        "mean": 8.666666666666666,
+        "p90": 17,
+        "support": 6,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.1971481524038964,
+        "standard_error": 0.030279782464600776
+      },
+      "cache_risk": {
+        "mean_kl": 0.009935505002504364,
+        "standard_error": 0.003832426729661704
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.0037367481967085503,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.013,
+          "queue_seconds": 0.0,
+          "risk_nats": 1.9710421021936422,
+          "retention_seconds": 0.0,
+          "score": 1.984042102193642
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.008666666666666666,
+          "queue_seconds": 0.0037367481967085503,
+          "risk_nats": 0.11932207501210591,
+          "retention_seconds": 0.0,
+          "score": 0.13172548987548113
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03306666666666666,
+          "queue_seconds": 0.0037367481967085503,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.03680341486337521
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_1_73",
+      "prefix_tokens": 54,
+      "remaining": {
+        "mean": 22.5,
+        "p90": 30,
+        "support": 2,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.12980689766409298,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03375,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.6866151548634642,
+          "retention_seconds": 0.0,
+          "score": 0.7203651548634642
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.0225,
+          "queue_seconds": 0.12980689766409298,
+          "risk_nats": 0.010496391742926164,
+          "retention_seconds": 0.0,
+          "score": 0.16280328940701913
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.19875,
+          "queue_seconds": 0.12980689766409298,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.328556897664093
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_2_73",
+      "prefix_tokens": 41,
+      "remaining": {
+        "mean": 27.999999999999993,
+        "p90": 43,
+        "support": 4,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.22479838897980978,
+        "standard_error": 0.013635141693267565
+      },
+      "cache_risk": {
+        "mean_kl": 0.007941362673625052,
+        "standard_error": 0.001356798923978047
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.45599089720833735,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.04199999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 6.676138858846164,
+          "retention_seconds": 0.0,
+          "score": 6.718138858846164
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.027999999999999994,
+          "queue_seconds": 0.45599089720833735,
+          "risk_nats": 0.26034852473288667,
+          "retention_seconds": 0.0,
+          "score": 0.744339421941224
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.147375,
+          "queue_seconds": 0.45599089720833735,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.6033658972083373
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_3_73",
+      "prefix_tokens": 20,
+      "remaining": {
+        "mean": 41.999999999999986,
+        "p90": 64,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.17566975275601165,
+        "standard_error": 0.014815482447891215
+      },
+      "cache_risk": {
+        "mean_kl": 0.014735170352292767,
+        "standard_error": 0.0006303928403540158
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.13516897037102463,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.06299999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 8.000379878563917,
+          "retention_seconds": 0.0,
+          "score": 8.063379878563918
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.04199999999999999,
+          "queue_seconds": 0.13516897037102463,
+          "risk_nats": 0.6453536540911646,
+          "retention_seconds": 0.0,
+          "score": 0.8225226244621893
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.08449999999999999,
+          "queue_seconds": 0.13516897037102463,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.21966897037102462
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_4_73",
+      "prefix_tokens": 42,
+      "remaining": {
+        "mean": 26.99999999999999,
+        "p90": 42,
+        "support": 4,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.08588413097640714,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.04049999999999999,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.8239381858361567,
+          "retention_seconds": 0.0,
+          "score": 0.8644381858361567
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.02699999999999999,
+          "queue_seconds": 0.08588413097640714,
+          "risk_nats": 0.012595670091511392,
+          "retention_seconds": 0.0,
+          "score": 0.1254798010679185
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.15075,
+          "queue_seconds": 0.08588413097640714,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.23663413097640712
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_5_73",
+      "prefix_tokens": 44,
+      "remaining": {
+        "mean": 24.999999999999982,
+        "p90": 40,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 1,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.02778969387130029,
+        "standard_error": 0.002726535233742567
+      },
+      "cache_risk": {
+        "mean_kl": 0.0003672356402014311,
+        "standard_error": 9.927065948417623e-05
+      },
+      "old_weights_available": false,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.17137618319806866,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_old_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_weights_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.024999999999999984,
+          "queue_seconds": 0.17137618319806866,
+          "risk_nats": 0.011662657492140176,
+          "retention_seconds": 0.0,
+          "score": 0.20803884069020884
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.1575,
+          "queue_seconds": 0.17137618319806866,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.32887618319806866
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_6_73",
+      "prefix_tokens": 22,
+      "remaining": {
+        "mean": 40.0,
+        "p90": 62,
+        "support": 5,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.17566975275601165,
+        "standard_error": 0.014815482447891215
+      },
+      "cache_risk": {
+        "mean_kl": 0.014735170352292767,
+        "standard_error": 0.0006303928403540158
+      },
+      "old_weights_available": false,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.09288278219721391,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": false,
+          "reason": "old_weights_unavailable",
+          "compute_seconds": 0.0,
+          "queue_seconds": 0.0,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": null
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.04,
+          "queue_seconds": 0.09288278219721391,
+          "risk_nats": 0.6146225277058713,
+          "retention_seconds": 0.0,
+          "score": 0.7475053099030853
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.08875,
+          "queue_seconds": 0.09288278219721391,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.1816327821972139
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  },
+  {
+    "request": {
+      "request_id": "random_7_73",
+      "prefix_tokens": 47,
+      "remaining": {
+        "mean": 21.99999999999998,
+        "p90": 37,
+        "support": 3,
+        "cold_start": false
+      },
+      "old_version": 0,
+      "current_version": 3,
+      "cache_version": 0,
+      "old_risk": {
+        "mean_kl": 0.22479838897980978,
+        "standard_error": 0.013635141693267565
+      },
+      "cache_risk": {
+        "mean_kl": 0.007941362673625052,
+        "standard_error": 0.001356798923978047
+      },
+      "old_weights_available": true,
+      "cache_available": true,
+      "old_queue_seconds": 0.0,
+      "new_queue_seconds": 0.5154320348110696,
+      "old_deadline_seconds": null,
+      "prefix_shift": 0.0,
+      "cache_is_mixed": false
+    },
+    "decision": {
+      "action": "new_weights_rebuild_kv",
+      "candidates": [
+        {
+          "action": "old_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.03299999999999997,
+          "queue_seconds": 0.0,
+          "risk_nats": 5.2455376748076965,
+          "retention_seconds": 0.0,
+          "score": 5.278537674807697
+        },
+        {
+          "action": "new_weights_old_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.021999999999999978,
+          "queue_seconds": 0.5154320348110696,
+          "risk_nats": 0.20455955514726795,
+          "retention_seconds": 0.0,
+          "score": 0.7419915899583376
+        },
+        {
+          "action": "new_weights_rebuild_kv",
+          "feasible": true,
+          "reason": "eligible",
+          "compute_seconds": 0.16762499999999997,
+          "queue_seconds": 0.5154320348110696,
+          "risk_nats": 0.0,
+          "retention_seconds": 0.0,
+          "score": 0.6830570348110696
+        }
+      ],
+      "reason": "minimum estimated cost plus risk"
+    }
+  }
+]

@@ -1,0 +1,107 @@
+{
+  "metadata": {
+    "cost_source": "synthetic_fixture_seconds",
+    "calibration_seeds": [
+      11,
+      12,
+      13
+    ],
+    "holdout_seeds": [
+      71,
+      72,
+      73
+    ],
+    "calibration_samples": 18,
+    "settings": {
+      "risk_seconds_per_nat": 1.0,
+      "uncertainty_weight": 1.0,
+      "max_old_gap": 4,
+      "max_cache_gap": 4,
+      "max_prefix_shift": 1.0,
+      "old_retention_seconds_per_token": 0.0
+    },
+    "holdout_requests": 48,
+    "randomized_holdout_requests": 24,
+    "measured_cpu_calibration_seconds": 0.13906427659094334,
+    "measured_cpu_evaluation_seconds": 0.6152781168930233,
+    "limitations": [
+      "synthetic_time_costs",
+      "untrained_single_head_model",
+      "teacher_forced_conditional_KL_only",
+      "controlled_holdout_horizons_not_EOS",
+      "no_engine_migration_or_online_RL"
+    ]
+  },
+  "policies": {
+    "adaptive": {
+      "requests": 48,
+      "action_counts": {
+        "old_weights_old_kv": 4,
+        "new_weights_old_kv": 25,
+        "new_weights_rebuild_kv": 19
+      },
+      "fallbacks": 0,
+      "synthetic_compute_seconds": 2.6643749999999993,
+      "synthetic_queue_seconds": 5.527558346578677,
+      "measured_toy_conditional_kl_sum": 1.0915761075836192,
+      "proxy_objective": 9.283509454162298,
+      "proxy_regret": 0.1603907240677454
+    },
+    "always_new_weights_old_kv": {
+      "requests": 48,
+      "action_counts": {
+        "old_weights_old_kv": 0,
+        "new_weights_old_kv": 45,
+        "new_weights_rebuild_kv": 3
+      },
+      "fallbacks": 3,
+      "synthetic_compute_seconds": 1.1989999999999998,
+      "synthetic_queue_seconds": 7.583232785108891,
+      "measured_toy_conditional_kl_sum": 3.249323795677246,
+      "proxy_objective": 12.03155658078614,
+      "proxy_regret": 2.9084378506915876
+    },
+    "always_new_weights_rebuild_kv": {
+      "requests": 48,
+      "action_counts": {
+        "old_weights_old_kv": 0,
+        "new_weights_old_kv": 0,
+        "new_weights_rebuild_kv": 48
+      },
+      "fallbacks": 0,
+      "synthetic_compute_seconds": 5.286883333333334,
+      "synthetic_queue_seconds": 7.583232785108891,
+      "measured_toy_conditional_kl_sum": 0.0,
+      "proxy_objective": 12.870116118442224,
+      "proxy_regret": 3.7469973883476744
+    },
+    "always_old_weights_old_kv": {
+      "requests": 48,
+      "action_counts": {
+        "old_weights_old_kv": 32,
+        "new_weights_old_kv": 0,
+        "new_weights_rebuild_kv": 16
+      },
+      "fallbacks": 16,
+      "synthetic_compute_seconds": 2.6964750000000004,
+      "synthetic_queue_seconds": 1.9288835662793113,
+      "measured_toy_conditional_kl_sum": 91.72054162470215,
+      "proxy_objective": 96.34590019098145,
+      "proxy_regret": 87.22278146088692
+    },
+    "oracle_proxy": {
+      "requests": 48,
+      "action_counts": {
+        "old_weights_old_kv": 4,
+        "new_weights_old_kv": 27,
+        "new_weights_rebuild_kv": 17
+      },
+      "fallbacks": 0,
+      "synthetic_compute_seconds": 2.5068749999999995,
+      "synthetic_queue_seconds": 5.527558346578677,
+      "measured_toy_conditional_kl_sum": 1.0886853835158739,
+      "proxy_objective": 9.123118730094552,
+      "proxy_regret": 0.0
+    }
+  }
+}

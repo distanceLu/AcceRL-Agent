@@ -1,0 +1,128 @@
+[
+  {
+    "seed": 11,
+    "gap": 1,
+    "prefix_tokens": 12,
+    "old_mean_kl": 0.03250834149909993,
+    "cache_mean_kl": 0.0011146940671418364
+  },
+  {
+    "seed": 11,
+    "gap": 1,
+    "prefix_tokens": 24,
+    "old_mean_kl": 0.018302781485207028,
+    "cache_mean_kl": 0.001051428685653816
+  },
+  {
+    "seed": 11,
+    "gap": 1,
+    "prefix_tokens": 48,
+    "old_mean_kl": 0.03059408050306833,
+    "cache_mean_kl": 0.0005657707612515232
+  },
+  {
+    "seed": 11,
+    "gap": 3,
+    "prefix_tokens": 12,
+    "old_mean_kl": 0.2333584330739575,
+    "cache_mean_kl": 0.016842317094797662
+  },
+  {
+    "seed": 11,
+    "gap": 3,
+    "prefix_tokens": 24,
+    "old_mean_kl": 0.14928517619785628,
+    "cache_mean_kl": 0.015437404823541369
+  },
+  {
+    "seed": 11,
+    "gap": 3,
+    "prefix_tokens": 48,
+    "old_mean_kl": 0.24828117296787677,
+    "cache_mean_kl": 0.010168217671852709
+  },
+  {
+    "seed": 12,
+    "gap": 1,
+    "prefix_tokens": 12,
+    "old_mean_kl": 0.01683282979199413,
+    "cache_mean_kl": 0.0001283894518386031
+  },
+  {
+    "seed": 12,
+    "gap": 1,
+    "prefix_tokens": 24,
+    "old_mean_kl": 0.020406726362088245,
+    "cache_mean_kl": 0.00031276122477891304
+  },
+  {
+    "seed": 12,
+    "gap": 1,
+    "prefix_tokens": 48,
+    "old_mean_kl": 0.022337371562755736,
+    "cache_mean_kl": 0.0002666094827940274
+  },
+  {
+    "seed": 12,
+    "gap": 3,
+    "prefix_tokens": 12,
+    "old_mean_kl": 0.13700484656824982,
+    "cache_mean_kl": 0.0036038279552200844
+  },
+  {
+    "seed": 12,
+    "gap": 3,
+    "prefix_tokens": 24,
+    "old_mean_kl": 0.1771835929200166,
+    "cache_mean_kl": 0.013477225977654939
+  },
+  {
+    "seed": 12,
+    "gap": 3,
+    "prefix_tokens": 48,
+    "old_mean_kl": 0.2010498987054344,
+    "cache_mean_kl": 0.005484972936406468
+  },
+  {
+    "seed": 13,
+    "gap": 1,
+    "prefix_tokens": 12,
+    "old_mean_kl": 0.024447990252686472,
+    "cache_mean_kl": 0.0003985551892446275
+  },
+  {
+    "seed": 13,
+    "gap": 1,
+    "prefix_tokens": 24,
+    "old_mean_kl": 0.021965008110003653,
+    "cache_mean_kl": 0.0004104523567180365
+  },
+  {
+    "seed": 13,
+    "gap": 1,
+    "prefix_tokens": 48,
+    "old_mean_kl": 0.030437629548076803,
+    "cache_mean_kl": 0.00026932667655874264
+  },
+  {
+    "seed": 13,
+    "gap": 3,
+    "prefix_tokens": 12,
+    "old_mean_kl": 0.22108117756948187,
+    "cache_mean_kl": 0.009360369957495345
+  },
+  {
+    "seed": 13,
+    "gap": 3,
+    "prefix_tokens": 24,
+    "old_mean_kl": 0.2005404891501621,
+    "cache_mean_kl": 0.015290880255681991
+  },
+  {
+    "seed": 13,
+    "gap": 3,
+    "prefix_tokens": 48,
+    "old_mean_kl": 0.22506409526611815,
+    "cache_mean_kl": 0.008170897412615981
+  }
+]

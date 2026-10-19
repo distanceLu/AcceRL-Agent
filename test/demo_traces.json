@@ -1,0 +1,22 @@
+{
+  "description": "Synthetic cost/length fixture, not GPU measurements or RL results. Toy attention KL is measured separately.",
+  "cost_profile": {
+    "source": "synthetic_fixture_seconds",
+    "prefill_points": [[1, 0.002], [16, 0.03], [32, 0.08], [64, 0.22], [128, 0.70]],
+    "decode_old_seconds_per_token": 0.0015,
+    "decode_new_seconds_per_token": 0.001
+  },
+  "length_observations": [
+    {"task": "short", "generated_tokens": 10, "completed": true},
+    {"task": "short", "generated_tokens": 12, "completed": true},
+    {"task": "short", "generated_tokens": 14, "completed": true},
+    {"task": "short", "generated_tokens": 18, "completed": true},
+    {"task": "short", "generated_tokens": 22, "completed": false},
+    {"task": "short", "generated_tokens": 26, "completed": true},
+    {"task": "long", "generated_tokens": 30, "completed": true},
+    {"task": "long", "generated_tokens": 40, "completed": false},
+    {"task": "long", "generated_tokens": 50, "completed": true},
+    {"task": "long", "generated_tokens": 65, "completed": true},
+    {"task": "long", "generated_tokens": 80, "completed": false}
+  ]
+}
