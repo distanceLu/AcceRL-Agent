@@ -69,8 +69,11 @@ from accerl_agent.rl_data import (
     TerminationReason,
     _compute_batched_token_gae_unchecked,
     classify_textworld_termination_reason,
+    freeze_rollout_ppo_targets,
     textworld_ppo_boundary_is_terminal,
 )
+from accerl_agent.varlen_batching import pack_sequence_indices, split_packs_to_count
+from accerl_agent.ppo_early_stop import K2EarlyStopState, graph_zero
 
 
 def get_local_ip() -> str:
@@ -176,6 +179,7 @@ class PreparedVarlenPack:
     version_lag_sum: float
     sample_count: int
     valid_trajectory_count: int = 0
+    telemetry_samples: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -655,7 +659,7 @@ def _make_ppo_varlen_batch_unchecked(
     ]
     # Derived packing metadata below is Trainer-local and is never persisted
     # in Replay.
-    return {
+    batch = {
         "input_ids": torch.tensor([input_ids], dtype=torch.long),
         "position_ids": torch.tensor([position_ids], dtype=torch.long),
         "cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32),
@@ -702,6 +706,15 @@ def _make_ppo_varlen_batch_unchecked(
             dtype=torch.long,
         ),
     }
+    if any(example.raw_advantages is not None for example in examples):
+        if any(example.raw_advantages is None for example in examples):
+            raise ValueError("Cannot mix JIT and rollout GAE samples in one pack.")
+        for name in ("raw_advantages", "returns"):
+            batch[name] = torch.tensor(
+                [value for example in examples for value in getattr(example, name)],
+                dtype=torch.float32,
+            )
+    return batch
 
 
 def select_varlen_pack(
@@ -720,7 +733,7 @@ def select_varlen_pack(
     total_tokens = 0
     for original_index, prepared in ordered:
         length = len(prepared.input_ids)
-        if len(selected) >= max_sequences:
+        if max_sequences > 0 and len(selected) >= max_sequences:
             break
         if total_tokens + length > token_budget:
             continue
@@ -1060,6 +1073,10 @@ class FSDPTrainWorker:
         self.rank = rank
         self.fsdp_world_size = fsdp_world_size
         self.replay_buffer = replay_buffer
+        self.research = None
+        if getattr(args, "research_config", None):
+            from testForAcceRL.live import recorder_for
+            self.research = recorder_for(args, "trainer", rank)
         self.weight_sync_packed_buffer_bytes = (
             args.weight_sync_packed_buffer_bytes
         )
@@ -1390,7 +1407,9 @@ class FSDPTrainWorker:
         self.optimizer.zero_grad(set_to_none=True)
 
         self.train_micro_step = 0
+        self.train_window_step = 0
         self.optimizer_step = 0
+        self._ppo_early_stop_state = None
         self._gradient_precision_validated = False
         self._optimizer_precision_validated = False
         self.ppo_adv_ema_mean: float | None = None
@@ -1614,6 +1633,10 @@ class FSDPTrainWorker:
         )
         if not algorithm_matches or len(sample.input_ids) > self.args.max_length:
             return None
+        if isinstance(sample, RawPPOSample):
+            rollout_gae = getattr(self.args, "ppo_gae_mode", "jit") == "rollout"
+            if (sample.raw_advantages is not None) != rollout_gae:
+                raise ValueError("Replay PPO targets do not match --ppo-gae-mode.")
         return sample
 
     def _collate_prepared_rl_samples(
@@ -1671,12 +1694,10 @@ class FSDPTrainWorker:
         self.pending_prepared_samples = remaining
         return selected
 
-    def _next_varlen_cpu_pack(
-        self,
-        trainer_version: float,
-    ) -> PreparedVarlenPack:
-        """Prepare one Varlen pack without moving any tensor to the GPU."""
+    def _wait_for_replay_warmup(self) -> Dict[str, int]:
+        """Wait for the configured replay warmup before sampling a window."""
         replay_stats = self.get_replay_stats()
+        research_wait_start = time.monotonic_ns()
         warmup_deadline = None
         if self.args.replay_sample_timeout_seconds > 0:
             warmup_deadline = time.monotonic() + self.args.replay_sample_timeout_seconds
@@ -1691,16 +1712,67 @@ class FSDPTrainWorker:
             time.sleep(self.args.replay_wait_sleep_seconds)
             replay_stats = self.get_replay_stats()
 
+        if self.research is not None:
+            self.research.emit("trainer_data_wait", phase="warmup", seconds=(time.monotonic_ns() - research_wait_start) / 1e9)
+        return replay_stats
+
+    def _sample_fixed_episode_batch(self) -> List[RLSample]:
+        """Select exactly this rank's episode-use quota, before any packing."""
+        self._wait_for_replay_warmup()
+        quota = self.args.global_batch_size // self.fsdp_world_size
+        collected = []
+        deadline = None
+        if self.args.replay_sample_timeout_seconds > 0:
+            deadline = time.monotonic() + self.args.replay_sample_timeout_seconds
+        while len(collected) < quota:
+            fetch_start = time.monotonic_ns()
+            sampled = ray.get(self.replay_buffer.sample.remote(quota - len(collected)))
+            if self.research is not None:
+                self.research.emit("trainer_data_wait", phase="sample_rpc", seconds=(time.monotonic_ns() - fetch_start) / 1e9)
+            accepted = 0
+            for sample in sampled:
+                prepared = self._prepare_rl_sample(sample)
+                if self.research is not None:
+                    self.research.emit("trainer_sample_prepared", sample_id=sample.telemetry_id,
+                        response_tokens=sum(end - start for start, end in sample.response_spans),
+                        accepted=prepared is not None)
+                if prepared is not None:
+                    collected.append(prepared)
+                    accepted += 1
+            if len(collected) == quota:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out sampling the fixed episode batch: "
+                    f"rank={self.rank} collected={len(collected)} quota={quota}"
+                )
+            if accepted == 0:
+                time.sleep(self.args.replay_wait_sleep_seconds)
+        return collected
+
+    def _next_varlen_cpu_pack(
+        self,
+        trainer_version: float,
+    ) -> PreparedVarlenPack:
+        """Prepare one Varlen pack for the legacy fixed-pack mode."""
+        replay_stats = self._wait_for_replay_warmup()
         candidate_target = self.args.train_pack_candidate_pool_size
         deadline = None
         if self.args.replay_sample_timeout_seconds > 0:
             deadline = time.monotonic() + self.args.replay_sample_timeout_seconds
 
         while not self.pending_prepared_samples:
+            research_fetch_start = time.monotonic_ns()
             sampled = ray.get(self.replay_buffer.sample.remote(candidate_target))
+            if self.research is not None:
+                self.research.emit("trainer_data_wait", phase="sample_rpc", seconds=(time.monotonic_ns() - research_fetch_start) / 1e9)
             replay_stats = self.get_replay_stats()
             for sample in sampled:
                 prepared_sample = self._prepare_rl_sample(sample)
+                if self.research is not None:
+                    self.research.emit("trainer_sample_prepared", sample_id=sample.telemetry_id,
+                        response_tokens=sum(end - start for start, end in sample.response_spans),
+                        accepted=prepared_sample is not None)
                 if prepared_sample is None:
                     continue
                 self.pending_prepared_samples.append(prepared_sample)
@@ -1713,8 +1785,16 @@ class FSDPTrainWorker:
                     f"stats={replay_stats}"
                 )
             time.sleep(self.args.replay_wait_sleep_seconds)
+            if self.research is not None:
+                self.research.emit("trainer_data_wait", phase="empty_replay_sleep", seconds=self.args.replay_wait_sleep_seconds)
 
         collected = self._select_varlen_pack()
+        return self._make_prepared_varlen_pack(collected, trainer_version)
+
+    def _make_prepared_varlen_pack(
+        self, collected: List[RLSample], trainer_version: float,
+    ) -> PreparedVarlenPack:
+        """Collate real samples while preserving targets and telemetry."""
         batch = self._collate_prepared_rl_samples(
             collected,
             move_to_device=False,
@@ -1737,6 +1817,9 @@ class FSDPTrainWorker:
             version_lag_sum=version_lag_sum,
             sample_count=sample_count,
             valid_trajectory_count=valid_trajectory_count,
+            telemetry_samples=tuple((sample.telemetry_id, sample.created_monotonic_ns,
+                                     sum(end - start for start, end in sample.response_spans)) for sample in collected)
+                              if self.research is not None else (),
         )
 
     def _compute_rl_loss(
@@ -2193,6 +2276,21 @@ class FSDPTrainWorker:
                 f"value shape {tuple(expected_shape)}."
             )
 
+    def _ppo_window_should_stop(self, view: PPOFlatTokenView) -> bool:
+        guard = getattr(self, "_ppo_early_stop_state", None)
+        if guard is None:
+            return False
+        guard.observe(view.current_logprobs, view.old_logprobs, group=self.loss_pg)
+        return guard.stop_ppo
+
+    def _zero_ppo_loss(self, view: PPOFlatTokenView) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Actor and Critic share a backbone and an optimizer. Keep all heads
+        # connected for FSDP backward; discard the entire joint update later.
+        return (
+            graph_zero(view.current_logprobs, view.current_values, view.bootstrap_values),
+            PPOReductionStats.zeros(self.device),
+        )
+
     def _compute_ppo_loss_from_targets_unchecked(
         self,
         view: PPOFlatTokenView,
@@ -2200,8 +2298,11 @@ class FSDPTrainWorker:
         raw_advantages: torch.Tensor,
         actor_advantages: torch.Tensor,
         returns: torch.Tensor,
+        check_early_stop: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute loss for targets derived from a validated PPO pack."""
+        if check_early_stop and self._ppo_window_should_stop(view):
+            return self._zero_ppo_loss(view)
         raw_advantages = raw_advantages.detach().float()
         actor_advantages = actor_advantages.detach().float()
         returns = returns.detach().float()
@@ -2322,6 +2423,8 @@ class FSDPTrainWorker:
         ema_scale: float | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Hot-path PPO objective for a CPU-validated packed batch."""
+        if self._ppo_window_should_stop(view):
+            return self._zero_ppo_loss(view)
         mode = self.args.ppo_advantage_normalization
         if mode == "optimizer_window":
             raise RuntimeError(
@@ -2350,6 +2453,7 @@ class FSDPTrainWorker:
             raw_advantages=raw_advantages,
             actor_advantages=actor_advantages,
             returns=returns,
+            check_early_stop=False,
         )
 
     def _compute_packed_ppo_reduction_sums(
@@ -2399,6 +2503,27 @@ class FSDPTrainWorker:
         )
         self._validate_ppo_flat_token_view(view)
         self._validate_ppo_boundary_layout(view)
+        if getattr(self.args, "ppo_gae_mode", "jit") == "rollout":
+            for name in ("raw_advantages", "returns"):
+                target = batch.get(name)
+                if target is None or target.shape != zeros.shape or not torch.isfinite(target).all():
+                    raise ValueError(f"Rollout PPO pack requires finite response-aligned {name}.")
+
+    def _rollout_ppo_optimizer_window_moments(
+        self, window: List[PreparedVarlenPack], *, global_valid_token_count: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Read frozen replay advantages; no model prepass or historical EMA."""
+        local_moments = torch.zeros(3, dtype=torch.float64)
+        for prepared in window:
+            advantages = prepared.batch["raw_advantages"].double()
+            local_moments[0] += advantages.sum()
+            local_moments[1] += advantages.square().sum()
+            local_moments[2] += advantages.numel()
+        moments = local_moments.to(self.device)
+        dist.all_reduce(moments, op=dist.ReduceOp.SUM, group=self.loss_pg)
+        return self._finalize_ppo_advantage_moments(
+            moments, expected_count=global_valid_token_count,
+        )
 
     def _snapshot_ppo_forward_buffers(self) -> Dict[str, torch.Tensor]:
         if self.value_head is None:
@@ -2550,18 +2675,59 @@ class FSDPTrainWorker:
             advantage_std,
         )
 
+    def _prepare_fixed_episode_window(
+        self, trainer_version: float,
+    ) -> List[PreparedVarlenPack]:
+        """Pack an exact episode quota and align nonempty packs across ranks."""
+        samples = None
+        indices = None
+        local_error = None
+        try:
+            samples = self._sample_fixed_episode_batch()
+            indices = pack_sequence_indices(
+                [len(sample.input_ids) for sample in samples],
+                token_budget=self.args.train_token_budget,
+                max_sequences=self.args.train_max_sequences_per_pack,
+            )
+        except Exception as exc:
+            local_error = repr(exc)
+            print(f"[rank {self.rank}] Fixed episode sampling/packing failed: {local_error}")
+
+        # No rank may enter the pack-count collective if a peer failed while
+        # sampling/packing. The enclosing window also coordinates collation
+        # errors after the MAX collective.
+        success = torch.tensor(int(local_error is None), device=self.device, dtype=torch.int32)
+        dist.all_reduce(success, op=dist.ReduceOp.MIN, group=self.loss_pg)
+        if int(success.item()) != 1:
+            raise RuntimeError("A rank failed to sample/pack its fixed episode quota; see per-rank logs.")
+        assert samples is not None and indices is not None
+        pack_count = torch.tensor(len(indices), device=self.device, dtype=torch.int64)
+        dist.all_reduce(pack_count, op=dist.ReduceOp.MAX, group=self.loss_pg)
+        indices = split_packs_to_count(
+            indices, int(pack_count.item()), [len(sample.input_ids) for sample in samples],
+        )
+        # Equal per-rank episode quotas guarantee every rank can split up to
+        # the maximum pack count, without dummy samples or duplicate losses.
+        return [
+            self._make_prepared_varlen_pack([samples[index] for index in pack], trainer_version)
+            for pack in indices
+        ]
+
     def _prepare_varlen_optimizer_window(
         self,
         trainer_version: float,
     ) -> List[PreparedVarlenPack]:
-        """Prepare a fixed-size CPU window and synchronize preparation errors."""
+        """Prepare a CPU optimizer window and synchronize preparation errors."""
         window = None
         local_error = None
         try:
-            window = [
-                self._next_varlen_cpu_pack(trainer_version)
-                for _ in range(self.args.grad_accum_steps)
-            ]
+            if getattr(self.args, "global_batch_size", None) is not None:
+                window = self._prepare_fixed_episode_window(trainer_version)
+            else:
+                window = [
+                    self._next_varlen_cpu_pack(trainer_version)
+                    for _ in range(self.args.grad_accum_steps)
+                ]
             if self.args.rl_algorithm == "ppo":
                 for prepared in window:
                     self._validate_prepared_packed_ppo_batch(prepared)
@@ -2588,6 +2754,10 @@ class FSDPTrainWorker:
                 "optimizer window; see per-rank logs for the original error."
             )
         assert window is not None
+        if self.research is not None:
+            self.research.emit("training_window_ready", optimizer_step=self.optimizer_step + 1,
+                               train_window_step=getattr(self, "train_window_step", 0) + 1,
+                               samples=[item for pack in window for item in pack.telemetry_samples])
         return window
 
     def _reduce_varlen_window_counts(
@@ -2612,6 +2782,12 @@ class FSDPTrainWorker:
         valid_tokens, valid_trajectories, packed_tokens = (
             int(value) for value in global_counts.tolist()
         )
+        expected_trajectories = getattr(self.args, "global_batch_size", None)
+        if expected_trajectories is not None and valid_trajectories != expected_trajectories:
+            raise RuntimeError(
+                "Fixed episode batch size mismatch: "
+                f"expected={expected_trajectories} actual={valid_trajectories}"
+            )
         return (
             valid_tokens,
             valid_trajectories,
@@ -2624,6 +2800,18 @@ class FSDPTrainWorker:
     def _run_ppo_optimizer_step(
         self,
         trainer_version: float,
+    ) -> Dict[str, object]:
+        """Run one attempt; never leak a guard into a target prepass/window."""
+        threshold = getattr(self.args, "early_stop_kl", 0.0)
+        guard = K2EarlyStopState(threshold) if threshold > 0 else None
+        self._ppo_early_stop_state = None
+        try:
+            return self._run_ppo_optimizer_window(trainer_version, guard)
+        finally:
+            self._ppo_early_stop_state = None
+
+    def _run_ppo_optimizer_window(
+        self, trainer_version: float, guard: K2EarlyStopState | None,
     ) -> Dict[str, object]:
         """Run one globally trajectory-normalized packed PPO optimizer step."""
         window = self._prepare_varlen_optimizer_window(trainer_version)
@@ -2643,10 +2831,13 @@ class FSDPTrainWorker:
                 "trajectories."
             )
 
+        rollout_gae = getattr(self.args, "ppo_gae_mode", "jit") == "rollout"
         normalization_mode = self.args.ppo_advantage_normalization
         ema_mode = normalization_mode in ("ema_rms", "ema_zscore")
-        ema_mean = self.ppo_adv_ema_mean
-        ema_variance = self.ppo_adv_ema_variance
+        if rollout_gae and normalization_mode != "optimizer_window":
+            raise ValueError("Rollout GAE requires optimizer_window normalization.")
+        ema_mean = None if rollout_gae else self.ppo_adv_ema_mean
+        ema_variance = None if rollout_gae else self.ppo_adv_ema_variance
         if (ema_mean is None) != (ema_variance is None):
             raise RuntimeError(
                 "PPO advantage EMA mean and variance must be initialized "
@@ -2679,7 +2870,11 @@ class FSDPTrainWorker:
         frozen_window = None
         advantage_mean = None
         advantage_std = None
-        if use_optimizer_window:
+        if rollout_gae:
+            advantage_mean, advantage_std = self._rollout_ppo_optimizer_window_moments(
+                window, global_valid_token_count=global_valid_token_count,
+            )
+        elif use_optimizer_window:
             (
                 frozen_window,
                 advantage_mean,
@@ -2689,6 +2884,9 @@ class FSDPTrainWorker:
                 global_valid_token_count=global_valid_token_count,
             )
 
+        # Target prepasses do not backpropagate or consume guard observations.
+        # Exactly one observation is made for each actual training pack.
+        self._ppo_early_stop_state = guard
         local_reduction_stats = PPOReductionStats.zeros(self.device)
         local_version_stats = torch.zeros(
             2,
@@ -2697,26 +2895,29 @@ class FSDPTrainWorker:
         )
         for pack_index, prepared in enumerate(window):
             batch = move_batch_to_device(prepared.batch, self.device)
-            if frozen_window is not None:
-                frozen = frozen_window[pack_index]
-                self._restore_ppo_rng_state(
-                    self.device,
-                    frozen.cpu_rng_state,
-                    frozen.cuda_rng_state,
-                )
+            if rollout_gae or frozen_window is not None:
+                if frozen_window is not None:
+                    frozen = frozen_window[pack_index]
+                    self._restore_ppo_rng_state(
+                        self.device,
+                        frozen.cpu_rng_state,
+                        frozen.cuda_rng_state,
+                    )
                 view = self._forward_ppo_token_view(
                     batch,
                     max_seqlen=prepared.max_seqlen,
                 )
-                self._validate_frozen_ppo_targets(view, frozen)
-                raw_advantages = frozen.raw_advantages.to(
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-                returns = frozen.returns.to(
-                    device=self.device,
-                    dtype=torch.float32,
-                )
+                if rollout_gae:
+                    raw_advantages = batch["raw_advantages"]
+                    returns = batch["returns"]
+                else:
+                    self._validate_frozen_ppo_targets(view, frozen)
+                    raw_advantages = frozen.raw_advantages.to(
+                        device=self.device, dtype=torch.float32,
+                    )
+                    returns = frozen.returns.to(
+                        device=self.device, dtype=torch.float32,
+                    )
                 assert advantage_mean is not None
                 assert advantage_std is not None
                 actor_advantages = self._normalize_ppo_advantages(
@@ -2752,8 +2953,10 @@ class FSDPTrainWorker:
             local_version_stats[1] += prepared.sample_count
             self.train_micro_step += 1
             del batch, trajectory_loss_sum, reduction_stats, backward_loss
-            if frozen_window is not None:
-                del view, raw_advantages, actor_advantages, returns, frozen
+            if rollout_gae or frozen_window is not None:
+                del view, raw_advantages, actor_advantages, returns
+                if frozen_window is not None:
+                    del frozen
 
         dist.all_reduce(
             local_reduction_stats,
@@ -2769,6 +2972,34 @@ class FSDPTrainWorker:
         stats = PPOReductionStats.unpack(
             local_reduction_stats
         ).to_float_dict()
+        if guard is not None and guard.stop_ppo:
+            # Zero backward does not erase gradients accumulated before the
+            # trigger. Clear the whole window and never enter AdamW/LR/EMA.
+            self.optimizer.zero_grad(set_to_none=True)
+            ep_metrics = self._reduce_ep_dispatch_metrics()
+            if self.research is not None:
+                self.research.emit("optimizer_discarded", optimizer_step=self.optimizer_step,
+                    train_window_step=getattr(self, "train_window_step", 0) + 1,
+                    response_tokens=sum(pack.valid_token_count for pack in window),
+                    trajectories=sum(pack.valid_trajectory_count for pack in window),
+                    **guard.metrics())
+            if self.rank == 0:
+                print(
+                    "[train] Discarded PPO window: "
+                    f"K2_max_microbatch={guard.max_microbatch_kl:.6g} "
+                    f"threshold={guard.threshold:.6g}; optimizer/LR/EMA unchanged."
+                )
+            return {
+                **pack_stats, **ep_metrics, **guard.metrics(),
+                "global_ppo_stats": {name: 0.0 for name in PPOReductionStats.names()},
+                "global_valid_token_count": float(global_valid_token_count),
+                "global_valid_trajectory_count": float(global_valid_trajectory_count),
+                "global_version_lag_sum": float(local_version_stats[0].item()),
+                "global_sample_count": float(local_version_stats[1].item()),
+                "value_loss_mean": 0.0, "loss_mean": 0.0,
+                "kl_trajectory_mean": 0.0, "kl_token_mean": 0.0, "clip_fraction": 0.0,
+                "current_lr": self.optimizer.param_groups[0]["lr"],
+            }
         stats_valid_trajectory_count = int(
             stats["valid_trajectory_count"]
         )
@@ -2833,6 +3064,12 @@ class FSDPTrainWorker:
 
         ep_metrics = self._reduce_ep_dispatch_metrics()
         current_lr = self._finalize_optimizer_step()
+        if self.research is not None:
+            self.research.emit("optimizer_committed", optimizer_step=self.optimizer_step,
+                               train_window_step=getattr(self, "train_window_step", 0) + 1,
+                               response_tokens=sum(pack.valid_token_count for pack in window),
+                               trajectories=sum(pack.valid_trajectory_count for pack in window),
+                               samples=[item for pack in window for item in pack.telemetry_samples])
         if ema_mode:
             assert candidate_ema_mean is not None
             assert candidate_ema_variance is not None
@@ -2857,6 +3094,8 @@ class FSDPTrainWorker:
         return {
             **pack_stats,
             **ep_metrics,
+            **(guard.metrics() if guard is not None else {}),
+            "optimizer_step_skipped": 0.0,
             "global_ppo_stats": stats,
             "global_valid_token_count": token_count,
             "global_valid_trajectory_count": trajectory_count,
@@ -2992,31 +3231,52 @@ class FSDPTrainWorker:
     def train_until_next_sync(
         self,
         num_optimizer_steps: int = 100,
+        trainer_version: float | None = None,
     ) -> Dict[str, float]:
-        """Train through one sync segment using the algorithm-specific path."""
+        """Attempt at most one bounded segment; count only committed updates."""
         if num_optimizer_steps < 1:
             raise ValueError("num_optimizer_steps must be >= 1")
         start_optimizer_step = self.optimizer_step
+        self.train_window_step = getattr(self, "train_window_step", 0)
+        start_window_step = self.train_window_step
+        start_trainer_version = (
+            self.optimizer_step / self.args.sync_every_optimizer_steps
+            if trainer_version is None else trainer_version
+        )
+        stop_after_steps = getattr(self.args, "stop_after_steps", 0)
         target_optimizer_step = min(
             self.optimizer_step + num_optimizer_steps,
             self.args.max_steps,
+            stop_after_steps if stop_after_steps > 0 else self.args.max_steps,
         )
         global_steps = []
         aggregate_ppo_stats = {
             name: 0.0 for name in PPOReductionStats.names()
         }
-        while self.optimizer_step < target_optimizer_step:
-            trainer_version = (
-                self.optimizer_step / self.args.sync_every_optimizer_steps
+        for _ in range(num_optimizer_steps):
+            if self.optimizer_step >= target_optimizer_step:
+                break
+            current_trainer_version = (
+                start_trainer_version
+                + (self.optimizer_step - start_optimizer_step) / self.args.sync_every_optimizer_steps
             )
             if self.args.rl_algorithm == "ppo":
-                step_stats = self._run_ppo_optimizer_step(trainer_version)
+                step_stats = self._run_ppo_optimizer_step(current_trainer_version)
             else:
-                step_stats = self._run_grpo_optimizer_step(trainer_version)
-            if self.args.rl_algorithm == "ppo":
+                step_stats = self._run_grpo_optimizer_step(current_trainer_version)
+            self.train_window_step += 1
+            skipped = bool(step_stats.get("optimizer_step_skipped", False))
+            if self.args.rl_algorithm == "ppo" and not skipped:
                 for name, value in step_stats["global_ppo_stats"].items():
                     aggregate_ppo_stats[name] += value
             global_steps.append(step_stats)
+            if self.rank == 0 and os.environ.get("TW_EVENT_DIR"):
+                from framework_benchmark.events import emit
+                emit({"kind": "optimizer_discard" if skipped else "optimizer_commit", "episode_id": "optimizer",
+                      "optimizer_step": self.optimizer_step,
+                      "train_window_step": self.train_window_step,
+                      "response_token_uses": int(step_stats["global_valid_token_count"]),
+                      "metrics": step_stats})
             if (
                 self.rank == 0
                 and self.optimizer_step % self.args.log_every == 0
@@ -3040,13 +3300,17 @@ class FSDPTrainWorker:
                 )
                 print(
                     "[train] "
+                    f"train_window_step={self.train_window_step} "
                     f"optimizer_step={self.optimizer_step} "
+                    f"early_stop={int(skipped)} "
                     f"loss={step_stats['loss_mean']:.6f}"
                     f"{value_text} "
                     f"{trajectory_kl_text} "
                     f"kl_token_mean={step_stats['kl_token_mean']:.6f} "
                     f"clip_frac={step_stats['clip_fraction']:.4f} "
                     f"tokens={step_stats['global_valid_token_count']:.0f} "
+                    f"episode_uses={step_stats['global_valid_trajectory_count']:.0f} "
+                    f"microbatches_per_rank={step_stats['global_pack_count'] / self.fsdp_world_size:.0f} "
                     f"lr={step_stats['current_lr']:.8g}"
                     f"{ep_text}"
                 )
@@ -3065,15 +3329,32 @@ class FSDPTrainWorker:
         )
         result = {
             "rank": self.rank,
+            "train_windows_run": self.train_window_step - start_window_step,
+            "train_window_step": self.train_window_step,
+            "skipped_windows": sum(bool(step.get("optimizer_step_skipped", False)) for step in global_steps),
             "optimizer_steps_run": self.optimizer_step - start_optimizer_step,
             "optimizer_step": self.optimizer_step,
             "reached_max_steps": self.optimizer_step >= self.args.max_steps,
+            "reached_stop_after_steps": (
+                stop_after_steps > 0 and self.optimizer_step >= stop_after_steps
+            ),
             "segment_valid_tokens": valid_tokens,
             "segment_version_lag_mean": (
                 version_lag_sum / sample_count if sample_count else 0.0
             ),
             "learning_rate": self.optimizer.param_groups[0]["lr"],
         }
+        committed_steps = [step for step in global_steps if not step.get("optimizer_step_skipped", False)]
+        k2_tokens = sum(float(step["global_valid_token_count"]) for step in global_steps if "k2_kl" in step)
+        result["segment_k2_kl"] = (
+            sum(float(step["k2_kl"]) * float(step["global_valid_token_count"])
+                for step in global_steps if "k2_kl" in step) / k2_tokens
+            if k2_tokens else 0.0
+        )
+        result["segment_k2_kl_max_microbatch"] = max(
+            (float(step.get("k2_kl_max_microbatch", 0.0)) for step in global_steps), default=0.0,
+        )
+        result["segment_early_stop_fraction"] = result["skipped_windows"] / max(len(global_steps), 1)
         pack_token_count = sum(
             float(step["global_pack_token_count"])
             for step in global_steps
@@ -3083,6 +3364,14 @@ class FSDPTrainWorker:
             for step in global_steps
         )
         pack_capacity = pack_count * float(self.args.train_token_budget)
+        result["segment_episode_uses_per_update"] = (
+            sum(float(step["global_valid_trajectory_count"]) for step in global_steps)
+            / max(len(global_steps), 1)
+        )
+        result["segment_microbatches_per_rank_mean"] = (
+            pack_count / (self.fsdp_world_size * max(len(global_steps), 1))
+        )
+        result["segment_input_token_uses_per_update"] = pack_token_count / max(len(global_steps), 1)
         result["segment_pack_token_utilization"] = (
             pack_token_count / pack_capacity
             if pack_capacity > 0
@@ -3162,10 +3451,12 @@ class FSDPTrainWorker:
             dist.barrier()
             return result
 
-        token_denominator = max(valid_tokens, 1.0)
+        # Consumed samples/packs above include rejected windows for honest
+        # throughput accounting. Loss/value moments use committed data only.
+        token_denominator = max(sum(float(step["global_valid_token_count"]) for step in committed_steps), 1.0)
         valid_trajectories = sum(
             float(step["global_valid_trajectory_count"])
-            for step in global_steps
+            for step in committed_steps
         )
         trajectory_denominator = max(valid_trajectories, 1.0)
         policy_mean = (
@@ -3363,8 +3654,21 @@ class FSDPTrainWorker:
             for _, param in self.policy_params:
                 full_param = param.full_tensor()
                 del full_param
+        critic_snapshot = None
+        if getattr(self.args, "ppo_gae_mode", "jit") == "rollout":
+            # Same stopped optimizer step as the policy broadcast above.
+            # Keep the small FP32 head out of the policy loader/NCCL payload.
+            state = {}
+            for name, param in self.value_head_params:
+                full_param = param.full_tensor()
+                if self.rank == 0:
+                    state[name] = full_param.detach().float().cpu().tolist()
+                del full_param
+            if self.rank == 0:
+                critic_snapshot = {"state": state, "version": self.optimizer_step}
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        return critic_snapshot
 
     def save_checkpoint(self, checkpoint_dir: str, tag: str) -> Dict[str, Any]:
         """
@@ -3436,11 +3740,18 @@ class FSDPTrainWorker:
             trainer_state = {
                 "optimizer_step": self.optimizer_step,
                 "train_micro_step": self.train_micro_step,
+                "train_window_step": getattr(self, "train_window_step", self.optimizer_step),
+                "early_stop_kl": getattr(self.args, "early_stop_kl", 0.0),
                 "fsdp_world_size": self.fsdp_world_size,
                 "train_ep_size": self.args.train_ep_size,
                 "rl_algorithm": self.args.rl_algorithm,
                 "max_steps": self.args.max_steps,
+                "stop_after_steps": getattr(self.args, "stop_after_steps", 0),
                 "sync_every_optimizer_steps": self.args.sync_every_optimizer_steps,
+                "global_batch_size": getattr(self.args, "global_batch_size", None),
+                "grad_accum_steps": self.args.grad_accum_steps,
+                "train_token_budget": self.args.train_token_budget,
+                "train_max_sequences_per_pack": self.args.train_max_sequences_per_pack,
                 "checkpoint_kind": "fp32_model_weights",
                 "policy_storage_dtype": "float32",
                 "policy_compute_dtype": self.compute_dtype_name,
@@ -3693,6 +4004,7 @@ class InterruptibleGenerationRunner:
         self.resume_event.set()
         self._active_attempts = 0
         self._active_changed = asyncio.Condition()
+        self.research_observer = None
 
     def pause(self) -> None:
         self.resume_event.clear()
@@ -3729,7 +4041,7 @@ class InterruptibleGenerationRunner:
 
             attempt_version = self.version
             sampling_kwargs = {
-                "temperature": self.temperature,
+                "temperature": getattr(state, "sampling_temperature", self.temperature),
                 "top_p": self.top_p,
                 "max_tokens": remaining,
                 "stop": self.stop_sequences,
@@ -3746,14 +4058,19 @@ class InterruptibleGenerationRunner:
             attempt_prompt_token_ids = state.restart_prompt_token_ids
 
             await self._increment_active_attempts()
+            if self.research_observer is not None:
+                self.research_observer.attempt_start(state, request_id)
             try:
                 # 调用vllm生成接口，拿到输出后更新state，如果生成过程中被weight update打断了，engine.generate()会抛出异常，直接进入finally块结束这个attempt
                 async for request_output in self.engine.generate(
-                    {"prompt_token_ids": attempt_prompt_token_ids},
+                    {"prompt_token_ids": attempt_prompt_token_ids,
+                     **({"cache_salt": state.research_cache_salt} if hasattr(state, "research_cache_salt") else {})},
                     sampling_params,
                     request_id=request_id,
                 ):
                     final_output = request_output
+                    if self.research_observer is not None:
+                        self.research_observer.stream(state, request_id, request_output)
                     request_finished = bool(
                         getattr(request_output, "finished", False)
                     )
@@ -3787,6 +4104,8 @@ class InterruptibleGenerationRunner:
                 state.output_tokens.extend(attempt_tokens)
                 state.output_logprobs.extend(attempt_logprobs)
                 state.output_versions.extend(
+                    self.research_observer.versions(request_id, attempt_tokens)
+                    if self.research_observer is not None else
                     [attempt_version] * len(attempt_tokens)
                 )
 
@@ -3846,7 +4165,22 @@ class VLLMInferenceActor:
             weight_transfer_config=WeightTransferConfig(backend="nccl"),
             load_format="dummy",
         )
+        self.research = None
+        if getattr(args, "research_config", None):
+            from testForAcceRL.live import LiveInference, engine_kwargs as research_engine_kwargs
+            engine_kwargs.update(research_engine_kwargs(args))
+            self.research = LiveInference(args)
+        if getattr(args, "ppo_gae_mode", "jit") == "rollout":
+            engine_kwargs["worker_extension_cls"] = (
+                "accerl_agent.rollout_critic_research.ResearchRolloutCriticWorker"
+                if self.research is not None
+                else "accerl_agent.rollout_critic.RolloutCriticWorkerExtension"
+            )
         self.engine = create_async_engine(**engine_kwargs)
+        self.rollout_critic = None
+        if getattr(args, "ppo_gae_mode", "jit") == "rollout":
+            from accerl_agent.rollout_critic import RolloutCriticClient
+            self.rollout_critic = RolloutCriticClient(self.engine)
         self.runner = InterruptibleGenerationRunner(
             self.engine,
             temperature=args.infer_temperature,
@@ -3854,6 +4188,8 @@ class VLLMInferenceActor:
             stop_sequences=["\n"],
             collect_logprobs=True,
         )
+        if self.research is not None:
+            self.runner.research_observer = self.research
         self.active_generation_tasks = set()
         self.total_tokens = 0
         self.interval_request_count = 0
@@ -3869,9 +4205,12 @@ class VLLMInferenceActor:
         self,
         input_ids: List[int],
         infer_max_tokens: int,
+        context: dict | None = None,
     ) -> InferenceResult:
         if self.stopped:
             raise RuntimeError("VLLMInferenceActor is stopped.")
+        if self.research is not None:
+            await self.research.accept.wait()
         request_index = self.next_request_index
         self.next_request_index += 1
         state = OnlineGenerationState(
@@ -3879,6 +4218,13 @@ class VLLMInferenceActor:
             input_ids=list(input_ids),
             requested_max_tokens=int(infer_max_tokens),
         )
+        if self.research is not None:
+            if (context or {}).get("evaluation"):
+                state.sampling_temperature = 0.0
+                # Separate evaluation cache namespace: retained training KV
+                # from B must not contaminate a fresh-current-policy score.
+                state.research_cache_salt = f"independent-evaluation-v{self.runner.version}"
+            self.research.begin(state, context)
         return await self._run_generation(state)
 
     async def _run_generation(
@@ -3902,6 +4248,8 @@ class VLLMInferenceActor:
             output_versions=list(completed_state.output_versions),
             stop_reason=completed_state.stop_reason,
         )
+        if self.research is not None:
+            self.research.complete(completed_state)
         if len(result.output_logprobs) != len(result.output_tokens):
             raise RuntimeError(
                 "Inference output token/logprob lengths differ: "
@@ -3940,6 +4288,11 @@ class VLLMInferenceActor:
         }
 
     async def pause_and_wait_idle(self) -> None:
+        if self.rollout_critic is not None:
+            await self.rollout_critic.pause()
+        if self.research is not None and self.research.initialized:
+            await self.research.pause(self)
+            return
         self.runner.pause()
         await self.engine.pause_generation(mode="abort", clear_cache=True)
         await self.runner.wait_for_idle()
@@ -3947,9 +4300,26 @@ class VLLMInferenceActor:
     async def resume_generation(self, increment_version: bool = False):
         if increment_version:
             self.runner.version += 1
+        if self.research is not None:
+            if not self.research.initialized:
+                await self.engine.collective_rpc("research_initialize")
+                self.research.initialized = True
+            await self.research.resume(self)
         await self.engine.resume_generation()
         self.runner.resume()
+        if self.rollout_critic is not None:
+            self.rollout_critic.resume()
         return self.runner.version
+
+    async def request_rollout_values(self, transcripts: List[List[int]]):
+        if self.rollout_critic is None:
+            raise RuntimeError("Rollout value inference requires --ppo-gae-mode rollout.")
+        return await self.rollout_critic.score(transcripts)
+
+    async def update_rollout_critic(self, snapshot):
+        if self.rollout_critic is None:
+            raise RuntimeError("Unexpected critic snapshot in JIT GAE mode.")
+        await self.rollout_critic.load(snapshot["state"], snapshot["version"])
 
     async def init_weight_transfer_engine(
         self,
@@ -4005,12 +4375,16 @@ class VLLMInferenceActor:
 
     async def shutdown(self):
         self.stopped = True
+        if self.rollout_critic is not None:
+            self.rollout_critic.close()
         self.runner.resume()
         for task in list(self.active_generation_tasks):
             if not task.done():
                 task.cancel()
         if self.active_generation_tasks:
             await asyncio.gather(*self.active_generation_tasks, return_exceptions=True)
+        if self.research is not None and self.research.initialized:
+            await self.engine.collective_rpc("research_snapshot")
         await shutdown_vllm_engine(self.engine)
         return self.get_stats()
 
@@ -4036,6 +4410,7 @@ class TextWorldTrajectoryState:
     won: bool = False
     lost: bool = False
     termination_reason: TerminationReason | None = None
+    telemetry_id: str = ""
 
 
 @dataclass
@@ -4048,6 +4423,13 @@ class TextWorldPendingRequest:
 
 
 def load_textworld_game_files(args: argparse.Namespace) -> List[str]:
+    manifest_path = getattr(args, "tw_game_manifest", None)
+    if manifest_path:
+        from framework_benchmark.prepare import verify_manifest
+        with open(manifest_path) as stream:
+            manifest = json.load(stream)
+        verify_manifest(manifest)
+        return [row["path"] for row in manifest["splits"]["train"]]
     pattern = os.path.join(args.tw_game_dir, args.tw_game_pattern)
     game_files = sorted(glob.glob(pattern))
     game_files = [path for path in game_files if os.path.isfile(path)]
@@ -4243,6 +4625,10 @@ class TextWorldRolloutWorkerActor:
         self.worker_id = int(worker_id)
         self.replay_buffer = replay_buffer
         self.stats_actor = stats_actor
+        self.research = None
+        if getattr(args, "research_config", None):
+            from testForAcceRL.live import recorder_for
+            self.research = recorder_for(args, "evaluation" if worker_id < 0 else "rollout", worker_id)
         wait_for_selected_ray_actor_debugger("rollout", self.worker_id)
         self.tokenizer = build_tokenizer(args, log=False)
         self.game_files = load_textworld_game_files(args)
@@ -4352,6 +4738,10 @@ class TextWorldRolloutWorkerActor:
             selected_action = parsed_action.action
             obs, step_score, done, infos = state.env.step(selected_action)
             state.environment_steps += 1
+            if os.environ.get("TW_EVENT_DIR"):
+                from framework_benchmark.events import emit
+                emit({"kind": "env_step", "episode_id": state.telemetry_id,
+                      "attempt": len(state.step_records), "evaluation": self.worker_id < 0})
             state.obs = obs
             state.infos = dict(infos)
             state.latest_score = _textworld_score(step_score, infos)
@@ -4439,6 +4829,10 @@ class TextWorldRolloutWorkerActor:
                 self.infer_actor.request_generation.remote(
                     list(input_ids),
                     infer_max_tokens,
+                    **({"context": {"episode_id": state.telemetry_id,
+                                     "environment_step": len(state.step_records),
+                                     "evaluation": self.worker_id < 0}}
+                       if self.research is not None else {}),
                 )
             )
             # 当前 TextWorld step 中“已经提交推理、但结果尚未返回”的请求上下文列表。
@@ -4654,6 +5048,7 @@ class TextWorldRolloutWorkerActor:
                         transcript_ids=transcript_ids,
                         won=bool(infos.get("won", False)),
                         lost=bool(infos.get("lost", False)),
+                        telemetry_id=(str(uuid.uuid4()) if self.research is not None or os.environ.get("TW_EVENT_DIR") else ""),
                     )
                 )
 
@@ -4683,12 +5078,33 @@ class TextWorldRolloutWorkerActor:
                         state=state,
                         algorithm="ppo",
                     )
+                    if os.environ.get("TW_EVENT_DIR"):
+                        from framework_benchmark.events import accerl_episode
+                        accerl_episode(state, sample)
+                    if self.research is not None:
+                        from testForAcceRL.live import attach_sample
+                        sample = attach_sample(self.research, state, sample)
                     if sample is not None:
                         samples.append(sample)
             else:
                 samples = self._build_valid_grpo_group_samples(states)
 
             if samples:
+                if algorithm == "ppo" and getattr(self.args, "ppo_gae_mode", "jit") == "rollout":
+                    snapshot = await self.infer_actor.request_rollout_values.remote(
+                        [list(sample.input_ids) for sample in samples]
+                    )
+                    if len(snapshot["token_values"]) != len(samples):
+                        raise RuntimeError("Rollout critic returned the wrong number of trajectories.")
+                    samples = [
+                        freeze_rollout_ppo_targets(
+                            sample, values,
+                            value_version=snapshot["value_version"],
+                            gamma=self.args.gae_gamma,
+                            gae_lambda=self.args.gae_lambda,
+                        )
+                        for sample, values in zip(samples, snapshot["token_values"])
+                    ]
                 self.replay_buffer.add_samples.remote(samples)
 
             max_score = _textworld_max_score(states[0].infos) if states else 0.0
@@ -4725,6 +5141,35 @@ class TextWorldRolloutWorkerActor:
             f"episodes={episode_index}"
         )
         return {"episodes": episode_index}
+
+    async def evaluate_fixed_games(self, optimizer_step: int) -> Dict:
+        results = []
+        for game_file in self.game_files:
+            env = textworld.gym.make(self.game_env_ids[game_file])
+            try:
+                if hasattr(env, "seed"):
+                    env.seed(self.args.seed)
+                obs, infos = env.reset()
+                state = TextWorldTrajectoryState(env=env, obs=obs, infos=dict(infos),
+                    latest_score=_textworld_score(0, infos), transcript_ids=self._initial_transcript_ids(obs, infos),
+                    telemetry_id="eval-" + str(uuid.uuid4()))
+                for _ in range(self.args.tw_max_episode_steps):
+                    if not await self._run_textworld_step_batch([state]):
+                        break
+                results.append({"game": game_file, "won": bool(state.won),
+                                "score": state.latest_score, "max_score": _textworld_max_score(state.infos),
+                                "steps": len(state.step_records), "invalid_actions": state.invalid_actions})
+            finally:
+                env.close()
+        denominator = sum(row["max_score"] for row in results)
+        metrics = {"optimizer_step": optimizer_step, "independent_eval": True, "temperature": 0.0,
+                   "win_rate": sum(row["won"] for row in results) / len(results),
+                   "normalized_score": sum(row["score"] for row in results) / denominator if denominator > 0 else 0.0,
+                   "normalized_score_macro": sum(row["score"] / row["max_score"] if row["max_score"] > 0 else 0.0 for row in results) / len(results),
+                   "score_aggregation": "sum(score)/sum(max_score), consistent with training statistics; macro also reported",
+                   "games": results}
+        self.research.emit("evaluation", **metrics)
+        return metrics
 
 
 def summarize_weight_payload(dtype_names: List[str], shapes: List[List[int]]) -> float:
@@ -4794,6 +5239,13 @@ async def sync_weights_to_vllm(
             num_returns=1,
         )
         ray.get(ready_handles[0])
+    critic_snapshot = ray.get(broadcast_handles[0])
+    if critic_snapshot is not None:
+        ray.get(infer_actor.update_rollout_critic.remote(critic_snapshot))
+        print(
+            "[sync] rollout critic snapshot synchronized: "
+            f"optimizer_step={critic_snapshot['version']} (FP32 Value Head)"
+        )
     ray.get(infer_actor.finish_weight_update.remote())
     elapsed = time.perf_counter() - t0
     print(
@@ -4912,6 +5364,10 @@ async def run_textworld_train(args: argparse.Namespace):
         f"train_token_budget={args.train_token_budget} "
         f"train_ep_size={args.train_ep_size} "
         f"train_pack_candidate_pool_size={args.train_pack_candidate_pool_size} "
+        f"global_batch_size={args.global_batch_size} "
+        f"grad_accum_steps={args.grad_accum_steps} "
+        f"early_stop_kl={args.early_stop_kl} "
+        f"train_max_sequences_per_pack={args.train_max_sequences_per_pack} "
         "logprob_forward=response_only_lm_head "
         "ppo_forward_mode="
         f"{'selected_positions' if args.rl_algorithm == 'ppo' else 'inactive'} "
@@ -4926,6 +5382,7 @@ async def run_textworld_train(args: argparse.Namespace):
         f"grpo_group_size={args.grpo_group_size} "
         f"gae_gamma={args.gae_gamma} "
         f"gae_lambda={args.gae_lambda} "
+        f"ppo_gae_mode={args.ppo_gae_mode} "
         f"value_loss_coef={args.value_loss_coef} "
         "ppo_advantage_normalization="
         f"{args.ppo_advantage_normalization} "
@@ -4942,6 +5399,8 @@ async def run_textworld_train(args: argparse.Namespace):
     infer_actor = None
     rollout_workers = []
     rollout_refs = []
+    research_eval_worker = None
+    research_config = None
     try:
         # Use local/shared model weights directly.
         print(f"[init] Loading local model from {args.model_path}")
@@ -5057,6 +5516,17 @@ async def run_textworld_train(args: argparse.Namespace):
         ray.get(infer_actor.resume_generation.remote(increment_version=False))
         print("[sync] Initial full sync complete; generation can start.")
 
+        if getattr(args, "research_config", None):
+            from testForAcceRL.telemetry import load_config
+            research_config = load_config(args.research_config)
+            eval_args = argparse.Namespace(**vars(args))
+            # A training manifest must never override the independent evaluation directory.
+            eval_args.tw_game_manifest = None
+            eval_args.tw_game_dir = research_config["eval_game_dir"]
+            eval_args.tw_game_limit = research_config.get("eval_games", 4)
+            research_eval_worker = remote_rollout_worker.remote(eval_args, infer_actor, -1, None, None)
+            ray.get(research_eval_worker.evaluate_fixed_games.remote(0))
+
         rollout_workers = [
             remote_rollout_worker.remote(
                 args,
@@ -5078,6 +5548,7 @@ async def run_textworld_train(args: argparse.Namespace):
             f"grpo_group_size={args.grpo_group_size} "
             f"gae_gamma={args.gae_gamma} "
             f"gae_lambda={args.gae_lambda} "
+            f"ppo_gae_mode={args.ppo_gae_mode} "
             f"value_loss_coef={args.value_loss_coef} "
             "ppo_advantage_normalization="
             f"{args.ppo_advantage_normalization} "
@@ -5096,6 +5567,9 @@ async def run_textworld_train(args: argparse.Namespace):
         last_checkpoint_step = None
         training_reached_max = False
         while not training_reached_max:
+            if args.max_sync_rounds is not None and sync_rounds >= args.max_sync_rounds:
+                print("[sync] max_sync_rounds reached; stopping before another training segment.")
+                break
             check_rollout_workers()
             print(
                 "[train] Launching trainer segment: "
@@ -5111,7 +5585,8 @@ async def run_textworld_train(args: argparse.Namespace):
             train_segment_start_time = time.perf_counter()
             train_handles = [
                 worker.train_until_next_sync.remote(
-                    args.sync_every_optimizer_steps
+                    args.sync_every_optimizer_steps,
+                    trainer_version=float(sync_rounds),
                 )
                 for worker in fsdp_workers
             ]
@@ -5130,9 +5605,27 @@ async def run_textworld_train(args: argparse.Namespace):
             ])
             check_rollout_workers()
             rank0_summary = next(item for item in summaries if item["rank"] == 0)
-            training_reached_max = bool(rank0_summary["reached_max_steps"])
+            training_reached_max = bool(
+                rank0_summary["reached_max_steps"]
+                or rank0_summary["reached_stop_after_steps"]
+            )
             latest_optimizer_step = int(rank0_summary["optimizer_step"])
-            if rank0_summary["optimizer_steps_run"] <= 0:
+            if rank0_summary["reached_stop_after_steps"]:
+                print(
+                    "[train] --stop-after-steps reached: "
+                    f"optimizer_step={latest_optimizer_step}; "
+                    f"learning-rate schedule max_steps={args.max_steps}."
+                )
+            if research_config is not None:
+                elapsed = (time.monotonic_ns() - research_config["start_ns"]) / 1e9
+                wall_limit = research_config.get("max_wall_seconds")
+                gpu_limit = research_config.get("max_gpu_hours")
+                if ((wall_limit is not None and elapsed >= wall_limit) or
+                    (gpu_limit is not None and elapsed * len(research_config["gpus"]) / 3600 >= gpu_limit)):
+                    # Stop at a collective optimizer boundary, then publish and
+                    # independently evaluate the final policy before cleanup.
+                    training_reached_max = True
+            if rank0_summary["optimizer_steps_run"] <= 0 and rank0_summary["train_windows_run"] <= 0:
                 print("[train] No optimizer steps left; stopping sync loop.")
                 break
 
@@ -5183,6 +5676,9 @@ async def run_textworld_train(args: argparse.Namespace):
                 rank0_summary["segment_kl_trajectory_mean"]
             )
             clip_fraction = float(rank0_summary["segment_clip_frac"])
+            if research_config is not None:
+                from testForAcceRL.telemetry import Recorder
+                Recorder(research_config, "driver").publish_control(trainer_behavior_kl_proxy=kl_token_mean)
             version_lag_mean = float(
                 rank0_summary["segment_version_lag_mean"]
             )
@@ -5193,7 +5689,13 @@ async def run_textworld_train(args: argparse.Namespace):
                 segment_valid_tokens
                 / max(train_segment_elapsed, 1e-9)
             )
-            tb_step = rank0_summary["optimizer_step"]
+            tb_step = rank0_summary["train_window_step"]
+            writer.add_scalar("Train/OptimizerStep", rank0_summary["optimizer_step"], tb_step)
+            writer.add_scalar("Train/SkippedWindows", rank0_summary["skipped_windows"], tb_step)
+            if args.early_stop_kl > 0:
+                writer.add_scalar("Train/K2KL", rank0_summary["segment_k2_kl"], tb_step)
+                writer.add_scalar("Train/K2KLMaxMicrobatch", rank0_summary["segment_k2_kl_max_microbatch"], tb_step)
+                writer.add_scalar("Train/EarlyStopFraction", rank0_summary["segment_early_stop_fraction"], tb_step)
             writer.add_scalar(
                 "TextWorld/NormalizedScore",
                 rollout_stats["tw_normalized_score"],
@@ -5239,6 +5741,21 @@ async def run_textworld_train(args: argparse.Namespace):
             writer.add_scalar(
                 "Train/PackTokenUtilization",
                 rank0_summary["segment_pack_token_utilization"],
+                tb_step,
+            )
+            writer.add_scalar(
+                "Train/EpisodeUsesPerUpdate",
+                rank0_summary["segment_episode_uses_per_update"],
+                tb_step,
+            )
+            writer.add_scalar(
+                "Train/MicrobatchesPerRank",
+                rank0_summary["segment_microbatches_per_rank_mean"],
+                tb_step,
+            )
+            writer.add_scalar(
+                "Train/InputTokenUsesPerUpdate",
+                rank0_summary["segment_input_token_uses_per_update"],
                 tb_step,
             )
             if args.train_ep_size > 1:
@@ -5329,6 +5846,14 @@ async def run_textworld_train(args: argparse.Namespace):
             )
             writer.flush()
 
+            if rank0_summary["optimizer_steps_run"] <= 0:
+                print("[train] All attempted windows discarded; weights/EMA unchanged, no publication.")
+                if training_reached_max:
+                    if research_eval_worker is not None:
+                        ray.get(research_eval_worker.evaluate_fixed_games.remote(latest_optimizer_step))
+                    break
+                continue
+
             if (
                 args.save_checkpoint
                 and args.checkpoint_every_sync_rounds > 0
@@ -5340,16 +5865,6 @@ async def run_textworld_train(args: argparse.Namespace):
                 )
                 last_checkpoint_step = latest_optimizer_step
                 print(f"[checkpoint] Periodic checkpoint ready: {checkpoint_path}")
-
-            if (
-                args.max_sync_rounds is not None
-                and sync_rounds >= args.max_sync_rounds
-            ):
-                print(
-                    "[sync] max_sync_rounds reached; letting inference finish "
-                    "without more policy updates."
-                )
-                break
 
             sync_rounds += 1
             print(
@@ -5369,6 +5884,10 @@ async def run_textworld_train(args: argparse.Namespace):
             next_version = ray.get(
                 infer_actor.resume_generation.remote(increment_version=True)
             )
+            if research_eval_worker is not None and (
+                latest_optimizer_step % research_config.get("eval_every_steps", 5) == 0 or training_reached_max
+            ):
+                ray.get(research_eval_worker.evaluate_fixed_games.remote(latest_optimizer_step))
             print(
                 f"[sync] Round {sync_rounds}: resumed generation with "
                 f"weight version {next_version}."
@@ -5421,6 +5940,8 @@ async def run_textworld_train(args: argparse.Namespace):
                 ray.get(infer_actor.shutdown.remote())
             except Exception as exc:
                 print(f"[cleanup] Ignoring InferActor shutdown error: {exc!r}")
+        if research_eval_worker is not None:
+            ray.kill(research_eval_worker, no_restart=True)
         if fsdp_workers:
             try:
                 ray.get([worker.close.remote() for worker in fsdp_workers])
@@ -5437,6 +5958,8 @@ def parse_args() -> argparse.Namespace:
             "NCCL weight-sync demo."
         )
     )
+    parser.add_argument("--research-config", default=None, help="Opt-in real experiment telemetry and ABC sync policy JSON.")
+    parser.add_argument("--tw-game-manifest", default=None, help="Frozen benchmark game manifest; overrides training game selection, independently of --seed.")
     parser.add_argument(
         "--model-path",
         required=True,
@@ -5536,10 +6059,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-max-sequences-per-pack",
         type=int,
-        default=16,
+        default=None,
         help=(
             "Maximum number of independent RLSamples in one packed training "
-            "microbatch; this is not a padded tensor batch dimension."
+            "microbatch; 0 means token-budget only. Defaults to 0 with "
+            "--global-batch-size, otherwise 16."
         ),
     )
     parser.add_argument(
@@ -5557,14 +6081,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Replay candidates retained locally for length-aware packing. "
-            "Defaults to 4 * --train-max-sequences-per-pack."
+            "Used only in fixed-pack mode; fixed-episode mode packs the whole "
+            "rank-local episode quota."
         ),
     )
     parser.add_argument(
         "--max-steps",
         type=int,
         default=5000,
-        help="Maximum optimizer steps to run before stopping the demo.",
+        help="Maximum optimizer steps and total steps for learning-rate scheduling.",
+    )
+    parser.add_argument(
+        "--stop-after-steps",
+        type=int,
+        default=0,
+        help=(
+            "Stop after this many optimizer updates without changing the "
+            "learning-rate schedule defined by --max-steps. 0 disables early stopping."
+        ),
     )
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument(
@@ -5578,11 +6112,32 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument(
+        "--early-stop-kl", type=float, default=0.0,
+        help=(
+            "PPO/GIPO K2 guard: reject the entire optimizer window if any "
+            "pack's global response-token mean of half squared log-ratio "
+            "exceeds this threshold. Complete zero-loss backward, discard "
+            "gradients, and skip optimizer/LR/EMA updates. 0 disables it."
+        ),
+    )
+    batch_mode = parser.add_mutually_exclusive_group()
+    batch_mode.add_argument(
+        "--global-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Exact global episode uses per optimizer update. Must be divisible "
+            "by --fsdp-world-size. Pack count/gradient accumulation is dynamic. "
+            "Replay reuse is unchanged; this does not imply unique episodes."
+        ),
+    )
+    batch_mode.add_argument(
         "--grad-accum-steps",
         type=int,
-        default=8,
+        default=None,
         help=(
-            "Fixed number of packs prepared per rank for each optimizer step."
+            "Legacy fixed number of packs per rank/update (default 8 without "
+            "--global-batch-size). Mutually exclusive with fixed-episode batching."
         ),
     )
     parser.add_argument(
@@ -5591,6 +6146,16 @@ def parse_args() -> argparse.Namespace:
         default="ppo",
         choices=["ppo", "gipo", "sapo"],
         help="Policy objective clipping mode.",
+    )
+    parser.add_argument(
+        "--ppo-gae-mode",
+        choices=("jit", "rollout"),
+        default="jit",
+        help=(
+            "jit preserves trainer-side GAE. rollout freezes GAE and returns "
+            "before replay using a synchronized critic snapshot, and overrides "
+            "--ppo-advantage-normalization to optimizer_window (no EMA)."
+        ),
     )
     parser.add_argument(
         "--ppo-advantage-normalization",
@@ -5618,7 +6183,7 @@ def parse_args() -> argparse.Namespace:
         "--gae-lambda",
         type=float,
         default=0.95,
-        help="Trace parameter for on-the-fly token TD(lambda) targets.",
+        help="Trace parameter for token TD(lambda) targets in either GAE mode.",
     )
     parser.add_argument(
         "--value-loss-coef",
@@ -5676,8 +6241,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Maximum number of RL samples kept in each ReplayBufferActor. "
-            "Defaults to train_max_sequences_per_pack * "
-            "grad_accum_steps * 4."
+            "Defaults to 4 * global_batch_size / fsdp_world_size in "
+            "fixed-episode mode, or sequence_cap * grad_accum_steps * 4 "
+            "in fixed-pack mode (an unlimited cap uses 16 for defaults)."
         ),
     )
     parser.add_argument(
@@ -5698,8 +6264,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Minimum samples required in each trainer's replay buffer before "
-            "that trainer starts sampling. Defaults to "
-            "--train-max-sequences-per-pack."
+            "that trainer starts sampling. Defaults to the rank episode quota "
+            "capped by replay capacity in fixed-episode mode; otherwise the "
+            "sequence cap (16 when unlimited)."
         ),
     )
     parser.add_argument("--log-every", type=int, default=1)
@@ -5902,26 +6469,41 @@ def parse_args() -> argparse.Namespace:
             "--sapo-tau-pos and --sapo-tau-neg must be > 0, got "
             f"{args.sapo_tau_pos}, {args.sapo_tau_neg}"
         )
+    if args.train_max_sequences_per_pack is None:
+        args.train_max_sequences_per_pack = 0 if args.global_batch_size is not None else 16
+    if args.global_batch_size is None:
+        if args.grad_accum_steps is None:
+            args.grad_accum_steps = 8
+        default_rank_batch_size = (args.train_max_sequences_per_pack or 16) * args.grad_accum_steps
+    else:
+        default_rank_batch_size = max(1, args.global_batch_size // max(args.fsdp_world_size, 1))
     if args.replay_capacity is None:
-        args.replay_capacity = (
-            args.train_max_sequences_per_pack
-            * args.grad_accum_steps
-            * 4
-        )
+        args.replay_capacity = default_rank_batch_size * 4
     if args.train_pack_candidate_pool_size is None:
         args.train_pack_candidate_pool_size = (
-            args.train_max_sequences_per_pack * 4
+            (args.train_max_sequences_per_pack or 16) * 4
         )
     if args.replay_sample_timeout_seconds is None:
         args.replay_sample_timeout_seconds = 0.0
     if args.min_replay_size_per_rank is None:
-        args.min_replay_size_per_rank = args.train_max_sequences_per_pack
+        args.min_replay_size_per_rank = (
+            min(default_rank_batch_size, args.replay_capacity)
+            if args.global_batch_size is not None
+            else (args.train_max_sequences_per_pack or 16)
+        )
     if args.num_rollout_workers is None:
         args.num_rollout_workers = args.fsdp_world_size
     if args.grpo_group_size is None:
         args.grpo_group_size = args.rollout_batch_size
     if args.vllm_max_model_len is None:
         args.vllm_max_model_len = args.tw_history_token_window
+    if args.ppo_gae_mode == "rollout":
+        args.ppo_advantage_normalization = "optimizer_window"
+        # Scoring evaluates the whole transcript as a prompt, then generates
+        # one discarded token to obtain the final prefill hidden state.
+        args.vllm_max_model_len = max(
+            args.vllm_max_model_len, args.tw_history_token_window + 1,
+        )
     if args.log_dir is None:
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         args.log_dir = os.path.join("runs", "TextWorld_FSDP", timestamp)
@@ -5932,6 +6514,16 @@ def parse_args() -> argparse.Namespace:
 
 def validate_args(args: argparse.Namespace) -> None:
     pick_dtype(args.dtype)
+    early_stop_kl = getattr(args, "early_stop_kl", 0.0)
+    if not math.isfinite(early_stop_kl) or early_stop_kl < 0:
+        raise ValueError("--early-stop-kl must be finite and nonnegative (0 disables it)")
+    if early_stop_kl > 0 and args.rl_algorithm != "ppo":
+        raise ValueError("--early-stop-kl currently supports --rl-algorithm ppo only")
+    if args.ppo_gae_mode == "rollout":
+        if args.rl_algorithm != "ppo":
+            raise ValueError("--ppo-gae-mode rollout requires --rl-algorithm ppo.")
+        if args.ppo_advantage_normalization != "optimizer_window":
+            raise ValueError("Rollout GAE requires optimizer_window normalization.")
     if args.tw_game_limit is not None and args.tw_game_limit < 1:
         raise ValueError("--tw-game-limit must be >= 1 when set")
     if args.tw_max_episode_steps < 1:
@@ -5950,16 +6542,26 @@ def validate_args(args: argparse.Namespace) -> None:
             "TextWorld token-window transcript mode is enabled"
         )
     load_textworld_game_files(args)
-    if args.grad_accum_steps < 1:
-        raise ValueError("--grad-accum-steps must be >= 1")
+    global_batch_size = getattr(args, "global_batch_size", None)
+    if global_batch_size is not None:
+        if global_batch_size < 1:
+            raise ValueError("--global-batch-size must be >= 1")
+        if args.fsdp_world_size < 1 or global_batch_size % args.fsdp_world_size != 0:
+            raise ValueError("--global-batch-size must be divisible by --fsdp-world-size")
+        if args.grad_accum_steps is not None:
+            raise ValueError("--global-batch-size and --grad-accum-steps are mutually exclusive")
+    elif args.grad_accum_steps is None or args.grad_accum_steps < 1:
+        raise ValueError("--grad-accum-steps must be >= 1 in fixed-pack mode")
     if args.max_steps < 1:
         raise ValueError("--max-steps must be >= 1")
+    if args.stop_after_steps < 0:
+        raise ValueError("--stop-after-steps must be >= 0")
     if args.learning_rate < 0:
         raise ValueError("--learning-rate must be >= 0")
     if args.lr_warmup_steps < 0:
         raise ValueError("--lr-warmup-steps must be >= 0")
-    if args.train_max_sequences_per_pack < 1:
-        raise ValueError("--train-max-sequences-per-pack must be >= 1")
+    if args.train_max_sequences_per_pack < 0:
+        raise ValueError("--train-max-sequences-per-pack must be >= 0 (0 means token-budget only)")
     if args.train_pack_candidate_pool_size < 1:
         raise ValueError("--train-pack-candidate-pool-size must be >= 1")
     if args.train_token_budget < args.max_length:

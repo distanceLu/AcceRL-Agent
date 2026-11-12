@@ -33,33 +33,34 @@ cmd=("$PYTHON_BIN" -m accerl_agent.run_agent_textworld
   --model-path /mnt/data/lcx4/hf_cache/Qwen1.5-MoE-A2.7B-Chat
   --tw-game-dir /mnt/data/lcx4/AcceRL/accerl_vllm/data/tw_games/ftwp/games/train
   --tw-game-pattern '*.z8'
-  --tw-game-limit 400
-  --tw-max-episode-steps 40
-  --tw-history-token-window 4096
+  --tw-game-limit 400                 # 400个不同文件作为训练关卡
+  --tw-max-episode-steps 40           # 每局游戏最多40steps，可以提前结束，每个step包含st, at, rt
+  --tw-history-token-window 4096      # 每局episode累计上下文，包含初始提示，环境观察，历史动作等
   --tw-win-bonus 1.0
   --tw-lost-penalty 0.5
   --tw-invalid-action-penalty 0.1
-  --max-length 4096
+  --max-length 4096                   # 训练时只接受 input_ids 长度不超过 4096 的样本，超过就过滤，不会自动截成 4096
   --fsdp-world-size 3
   --infer-size 1
   --infer-tp-size 1
-  --num-rollout-workers 15
-  --rollout-batch-size 8
-  --infer-max-tokens 16
+  --num-rollout-workers 15            # 15*8=120 一次可以开120局
+  --rollout-batch-size 8              # 一个rollout worker可以开8局游戏8个episode
+  --infer-max-tokens 16               # 每次回答at最长16个token
   --infer-temperature 1
   --infer-top-p 1.0
-  --vllm-max-model-len 8192
-  --vllm-max-num-seqs 128
+  --vllm-max-model-len 8192           # 单条推理序列的最大长度，即输入上下文＋本次生成最多 8192 token
+  --vllm-max-num-seqs 128             # vLLM 最多同时调度 128 条序列，一次最多开15*8局
   --vllm-max-num-batched-tokens 8192
-  --train-max-sequences-per-pack 2
+  --train-max-sequences-per-pack 2    # pack是实际送入训练的样本，样本即episode，max-length=4096任意两条样本小于8192，两条样本组成一个pack，A3000，B4000，cu_seqlens = [0, 3000, 7000]
   --train-token-budget 8192
   --train-pack-candidate-pool-size 2
-  --grad-accum-steps 32
-  --replay-capacity 64
+  --grad-accum-steps 32               # 每个训练rank累计32个pack更新一次，即64条episode
+  --replay-capacity 64                # 缓冲区容量，3张卡每张卡一个缓冲区，总共3*64=192条轨迹
   --min-replay-size-per-rank 32
   --replay-sample-timeout-seconds 0.0
   --replay-wait-sleep-seconds 0.2
-  --max-steps 500000
+  --max-steps 500000                 # 学习率调度仍按500000次优化器更新计算
+  --stop-after-steps 2500            # 提前结束的更新次数；设为0则训练到max-steps
   --learning-rate 1e-6
   --lr-warmup-steps 500
   --weight-decay 0.0
@@ -72,6 +73,7 @@ cmd=("$PYTHON_BIN" -m accerl_agent.run_agent_textworld
   --clip-mode gipo
   --gipo-sigma 0.3
   --clip-eps 0.1
+  --early-stop-kl "${EARLY_STOP_KL:-0.01}"
   --old-new-kl-coef 0.05
   --dtype bfloat16
   --seed 42
@@ -83,7 +85,7 @@ cmd=("$PYTHON_BIN" -m accerl_agent.run_agent_textworld
   "$@"
 )
 
-# Extra CLI arguments are appended, e.g. --max-steps 2 for a short run.
+# Extra CLI arguments override defaults, e.g. --stop-after-steps 1000 (0 disables it).
 printf "Project: %s\nGPUs: %s\nLog directory: %s\n" "$PROJECT_ROOT" "$CUDA_VISIBLE_DEVICES" "$LOG_DIR"
 printf "%q " "${cmd[@]}" > "$LOG_DIR/launch_command.sh"
 printf "\n" >> "$LOG_DIR/launch_command.sh"

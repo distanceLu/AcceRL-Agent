@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from typing import List, Literal, Tuple, TypeAlias
 
 import torch
@@ -62,6 +63,15 @@ class RawPPOSample:
     # Maximum policy version among this sample's response tokens. Training
     # only uses the latest behavior version for replay-lag diagnostics.
     behavior_version: int
+    telemetry_id: str | None = None
+    created_monotonic_ns: int | None = None
+    telemetry_oldest_version: int | None = None
+    # Present together only for rollout GAE; aligned with response tokens.
+    # These targets remain unchanged when the sample is replayed.
+    raw_advantages: Tuple[float, ...] | None = None
+    returns: Tuple[float, ...] | None = None
+    # Optimizer step of the synchronized backbone + Value Head snapshot.
+    value_version: int | None = None
 
     def __post_init__(self) -> None:
         # Canonical tuples make a validated replay sample deeply immutable;
@@ -83,6 +93,10 @@ class RawPPOSample:
                 "response_rewards",
                 tuple(self.response_rewards),
             )
+            for name in ("raw_advantages", "returns"):
+                values = getattr(self, name)
+                if values is not None:
+                    object.__setattr__(self, name, tuple(values))
         except TypeError as exc:
             raise ValueError(
                 "PPO replay sequence fields must be iterable."
@@ -103,6 +117,9 @@ class GRPOSample:
     # Maximum policy version among this sample's response tokens. It is used
     # only for replay-lag diagnostics.
     behavior_version: int
+    telemetry_id: str | None = None
+    created_monotonic_ns: int | None = None
+    telemetry_oldest_version: int | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -170,6 +187,16 @@ def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
                 f"{name} must align with response tokens: "
                 f"{len(values)} != {response_count}"
             )
+    frozen_fields = (sample.raw_advantages, sample.returns, sample.value_version)
+    if any(value is not None for value in frozen_fields):
+        if any(value is None for value in frozen_fields):
+            raise ValueError("PPO rollout advantages, returns and value_version are required together.")
+        if type(sample.value_version) is not int or sample.value_version < 0:
+            raise ValueError("PPO value_version must be a non-negative optimizer step.")
+        for name in ("raw_advantages", "returns"):
+            values = getattr(sample, name)
+            if len(values) != response_count or not all(math.isfinite(v) for v in values):
+                raise ValueError(f"PPO {name} must contain one finite value per response token.")
     if sample.boundary_kind not in {"terminated", "truncated"}:
         raise ValueError(
             "PPO boundary_kind must be 'terminated' or 'truncated'."
@@ -388,3 +415,53 @@ def _compute_batched_token_gae_unchecked(
         torch.zeros_like(values),
     )
     return advantages.detach(), returns.detach(), deltas.detach()
+
+
+def freeze_rollout_ppo_targets(
+    sample: RawPPOSample,
+    token_values: List[float],
+    *,
+    value_version: int,
+    gamma: float,
+    gae_lambda: float,
+) -> RawPPOSample:
+    """Freeze GAE from one completed transcript and one critic snapshot.
+
+    ``token_values[i]`` is V after consuming input_ids[i]. A response token
+    at position p therefore uses V[p - 1], exactly as the trainer does.
+    Observation tokens stay in the context, but not in the GAE timeline.
+    """
+    if sample.raw_advantages is not None:
+        raise ValueError("Rollout PPO targets are already frozen.")
+    if len(token_values) != len(sample.input_ids):
+        raise ValueError("Critic values must align with the complete input transcript.")
+    values = torch.tensor(token_values, dtype=torch.float32)
+    if not torch.isfinite(values).all():
+        raise ValueError("Rollout critic values must be finite.")
+    prediction_indices = [
+        position - 1
+        for start, end in sample.response_spans
+        for position in range(start, end)
+    ]
+    baseline = values[prediction_indices].unsqueeze(0)
+    valid = torch.ones_like(baseline, dtype=torch.bool)
+    terminated = torch.zeros_like(valid)
+    truncated = torch.zeros_like(valid)
+    terminal = sample.boundary_kind == "terminated"
+    (terminated if terminal else truncated)[0, -1] = True
+    advantages, returns, _ = compute_batched_token_gae(
+        rewards=torch.tensor([sample.response_rewards], dtype=torch.float32),
+        baseline_values=baseline,
+        valid_mask=valid,
+        terminated=terminated,
+        truncated=truncated,
+        bootstrap_values=values.new_tensor([0.0]) if terminal else values[-1:],
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+    )
+    return replace(
+        sample,
+        raw_advantages=tuple(advantages[0].tolist()),
+        returns=tuple(returns[0].tolist()),
+        value_version=value_version,
+    )
