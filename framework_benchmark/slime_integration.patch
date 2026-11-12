@@ -1,0 +1,32 @@
+--- a/slime/ray/rollout.py
++++ b/slime/ray/rollout.py
+@@ -845,6 +845,7 @@
+                 "loss_masks",
+                 "round_number",
+                 "sample_indices",
++                "metadata",
+                 "rollout_ids",
+                 "rollout_mask_sums",
+                 "rollout_log_probs",
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -1618,7 +1618,7 @@
+         # Critic-specific: disable features that only apply to actors.
+         role_args.kl_coef = 0
+         role_args.use_opd = False
+-        role_args.custom_advantage_function_path = None
++        # Task-specific reward placement must also define critic targets.
+         role_args.untie_embeddings_and_output_weights = True
+         if "disable_param_buffers_cpu_backup" not in overrides:
+             role_args.disable_param_buffers_cpu_backup = False
+--- a/slime/backends/megatron_utils/megatron_to_hf/__init__.py
++++ b/slime/backends/megatron_utils/megatron_to_hf/__init__.py
+@@ -46,7 +46,7 @@
+         converted_named_tensors = convert_glm4_to_hf(args, name, param)
+     elif "gpt_oss" in model_name or "gpt-oss" in model_name or "gptoss" in model_name:
+         converted_named_tensors = convert_gpt_oss_to_hf(args, name, param)
+-    elif "qwen3moe" in model_name:
++    elif "qwen3moe" in model_name or "qwen2moe" in model_name or "qwen2_moe" in model_name:
+         converted_named_tensors = convert_qwen3moe_to_hf(args, name, param)
+     elif "qwen3next" in model_name:
+         converted_named_tensors = convert_qwen3_next_to_hf(args, name, param)

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "gpus": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "arms": [
+    "accerl_ppo",
+    "slime_ppo_sync",
+    "slime_ppo_fully_async"
+  ],
+  "model": "/mnt/data/lcx4/hf_cache/Qwen1.5-MoE-A2.7B-Chat",
+  "model_config_sha256": "b3e9fc1ad643d12f6536dee80a66c5ea045b571856165a598252720b6f2c553e",
+  "algorithm": "ppo",
+  "accerl_gae": "jit",
+  "accerl_advantage_normalization": "ema_zscore",
+  "task": {
+    "max_attempts": 40,
+    "history_tokens": 4096,
+    "action_tokens": 16,
+    "win_bonus": 1.0,
+    "lost_penalty": 0.5,
+    "invalid_penalty": 0.1
+  },
+  "evaluation": {
+    "decoding": "greedy",
+    "primary": "macro_normalized_score",
+    "secondary": "win_rate",
+    "targets": null,
+    "max_gpu_hours": null
+  },
+  "status": "prepared_not_gpu_validated",
+  "pending_gates": [
+    "qwen2_moe_weight_conversion_and_sync",
+    "ppo_actor_and_critic_targets",
+    "independent_evaluation",
+    "pilot_targets_and_budget",
+    "gpu_release"
+  ]
+}

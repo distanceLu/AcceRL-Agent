@@ -1,0 +1,27 @@
+--- a/slime/backends/megatron_utils/loss.py
++++ b/slime/backends/megatron_utils/loss.py
+@@ -975,6 +975,11 @@
+         log_probs = torch.cat(log_probs, dim=0)
+         ppo_kl = old_log_probs - log_probs
+ 
++    import os
++    if os.environ.get("TW_RATIO_DIAGNOSTICS") == "1":
++        from framework_benchmark.ratio_diagnostics import capture
++        capture(args, batch, old_log_probs, log_probs, advantages)
++
+     if args.advantage_estimator == "cispo":
+         pg_loss, pg_clipfrac = compute_cispo_loss(ppo_kl, log_probs, advantages, args.eps_clip, args.eps_clip_high)
+     else:
+--- a/slime/backends/megatron_utils/model.py
++++ b/slime/backends/megatron_utils/model.py
+@@ -834,6 +834,10 @@
+             microbatch_pbar=microbatch_pbar,
+         )
+ 
++        if os.environ.get("TW_RATIO_DIAGNOSTICS") == "1" and getattr(model[0], "role", "actor") == "actor":
++            from framework_benchmark.ratio_diagnostics import finish_step
++            loss_dict.update(finish_step(rollout_id * num_steps_per_rollout + step_id))
++
+         if step_id == 0:
+             # Enable forward pre-hook after training step has successfully run. All subsequent
+             # forward passes will use the forward pre-hook / `param_sync_func` in

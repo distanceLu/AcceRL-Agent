@@ -1,0 +1,10 @@
+--- a/slime/ray/rollout.py
++++ b/slime/ray/rollout.py
+@@ -845,6 +845,7 @@
+                 "loss_masks",
+                 "round_number",
+                 "sample_indices",
++                "metadata",
+                 "rollout_ids",
+                 "rollout_mask_sums",
+                 "rollout_log_probs",

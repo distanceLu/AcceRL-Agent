@@ -1,0 +1,18 @@
+--- a/slime/utils/logging_utils.py
++++ b/slime/utils/logging_utils.py
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ 
+ import wandb
+ 
+@@ -43,6 +44,9 @@
+ 
+ # TODO further refactor, e.g. put TensorBoard init to the "init" part
+ def log(args, metrics, step_key: str):
++    if os.environ.get("TW_EVENT_DIR"):
++        from framework_benchmark.events import emit
++        emit({"kind": "training_metrics", "episode_id": "metrics", "step_key": step_key, "metrics": metrics})
+     if args.use_wandb:
+         wandb.log(metrics)
+ 

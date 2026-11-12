@@ -1,0 +1,724 @@
+diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -888,6 +888,16 @@
+ 
+             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
+             parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
++            parser.add_argument(
++                "--early-stop-kl", type=float, default=0.0,
++                help=(
++                    "Reject a PPO actor optimizer window if any DP-global microbatch's "
++                    "action-token mean of 0.5 * (new_logprob - old_logprob)^2 exceeds "
++                    "this threshold. Complete zero-loss backward, discard accumulated "
++                    "gradients, and skip optimizer/LR steps. 0 disables the guard. "
++                    "Currently supports TP=PP=CP=1 with DP/EP."
++                ),
++            )
+             parser.add_argument(
+                 "--eps-clip-c",
+                 type=float,
+@@ -1623,6 +1633,10 @@
+         if "disable_param_buffers_cpu_backup" not in overrides:
+             role_args.disable_param_buffers_cpu_backup = False
+ 
++    if role == "actor":
++        from slime.utils.ppo_early_stop import validate_ppo_early_stop_args
++
++        validate_ppo_early_stop_args(role_args)
+     return role_args
+ 
+ 
+@@ -2018,3 +2032,8 @@
+                 "--update-weight-mode=delta requires --update-weight-local-checkpoint-dir "
+                 "(a rollout-host-local NVMe directory)."
+             )
++
++    # Validate after custom YAML overrides have been applied as well.
++    from slime.utils.ppo_early_stop import validate_ppo_early_stop_args
++
++    validate_ppo_early_stop_args(args)
+diff --git a/slime/backends/megatron_utils/loss.py b/slime/backends/megatron_utils/loss.py
+--- a/slime/backends/megatron_utils/loss.py
++++ b/slime/backends/megatron_utils/loss.py
+@@ -10,6 +10,7 @@
+ 
+ from slime.utils.distributed_utils import distributed_masked_whiten
+ from slime.utils.misc import load_function
++from slime.utils.ppo_early_stop import zero_policy_loss
+ from slime.utils.ppo_utils import (
+     calculate_log_probs_and_entropy,
+     compute_approx_kl,
+@@ -926,6 +927,8 @@
+ 
+     log_probs = log_probs_and_entropy["log_probs"]
+     if not args.use_rollout_logprobs and not old_log_probs:
++        if getattr(args, "_ppo_early_stop_state", None) is not None:
++            raise ValueError("K2 early stopping requires precomputed old policy logprobs.")
+         old_log_probs = [log_prob.detach() for log_prob in log_probs]
+     train_log_probs_for_tis = batch.get("log_probs")
+     if not train_log_probs_for_tis:
+@@ -979,6 +982,19 @@
+     if os.environ.get("TW_RATIO_DIAGNOSTICS") == "1":
+         from framework_benchmark.ratio_diagnostics import capture
+         capture(args, batch, old_log_probs, log_probs, advantages)
++
++    early_stop = getattr(args, "_ppo_early_stop_state", None)
++    if early_stop is not None:
++        early_stop.observe(
++            log_probs, old_log_probs,
++            torch.cat(batch["loss_masks"]).to(log_probs.device),
++            group=mpu.get_data_parallel_group(with_context_parallel=True),
++        )
++        if early_stop.stop_ppo:
++            # Gate before ratio.exp()/surrogate construction and backward.
++            # A latched stop also zeros every remaining microbatch; the
++            # trainer discards gradients from earlier microbatches as well.
++            return zero_policy_loss(logits, args, batch)
+ 
+     if args.advantage_estimator == "cispo":
+         pg_loss, pg_clipfrac = compute_cispo_loss(ppo_kl, log_probs, advantages, args.eps_clip, args.eps_clip_high)
+diff --git a/slime/backends/megatron_utils/model.py b/slime/backends/megatron_utils/model.py
+--- a/slime/backends/megatron_utils/model.py
++++ b/slime/backends/megatron_utils/model.py
+@@ -30,6 +30,7 @@
+     from megatron.core.utils import unwrap_model
+ from slime.utils import logging_utils
+ from slime.utils.memory_utils import clear_memory
++from slime.utils.ppo_early_stop import PPOEarlyStopState
+ 
+ from .checkpoint import load_checkpoint, save_checkpoint
+ from .cp_utils import reduce_train_step_metrics
+@@ -639,20 +640,28 @@
+ 
+     # Forward pass.
+     forward_backward_func = get_forward_backward_func()
+-    losses_reduced = forward_backward_func(
+-        forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
+-        data_iterator=data_iterator,
+-        model=model,
+-        num_microbatches=num_microbatches,
+-        seq_length=args.seq_length,
+-        micro_batch_size=args.micro_batch_size,
+-        decoder_seq_length=args.decoder_seq_length,
+-        forward_only=False,
+-    )
+-
+-    valid_step = True
+-    grad_norm = float("nan")
+-    if not getattr(args, "check_for_nan_in_loss_and_grad", True):
++    early_stop = None
++    if args.loss_type == "policy_loss" and getattr(args, "early_stop_kl", 0.0) > 0:
++        early_stop = PPOEarlyStopState(args.early_stop_kl)
++    args._ppo_early_stop_state = early_stop
++    try:
++        losses_reduced = forward_backward_func(
++            forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
++            data_iterator=data_iterator,
++            model=model,
++            num_microbatches=num_microbatches,
++            seq_length=args.seq_length,
++            micro_batch_size=args.micro_batch_size,
++            decoder_seq_length=args.decoder_seq_length,
++            forward_only=False,
++        )
++    finally:
++        args._ppo_early_stop_state = None
++
++    discarded = early_stop is not None and early_stop.stop_ppo
++    valid_step = not discarded
++    grad_norm = 0.0 if discarded else float("nan")
++    if valid_step and not getattr(args, "check_for_nan_in_loss_and_grad", True):
+         found_inf_flag = optimizer.prepare_grads()
+         if found_inf_flag:
+             valid_step = False
+@@ -692,6 +701,18 @@
+             cp_size=mpu.get_context_parallel_world_size(),
+             dp_with_cp_group=mpu.get_data_parallel_group(with_context_parallel=True),
+         )
++        if early_stop is not None:
++            if discarded:
++                # Report the discarded window's effective loss as zero; it
++                # is not a successful, partially accumulated actor update.
++                loss_reduced = {key: 0.0 for key in loss_reduced}
++                logger.warning(
++                    "Discarded PPO actor window: rollout=%s step=%s "
++                    "K2 max_microbatch=%s threshold=%s trigger_microbatch=%s",
++                    rollout_id, step_id, early_stop.max_microbatch_kl,
++                    early_stop.threshold, early_stop.first_stopped_microbatch,
++                )
++            loss_reduced.update(early_stop.metrics())
+         return loss_reduced, grad_norm
+     return {}, grad_norm
+ 
+diff --git a/slime/utils/ppo_early_stop.py b/slime/utils/ppo_early_stop.py
+new file mode 100644
+--- /dev/null
++++ b/slime/utils/ppo_early_stop.py
+@@ -0,0 +1,100 @@
++"""Action-token K2 guard for a single Megatron PPO optimizer window."""
++
++import math
++from dataclasses import dataclass
++
++import torch
++import torch.distributed as dist
++
++
++def validate_ppo_early_stop_args(args):
++    threshold = getattr(args, "early_stop_kl", 0.0)
++    if not math.isfinite(threshold) or threshold < 0:
++        raise ValueError("--early-stop-kl must be finite and nonnegative (0 disables it).")
++    if threshold == 0:
++        return
++    if getattr(args, "train_backend", "megatron") != "megatron":
++        raise ValueError("--early-stop-kl currently requires the Megatron train backend.")
++    if args.advantage_estimator != "ppo" or args.loss_type != "policy_loss":
++        raise ValueError("--early-stop-kl requires PPO with policy_loss.")
++    # The benchmark has no pipeline/context/tensor parallel loss scheduling.
++    # Do not silently introduce loss collectives into unsupported schedules.
++    if any(getattr(args, key, 1) != 1 for key in (
++        "tensor_model_parallel_size", "pipeline_model_parallel_size", "context_parallel_size",
++    )):
++        raise ValueError("--early-stop-kl currently requires TP=PP=CP=1 (DP and EP are supported).")
++    if any(getattr(args, key, False) for key in (
++        "recompute_loss_function", "enable_mtp_training", "use_tis", "get_mismatch_metrics",
++    )):
++        raise ValueError("--early-stop-kl does not support loss recomputation, MTP, or TIS/mismatch metrics.")
++
++
++def zero_policy_loss(logits, args, batch):
++    # An empty view retains the complete model's backward graph without
++    # reading logits or multiplying an existing NaN/Inf loss by zero.
++    loss = logits.reshape(-1)[:0].float().sum()
++    names = ["loss", "pg_loss", "entropy_loss", "pg_clipfrac", "ppo_kl"]
++    if batch.get("rollout_log_probs"):
++        names.append("train_rollout_logprob_abs_diff")
++    if args.use_kl_loss:
++        names.append("kl_loss")
++    if getattr(args, "use_opsm", False):
++        names.append("opsm_clipfrac")
++    if "opd_reverse_kl" in batch:
++        names.append("opd_reverse_kl")
++    return loss, {name: loss.detach() for name in names}
++
++
++@dataclass
++class PPOEarlyStopState:
++    threshold: float
++    stop_ppo: bool = False
++    squared_sum: float = 0.0
++    token_count: int = 0
++    max_microbatch_kl: float = 0.0
++    microbatches: int = 0
++    first_stopped_microbatch: int = 0
++    nonfinite_tokens: int = 0
++
++    @torch.no_grad()
++    def observe(self, new_log_probs, old_log_probs, mask, group=None):
++        if new_log_probs.shape != old_log_probs.shape or new_log_probs.shape != mask.shape:
++            raise ValueError("K2 logprobs and action-token mask must have the same shape.")
++        keep = mask.to(device=new_log_probs.device, dtype=torch.bool)
++        # Select before subtraction/squaring, so masked NaN/Inf cannot pollute
++        # the statistic. FP64 also avoids overflow in finite FP32 differences.
++        delta = new_log_probs.detach()[keep].double() - old_log_probs.detach()[keep].double()
++        finite = torch.isfinite(delta)
++        stats = torch.stack((
++            0.5 * delta[finite].square().sum(),
++            delta.new_tensor(delta.numel()),
++            (~finite).double().sum(),
++        ))
++        if dist.is_initialized():
++            dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=group)
++        squared_sum, count, bad_count = stats.tolist()
++        if bad_count or not math.isfinite(squared_sum):
++            squared_sum = math.inf
++        k2 = squared_sum / max(count, 1)
++        self.microbatches += 1
++        self.squared_sum += squared_sum
++        self.token_count += int(count)
++        self.nonfinite_tokens += int(bad_count)
++        self.max_microbatch_kl = max(self.max_microbatch_kl, k2)
++        if not math.isfinite(k2) or k2 > self.threshold:
++            if not self.stop_ppo:
++                self.first_stopped_microbatch = self.microbatches
++            self.stop_ppo = True
++        return k2
++
++    def metrics(self):
++        # All microbatches are observed, including those after the latch, so
++        # this is the whole window's token-weighted mean, not a prefix mean.
++        return {
++            "k2_kl": self.squared_sum / max(self.token_count, 1),
++            "k2_kl_max_microbatch": self.max_microbatch_kl,
++            "early_stop": float(self.stop_ppo),
++            "early_stop_microbatch": self.first_stopped_microbatch,
++            "early_stop_nonfinite_tokens": self.nonfinite_tokens,
++            "optimizer_step_skipped": float(self.stop_ppo),
++        }
+diff --git a/tests/test_ppo_early_stop.py b/tests/test_ppo_early_stop.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_ppo_early_stop.py
+@@ -0,0 +1,363 @@
++"""CPU coverage of the guard and the production Megatron loss/update path.
++
++The AST loader executes production function bodies with CPU stand-ins for the
++Megatron pipeline and model-output decoding, avoiding a Megatron/CUDA import.
++"""
++import __future__
++import ast
++import copy
++import logging
++import math
++import os
++import unittest
++from functools import partial
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import torch
++
++from slime.utils import ppo_early_stop as guard
++
++NUM_GPUS = 0
++ROOT = Path(__file__).resolve().parents[1]
++
++def _args(**overrides):
++    values = dict(early_stop_kl=0.05, advantage_estimator='ppo', loss_type='policy_loss', tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1, expert_model_parallel_size=3, recompute_loss_function=False, enable_mtp_training=False, use_tis=False, get_mismatch_metrics=False, custom_megatron_before_train_step_hook_path=None, data_pad_size_multiplier=128, allgather_cp=False, seq_length=16, micro_batch_size=1, decoder_seq_length=None, check_for_nan_in_loss_and_grad=True, ci_test=False, calculate_per_token_loss=False, rollout_top_p=1.0, use_rollout_logprobs=False, use_opsm=False, eps_clip=0.1, eps_clip_high=0.1, custom_pg_loss_reducer_function_path=None, entropy_coef=0.0, use_kl_loss=False, use_unbiased_kl=False, kl_loss_type='k2', kl_loss_coef=0.1, value_clip=0.2)
++    values.update(overrides)
++    return SimpleNamespace(**values)
++
++def _observe(state, delta, mask=None):
++    new = torch.as_tensor(delta, dtype=torch.float32)
++    if mask is None:
++        mask = torch.ones_like(new)
++    return state.observe(new, torch.zeros_like(new), torch.as_tensor(mask))
++
++def _load_functions(relative_path, names, namespace):
++    """Compile actual source bodies, deferring annotations and CUDA decorators."""
++    path = ROOT / relative_path
++    tree = ast.parse(path.read_text())
++    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
++    assert {node.name for node in nodes} == set(names)
++    for node in nodes:
++        node.decorator_list = []
++    source = ast.Module(body=nodes, type_ignores=[])
++    exec(compile(source, str(path), 'exec', flags=__future__.annotations.compiler_flag), namespace)
++
++class _TinyModel(torch.nn.Module):
++
++    def __init__(self):
++        super().__init__()
++        self.weight = torch.nn.Parameter(torch.tensor(-0.5))
++        self.main_grad = torch.zeros_like(self.weight)
++        self.clear_calls = 0
++
++    def forward(self, input_ids, **kwargs):
++        return self.weight + input_ids
++
++    def zero_grad_buffer(self):
++        self.clear_calls += 1
++        self.main_grad.zero_()
++
++class _Adam:
++
++    def __init__(self, model):
++        self.model = model
++        self.inner = torch.optim.Adam(model.parameters(), lr=0.01)
++        self.step_calls = 0
++
++    def zero_grad(self):
++        self.inner.zero_grad(set_to_none=True)
++
++    def step(self):
++        self.step_calls += 1
++        norm = self.model.weight.grad.detach().abs().item()
++        self.inner.step()
++        return (True, norm, 0)
++
++class _CPUTraining:
++
++    def __init__(self, patches, **overrides):
++        self.args = _args(**overrides)
++        self.model = _TinyModel()
++        self.optimizer = _Adam(self.model)
++        self.scheduler = SimpleNamespace(step=Mock())
++        self.gradients = []
++        self.states = []
++        patches._remove_env('ENABLE_ROUTING_REPLAY', raising=False)
++        patches._remove_env('TW_RATIO_DIAGNOSTICS', raising=False)
++        patches._patch_attr(guard.dist, 'is_initialized', lambda : False)
++        patches._patch_attr(guard.dist, 'all_reduce', lambda *args, **kwargs: None)
++        mpu = SimpleNamespace(get_context_parallel_world_size=lambda : 1, get_data_parallel_world_size=lambda **kwargs: 1, get_data_parallel_group=lambda **kwargs: None, is_pipeline_last_stage=lambda **kwargs: True)
++        self.ns = dict(torch=torch, math=math, os=os, partial=partial, mpu=mpu, dist=guard.dist, logger=logging.getLogger(__name__), PPOEarlyStopState=guard.PPOEarlyStopState, zero_policy_loss=guard.zero_policy_loss, get_args=lambda : self.args, get_batch=lambda iterator, *args: next(iterator), _with_rollout_top_p_token_keys=lambda args, keys: keys, _wrap_forward_step_with_microbatch_pbar=lambda fn, pbar: fn, get_forward_backward_func=lambda : self.pipeline, get_rollout_top_p_logprob_kwargs=lambda args, batch: {}, get_log_probs_and_entropy=lambda logits, **kwargs: (None, {'log_probs': [logits.flatten()], 'entropy': [torch.zeros_like(logits.flatten())]}), get_values=lambda logits, **kwargs: (None, {'values': [logits.flatten()]}), all_gather_with_cp=lambda tensor, *args: tensor, compute_opsm_mask=lambda **kwargs: (torch.ones_like(torch.cat(kwargs['full_log_probs'])), torch.tensor(0.0)), compute_approx_kl=lambda logits, reference, **kwargs: torch.zeros_like(logits))
++        _load_functions('slime/utils/ppo_utils.py', ['compute_policy_loss'], self.ns)
++        self.policy_loss = Mock(wraps=self.ns['compute_policy_loss'])
++        self.ns['compute_policy_loss'] = self.policy_loss
++        _load_functions('slime/backends/megatron_utils/cp_utils.py', ['get_sum_of_sample_mean', 'reduce_train_step_metrics'], self.ns)
++        _load_functions('slime/backends/megatron_utils/loss.py', ['policy_loss_function', 'value_loss_function', 'loss_function'], self.ns)
++        _load_functions('slime/backends/megatron_utils/model.py', ['train_one_step'], self.ns)
++
++    def batch(self, delta, offset=0.0):
++        old = torch.tensor([self.model.weight.item() + offset - delta])
++        return dict(tokens=torch.tensor([offset]), unconcat_tokens=[torch.tensor([0])], multimodal_train_inputs=None, packed_seq_params=None, full_loss_masks=torch.ones(1), loss_masks=[torch.ones(1)], total_lengths=[1], response_lengths=[1], log_probs=[old], rollout_log_probs=[old.clone()], advantages=[torch.ones(1)], rollout_mask_sums=None, values=[torch.tensor([self.model.weight.item()])], returns=[torch.tensor([1.0])], ref_log_probs=[old.clone()])
++
++    def pipeline(self, *, forward_step_func, data_iterator, model, num_microbatches, **kwargs):
++        self.states.append(self.args._ppo_early_stop_state)
++        metrics = []
++        for _ in range(num_microbatches):
++            (logits, loss_fn) = forward_step_func(data_iterator[0], model[0])
++            (loss, _, log) = loss_fn(logits)
++            (loss / num_microbatches).backward()
++            model[0].main_grad.copy_(model[0].weight.grad)
++            self.gradients.append(model[0].weight.grad.detach().clone())
++            metrics.append(log)
++        return metrics
++
++    def run(self, deltas):
++        batches = [self.batch(delta) for delta in deltas]
++        return self.ns['train_one_step'](self.args, 0, 0, [iter(batches)], [self.model], self.optimizer, self.scheduler, len(batches), len(batches))
++
++def _assert_same_state(actual, expected):
++    if isinstance(expected, torch.Tensor):
++        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++    elif isinstance(expected, dict):
++        assert actual.keys() == expected.keys()
++        for key in expected:
++            _assert_same_state(actual[key], expected[key])
++    elif isinstance(expected, (tuple, list)):
++        assert len(actual) == len(expected)
++        for (left, right) in zip(actual, expected, strict=True):
++            _assert_same_state(left, right)
++    else:
++        assert actual == expected
++
++class PPOEarlyStopTests(unittest.TestCase):
++
++    def _patch_attr(self, obj, name, value):
++        patcher = patch.object(obj, name, value)
++        patcher.start()
++        self.addCleanup(patcher.stop)
++
++    def _remove_env(self, name, raising=False):
++        patcher = patch.dict(os.environ)
++        patcher.start()
++        self.addCleanup(patcher.stop)
++        os.environ.pop(name, None)
++
++    def test_masked_nonfinite_and_empty_masks_are_excluded(self):
++        state = guard.PPOEarlyStopState(0.05)
++        assert math.isclose(_observe(state, [0.2, math.nan, math.inf], [1, 0, 0]), 0.02, rel_tol=1e-06, abs_tol=1e-12)
++        assert _observe(state, [math.nan, math.inf], [0, 0]) == 0.0
++        assert _observe(state, []) == 0.0
++        assert not state.stop_ppo
++        assert state.token_count == 1
++        assert state.nonfinite_tokens == 0
++
++    def test_window_metrics_are_token_weighted_and_stop_latches(self):
++        state = guard.PPOEarlyStopState(0.4)
++        assert math.isclose(_observe(state, [0.1]), 0.005, rel_tol=1e-06, abs_tol=1e-12)
++        assert not state.stop_ppo
++        assert _observe(state, [1.0]) == 0.5
++        assert state.stop_ppo
++        assert _observe(state, [0.0, 0.0]) == 0.0
++        metrics = state.metrics()
++        assert math.isclose(metrics['k2_kl'], 0.505 / 4, rel_tol=1e-06, abs_tol=1e-12)
++        assert metrics['k2_kl_max_microbatch'] == 0.5
++        assert metrics['early_stop_microbatch'] == 2
++        assert metrics['early_stop'] == metrics['optimizer_step_skipped'] == 1.0
++        assert state.microbatches == 3
++
++    def test_nonfinite_action_tokens_stop(self):
++        for value in [math.nan, math.inf, -math.inf]:
++            with self.subTest(value=value):
++                state = guard.PPOEarlyStopState(1.0)
++                assert math.isinf(_observe(state, [0.0, value]))
++                assert state.stop_ppo
++                assert state.metrics()['early_stop_nonfinite_tokens'] == 1
++
++    def test_large_finite_fp32_deltas_do_not_overflow_when_squared(self):
++        state = guard.PPOEarlyStopState(0.1)
++        k2 = state.observe(torch.tensor([1e+20]), torch.tensor([-1e+20]), torch.tensor([1]))
++        assert math.isfinite(k2)
++        assert math.isclose(k2, 2e+40, rel_tol=1e-06, abs_tol=1e-12)
++        assert state.nonfinite_tokens == 0
++
++    def test_shape_mismatch_is_rejected(self):
++        with self.assertRaisesRegex(ValueError, 'same shape'):
++            guard.PPOEarlyStopState(0.1).observe(torch.zeros(2), torch.zeros(1), torch.ones(2))
++
++    def test_distributed_statistics_weight_tokens_instead_of_rank_means(self):
++        patches = self
++        group = object()
++        patches._patch_attr(guard.dist, 'is_initialized', lambda : True)
++        local_inputs = [([1.0], [0.5, 1.0, 0.0]), ([0.0, 0.0, 0.0], [0.0, 3.0, 0.0])]
++        for (delta, expected_local) in local_inputs:
++
++            def all_reduce(stats, *, op, group):
++                assert group is sentinel
++                assert op == guard.dist.ReduceOp.SUM
++                assert stats.dtype == torch.float64
++                torch.testing.assert_close(stats, torch.tensor(expected_local, dtype=torch.float64))
++                stats.copy_(torch.tensor([0.5, 4.0, 0.0], dtype=torch.float64))
++            sentinel = group
++            patches._patch_attr(guard.dist, 'all_reduce', all_reduce)
++            state = guard.PPOEarlyStopState(0.2)
++            new = torch.tensor(delta)
++            assert state.observe(new, torch.zeros_like(new), torch.ones_like(new), group) == 0.125
++            assert not state.stop_ppo
++            assert state.token_count == 4
++
++    def test_remote_rank_can_stop_a_rank_with_no_local_action_tokens(self):
++        patches = self
++        for remote_bad in [False, True]:
++            with self.subTest(remote_bad=remote_bad):
++                patches._patch_attr(guard.dist, 'is_initialized', lambda : True)
++
++                def all_reduce(stats, **kwargs):
++                    torch.testing.assert_close(stats, torch.zeros(3, dtype=torch.float64))
++                    stats.copy_(torch.tensor([0.5, 1.0, float(remote_bad)], dtype=torch.float64))
++                patches._patch_attr(guard.dist, 'all_reduce', all_reduce)
++                state = guard.PPOEarlyStopState(0.1)
++                k2 = _observe(state, [math.nan], [0])
++                assert math.isinf(k2) if remote_bad else k2 == 0.5
++                assert state.stop_ppo
++                assert state.nonfinite_tokens == int(remote_bad)
++
++    def test_invalid_threshold_is_rejected(self):
++        for threshold in [-1, math.nan, math.inf]:
++            with self.subTest(threshold=threshold):
++                with self.assertRaisesRegex(ValueError, 'finite and nonnegative'):
++                    guard.validate_ppo_early_stop_args(_args(early_stop_kl=threshold))
++
++    def test_unsupported_schedules_and_losses_are_rejected(self):
++        for overrides in [{'advantage_estimator': 'grpo'}, {'loss_type': 'value_loss'}, {'tensor_model_parallel_size': 2}, {'pipeline_model_parallel_size': 2}, {'context_parallel_size': 2}, {'recompute_loss_function': True}, {'enable_mtp_training': True}, {'use_tis': True}, {'get_mismatch_metrics': True}]:
++            with self.subTest(overrides=overrides):
++                with self.assertRaises(ValueError):
++                    guard.validate_ppo_early_stop_args(_args(**overrides))
++
++    def test_disabled_guard_needs_no_policy_attributes_and_ep_is_supported(self):
++        guard.validate_ppo_early_stop_args(SimpleNamespace(early_stop_kl=0.0))
++        guard.validate_ppo_early_stop_args(_args())
++
++    def test_non_megatron_backend_is_rejected(self):
++        with self.assertRaisesRegex(ValueError, 'Megatron train backend'):
++            guard.validate_ppo_early_stop_args(_args(train_backend='fsdp'))
++
++    def test_zero_loss_keeps_backward_graph_without_reading_nan_or_inf(self):
++        logits = torch.tensor([math.nan, math.inf, -math.inf], requires_grad=True)
++        args = _args(use_kl_loss=True, use_opsm=True)
++        (loss, metrics) = guard.zero_policy_loss(logits, args, {'rollout_log_probs': [torch.zeros(3)], 'opd_reverse_kl': [torch.zeros(3)]})
++        assert loss.requires_grad and loss.item() == 0.0
++        assert all((not x.requires_grad and x.item() == 0.0 for x in metrics.values()))
++        loss.backward()
++        torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
++
++    def test_trigger_discards_previous_gradients_and_adam_state_then_next_window_updates(self):
++        patches = self
++        training = _CPUTraining(patches)
++        training.model.weight.grad = torch.tensor(0.25)
++        training.optimizer.step()
++        training.optimizer.zero_grad()
++        before = copy.deepcopy(training.optimizer.inner.state_dict())
++        weight = training.model.weight.detach().clone()
++        steps = training.optimizer.step_calls
++        (metrics, grad_norm) = training.run([0.01, 2.0, 0.0])
++        assert training.gradients[0].abs().item() > 0
++        torch.testing.assert_close(training.gradients[1], training.gradients[0])
++        torch.testing.assert_close(training.gradients[2], training.gradients[0])
++        torch.testing.assert_close(training.model.weight, weight, rtol=0, atol=0)
++        _assert_same_state(training.optimizer.inner.state_dict(), before)
++        assert training.optimizer.step_calls == steps
++        training.scheduler.step.assert_not_called()
++        assert training.model.weight.grad is None and training.model.main_grad.item() == 0
++        assert training.model.clear_calls == 2
++        assert training.args._ppo_early_stop_state is None
++        assert metrics['early_stop'] == metrics['optimizer_step_skipped'] == 1
++        assert metrics['early_stop_microbatch'] == 2
++        assert metrics['loss'] == metrics['pg_loss'] == grad_norm == 0.0
++        assert training.policy_loss.call_count == 1
++        (metrics, _) = training.run([0.0, 0.0])
++        assert training.states[0] is not training.states[1]
++        assert metrics['early_stop'] == metrics['optimizer_step_skipped'] == 0
++        assert metrics['early_stop_microbatch'] == 0
++        assert training.optimizer.step_calls == steps + 1
++        training.scheduler.step.assert_called_once_with(increment=2)
++        assert training.model.weight.item() != weight.item()
++
++    def test_normal_guarded_update_matches_disabled_production_path(self):
++        patches = self
++        enabled = _CPUTraining(patches)
++        disabled = _CPUTraining(patches, early_stop_kl=0.0)
++        (enabled_metrics, _) = enabled.run([0.02, 0.03])
++        (disabled_metrics, _) = disabled.run([0.02, 0.03])
++        torch.testing.assert_close(enabled.model.weight, disabled.model.weight, rtol=0, atol=0)
++        _assert_same_state(enabled.optimizer.inner.state_dict(), disabled.optimizer.inner.state_dict())
++        assert enabled_metrics['early_stop'] == 0
++        assert enabled_metrics['loss'] == disabled_metrics['loss']
++        enabled.scheduler.step.assert_called_once_with(increment=2)
++        assert disabled.states == [None]
++
++    def test_critic_updates_without_creating_actor_guard(self):
++        patches = self
++        training = _CPUTraining(patches, loss_type='value_loss', early_stop_kl=1e-12)
++        initial = training.model.weight.item()
++        (metrics, _) = training.run([1000.0, 1000.0])
++        assert training.states == [None]
++        assert training.optimizer.step_calls == 1
++        assert training.model.weight.item() != initial
++        assert 'early_stop' not in metrics
++        assert metrics['value_loss'] > 0
++        training.scheduler.step.assert_called_once_with(increment=2)
++
++    def test_state_is_cleared_when_pipeline_raises(self):
++        patches = self
++        training = _CPUTraining(patches)
++
++        def failing_pipeline(**kwargs):
++            assert training.args._ppo_early_stop_state is not None
++            raise RuntimeError('pipeline failure')
++        training.pipeline = failing_pipeline
++        with self.assertRaisesRegex(RuntimeError, 'pipeline failure'):
++            training.run([0.0])
++        assert training.args._ppo_early_stop_state is None
++        assert training.optimizer.step_calls == 0
++
++    def test_enabled_guard_rejects_missing_precomputed_old_logprobs(self):
++        training = _CPUTraining(self)
++        for missing in [None, []]:
++            with self.subTest(old_log_probs=missing):
++                batch = training.batch(0.0)
++                batch['log_probs'] = missing
++                training.args._ppo_early_stop_state = guard.PPOEarlyStopState(0.05)
++                with self.assertRaisesRegex(ValueError, 'precomputed old policy logprobs'):
++                    training.ns['policy_loss_function'](
++                        training.args, batch,
++                        torch.tensor([-0.5], requires_grad=True), torch.mean,
++                    )
++        training.policy_loss.assert_not_called()
++
++    def test_actual_policy_guard_precedes_surrogate_and_preserves_metric_keys(self):
++        patches = self
++        for (rollout, reference, opsm, opd) in [(False, False, False, False), (True, False, False, False), (True, True, False, False), (True, True, True, True)]:
++            with self.subTest(rollout=rollout, reference=reference, opsm=opsm, opd=opd):
++                training = _CPUTraining(patches, use_kl_loss=reference, use_opsm=opsm)
++                batch = training.batch(0.0)
++                if not rollout:
++                    del batch['rollout_log_probs']
++                if opd:
++                    batch['opd_reverse_kl'] = [torch.zeros(1)]
++                training.args._ppo_early_stop_state = guard.PPOEarlyStopState(0.05)
++                (_, ordinary) = training.ns['policy_loss_function'](training.args, batch, torch.tensor([-0.5], requires_grad=True), torch.mean)
++                training.policy_loss.side_effect = AssertionError('surrogate evaluated after K2 stop')
++                for new_logprob in [1000.0, math.nan, math.inf]:
++                    logits = torch.tensor([new_logprob], requires_grad=True)
++                    (loss, stopped) = training.ns['policy_loss_function'](
++                        training.args, batch, logits, torch.mean,
++                    )
++                    assert list(stopped) == list(ordinary)
++                    assert loss.item() == 0.0 and torch.isfinite(loss)
++                    loss.backward()
++                    torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
++                assert training.policy_loss.call_count == 1
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_ppo_early_stop_dist.py b/tests/test_ppo_early_stop_dist.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_ppo_early_stop_dist.py
+@@ -0,0 +1,93 @@
++"""CPU/Gloo checks for the actual K2 collective and zero-loss DDP backward."""
++
++import copy
++import os
++import tempfile
++import unittest
++from argparse import Namespace
++from datetime import timedelta
++from pathlib import Path
++
++import torch
++import torch.distributed as dist
++import torch.multiprocessing as mp
++from torch.nn.parallel import DistributedDataParallel
++
++from slime.utils.ppo_early_stop import PPOEarlyStopState, zero_policy_loss
++
++NUM_GPUS = 0
++
++
++def _worker(rank, store):
++    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
++    dist.init_process_group(
++        "gloo", init_method=f"file://{store}", rank=rank, world_size=2,
++        timeout=timedelta(seconds=20),
++    )
++    try:
++        # Unequal token counts: global token mean is .125, not the .25
++        # obtained by incorrectly averaging the two local means.
++        count = 1 if rank == 0 else 3
++        old = torch.zeros(count)
++        mask = torch.ones(count, dtype=torch.bool)
++        state = PPOEarlyStopState(0.13)
++        delta = torch.ones(count) if rank == 0 else torch.zeros(count)
++        assert state.observe(delta, old, mask) == 0.125
++        assert not state.stop_ppo
++
++        # A bad microbatch on just one rank rejects the window on both.
++        delta = torch.full((count,), 2.0) if rank == 1 else torch.zeros(count)
++        assert state.observe(delta, old, mask) == 1.5
++        assert state.stop_ppo and state.first_stopped_microbatch == 2
++        state.observe(old, old, mask)
++        assert state.stop_ppo
++
++        # Local empty masks still enter the collective; masked NaN is ignored.
++        fresh = PPOEarlyStopState(0.13)
++        assert fresh.observe(torch.full_like(old, float("nan")), old, ~mask) == 0
++        assert not fresh.stop_ppo
++        invalid = old.clone()
++        if rank == 0:
++            invalid[0] = float("nan")
++        fresh.observe(invalid, old, mask)
++        assert fresh.stop_ppo and fresh.nonfinite_tokens == 1
++
++        # Exercise DDP gradient collectives, including zero backward after
++        # earlier nonzero accumulation and an already initialized Adam state.
++        model = DistributedDataParallel(torch.nn.Linear(2, 1))
++        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
++        args = Namespace(use_kl_loss=False)
++        model(torch.ones(1, 2)).square().sum().backward()
++        optimizer.step()
++        optimizer.zero_grad(set_to_none=True)
++        parameters = [p.detach().clone() for p in model.parameters()]
++        adam = copy.deepcopy(optimizer.state_dict())
++        window = PPOEarlyStopState(0.1)
++        for microbatch in range(3):
++            logits = model(torch.ones(count, 2))
++            new = logits[:, 0]
++            delta = torch.full_like(new, 2.0) if microbatch == 1 and rank == 1 else torch.zeros_like(new)
++            window.observe(new, new.detach() - delta, mask)
++            loss = zero_policy_loss(logits, args, {})[0] if window.stop_ppo else logits.square().sum()
++            assert loss.requires_grad and torch.isfinite(loss)
++            loss.backward()
++        assert window.stop_ppo
++        optimizer.zero_grad(set_to_none=True)
++        assert all(torch.equal(p, before) for p, before in zip(model.parameters(), parameters))
++        current = optimizer.state_dict()
++        assert current["param_groups"] == adam["param_groups"]
++        for key, values in adam["state"].items():
++            assert all(torch.equal(current["state"][key][name], value) for name, value in values.items())
++        assert all(p.grad is None for p in model.parameters())
++    finally:
++        dist.destroy_process_group()
++
++
++class DistributedPPOEarlyStopTests(unittest.TestCase):
++    def test_two_rank_token_weighting_latch_and_ddp_backward(self):
++        with tempfile.TemporaryDirectory(prefix="slime-k2-gloo-") as directory:
++            mp.spawn(_worker, args=(str(Path(directory) / "store"),), nprocs=2, join=True)
++
++
++if __name__ == "__main__":
++    unittest.main()

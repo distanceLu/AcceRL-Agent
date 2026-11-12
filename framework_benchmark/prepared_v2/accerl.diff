@@ -1,0 +1,1013 @@
+diff --git a/accerl_agent/agent_textworld.py b/accerl_agent/agent_textworld.py
+index ce76283..32c56ac 100644
+--- a/accerl_agent/agent_textworld.py
++++ b/accerl_agent/agent_textworld.py
+@@ -69,6 +69,7 @@ from accerl_agent.rl_data import (
+     TerminationReason,
+     _compute_batched_token_gae_unchecked,
+     classify_textworld_termination_reason,
++    freeze_rollout_ppo_targets,
+     textworld_ppo_boundary_is_terminal,
+ )
+ 
+@@ -176,6 +177,7 @@ class PreparedVarlenPack:
+     version_lag_sum: float
+     sample_count: int
+     valid_trajectory_count: int = 0
++    telemetry_samples: tuple = ()
+ 
+ 
+ @dataclass(frozen=True)
+@@ -655,7 +657,7 @@ def _make_ppo_varlen_batch_unchecked(
+     ]
+     # Derived packing metadata below is Trainer-local and is never persisted
+     # in Replay.
+-    return {
++    batch = {
+         "input_ids": torch.tensor([input_ids], dtype=torch.long),
+         "position_ids": torch.tensor([position_ids], dtype=torch.long),
+         "cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32),
+@@ -702,6 +704,15 @@ def _make_ppo_varlen_batch_unchecked(
+             dtype=torch.long,
+         ),
+     }
++    if any(example.raw_advantages is not None for example in examples):
++        if any(example.raw_advantages is None for example in examples):
++            raise ValueError("Cannot mix JIT and rollout GAE samples in one pack.")
++        for name in ("raw_advantages", "returns"):
++            batch[name] = torch.tensor(
++                [value for example in examples for value in getattr(example, name)],
++                dtype=torch.float32,
++            )
++    return batch
+ 
+ 
+ def select_varlen_pack(
+@@ -1060,6 +1071,10 @@ class FSDPTrainWorker:
+         self.rank = rank
+         self.fsdp_world_size = fsdp_world_size
+         self.replay_buffer = replay_buffer
++        self.research = None
++        if getattr(args, "research_config", None):
++            from testForAcceRL.live import recorder_for
++            self.research = recorder_for(args, "trainer", rank)
+         self.weight_sync_packed_buffer_bytes = (
+             args.weight_sync_packed_buffer_bytes
+         )
+@@ -1614,6 +1629,10 @@ class FSDPTrainWorker:
+         )
+         if not algorithm_matches or len(sample.input_ids) > self.args.max_length:
+             return None
++        if isinstance(sample, RawPPOSample):
++            rollout_gae = getattr(self.args, "ppo_gae_mode", "jit") == "rollout"
++            if (sample.raw_advantages is not None) != rollout_gae:
++                raise ValueError("Replay PPO targets do not match --ppo-gae-mode.")
+         return sample
+ 
+     def _collate_prepared_rl_samples(
+@@ -1677,6 +1696,7 @@ class FSDPTrainWorker:
+     ) -> PreparedVarlenPack:
+         """Prepare one Varlen pack without moving any tensor to the GPU."""
+         replay_stats = self.get_replay_stats()
++        research_wait_start = time.monotonic_ns()
+         warmup_deadline = None
+         if self.args.replay_sample_timeout_seconds > 0:
+             warmup_deadline = time.monotonic() + self.args.replay_sample_timeout_seconds
+@@ -1691,16 +1711,25 @@ class FSDPTrainWorker:
+             time.sleep(self.args.replay_wait_sleep_seconds)
+             replay_stats = self.get_replay_stats()
+ 
++        if self.research is not None:
++            self.research.emit("trainer_data_wait", phase="warmup", seconds=(time.monotonic_ns() - research_wait_start) / 1e9)
+         candidate_target = self.args.train_pack_candidate_pool_size
+         deadline = None
+         if self.args.replay_sample_timeout_seconds > 0:
+             deadline = time.monotonic() + self.args.replay_sample_timeout_seconds
+ 
+         while not self.pending_prepared_samples:
++            research_fetch_start = time.monotonic_ns()
+             sampled = ray.get(self.replay_buffer.sample.remote(candidate_target))
++            if self.research is not None:
++                self.research.emit("trainer_data_wait", phase="sample_rpc", seconds=(time.monotonic_ns() - research_fetch_start) / 1e9)
+             replay_stats = self.get_replay_stats()
+             for sample in sampled:
+                 prepared_sample = self._prepare_rl_sample(sample)
++                if self.research is not None:
++                    self.research.emit("trainer_sample_prepared", sample_id=sample.telemetry_id,
++                        response_tokens=sum(end - start for start, end in sample.response_spans),
++                        accepted=prepared_sample is not None)
+                 if prepared_sample is None:
+                     continue
+                 self.pending_prepared_samples.append(prepared_sample)
+@@ -1713,6 +1742,8 @@ class FSDPTrainWorker:
+                     f"stats={replay_stats}"
+                 )
+             time.sleep(self.args.replay_wait_sleep_seconds)
++            if self.research is not None:
++                self.research.emit("trainer_data_wait", phase="empty_replay_sleep", seconds=self.args.replay_wait_sleep_seconds)
+ 
+         collected = self._select_varlen_pack()
+         batch = self._collate_prepared_rl_samples(
+@@ -1737,6 +1768,9 @@ class FSDPTrainWorker:
+             version_lag_sum=version_lag_sum,
+             sample_count=sample_count,
+             valid_trajectory_count=valid_trajectory_count,
++            telemetry_samples=tuple((sample.telemetry_id, sample.created_monotonic_ns,
++                                     sum(end - start for start, end in sample.response_spans)) for sample in collected)
++                              if self.research is not None else (),
+         )
+ 
+     def _compute_rl_loss(
+@@ -2399,6 +2433,27 @@ class FSDPTrainWorker:
+         )
+         self._validate_ppo_flat_token_view(view)
+         self._validate_ppo_boundary_layout(view)
++        if getattr(self.args, "ppo_gae_mode", "jit") == "rollout":
++            for name in ("raw_advantages", "returns"):
++                target = batch.get(name)
++                if target is None or target.shape != zeros.shape or not torch.isfinite(target).all():
++                    raise ValueError(f"Rollout PPO pack requires finite response-aligned {name}.")
++
++    def _rollout_ppo_optimizer_window_moments(
++        self, window: List[PreparedVarlenPack], *, global_valid_token_count: int,
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        """Read frozen replay advantages; no model prepass or historical EMA."""
++        local_moments = torch.zeros(3, dtype=torch.float64)
++        for prepared in window:
++            advantages = prepared.batch["raw_advantages"].double()
++            local_moments[0] += advantages.sum()
++            local_moments[1] += advantages.square().sum()
++            local_moments[2] += advantages.numel()
++        moments = local_moments.to(self.device)
++        dist.all_reduce(moments, op=dist.ReduceOp.SUM, group=self.loss_pg)
++        return self._finalize_ppo_advantage_moments(
++            moments, expected_count=global_valid_token_count,
++        )
+ 
+     def _snapshot_ppo_forward_buffers(self) -> Dict[str, torch.Tensor]:
+         if self.value_head is None:
+@@ -2588,6 +2643,9 @@ class FSDPTrainWorker:
+                 "optimizer window; see per-rank logs for the original error."
+             )
+         assert window is not None
++        if self.research is not None:
++            self.research.emit("training_window_ready", optimizer_step=self.optimizer_step + 1,
++                               samples=[item for pack in window for item in pack.telemetry_samples])
+         return window
+ 
+     def _reduce_varlen_window_counts(
+@@ -2643,10 +2701,13 @@ class FSDPTrainWorker:
+                 "trajectories."
+             )
+ 
++        rollout_gae = getattr(self.args, "ppo_gae_mode", "jit") == "rollout"
+         normalization_mode = self.args.ppo_advantage_normalization
+         ema_mode = normalization_mode in ("ema_rms", "ema_zscore")
+-        ema_mean = self.ppo_adv_ema_mean
+-        ema_variance = self.ppo_adv_ema_variance
++        if rollout_gae and normalization_mode != "optimizer_window":
++            raise ValueError("Rollout GAE requires optimizer_window normalization.")
++        ema_mean = None if rollout_gae else self.ppo_adv_ema_mean
++        ema_variance = None if rollout_gae else self.ppo_adv_ema_variance
+         if (ema_mean is None) != (ema_variance is None):
+             raise RuntimeError(
+                 "PPO advantage EMA mean and variance must be initialized "
+@@ -2679,7 +2740,11 @@ class FSDPTrainWorker:
+         frozen_window = None
+         advantage_mean = None
+         advantage_std = None
+-        if use_optimizer_window:
++        if rollout_gae:
++            advantage_mean, advantage_std = self._rollout_ppo_optimizer_window_moments(
++                window, global_valid_token_count=global_valid_token_count,
++            )
++        elif use_optimizer_window:
+             (
+                 frozen_window,
+                 advantage_mean,
+@@ -2697,26 +2762,29 @@ class FSDPTrainWorker:
+         )
+         for pack_index, prepared in enumerate(window):
+             batch = move_batch_to_device(prepared.batch, self.device)
+-            if frozen_window is not None:
+-                frozen = frozen_window[pack_index]
+-                self._restore_ppo_rng_state(
+-                    self.device,
+-                    frozen.cpu_rng_state,
+-                    frozen.cuda_rng_state,
+-                )
++            if rollout_gae or frozen_window is not None:
++                if frozen_window is not None:
++                    frozen = frozen_window[pack_index]
++                    self._restore_ppo_rng_state(
++                        self.device,
++                        frozen.cpu_rng_state,
++                        frozen.cuda_rng_state,
++                    )
+                 view = self._forward_ppo_token_view(
+                     batch,
+                     max_seqlen=prepared.max_seqlen,
+                 )
+-                self._validate_frozen_ppo_targets(view, frozen)
+-                raw_advantages = frozen.raw_advantages.to(
+-                    device=self.device,
+-                    dtype=torch.float32,
+-                )
+-                returns = frozen.returns.to(
+-                    device=self.device,
+-                    dtype=torch.float32,
+-                )
++                if rollout_gae:
++                    raw_advantages = batch["raw_advantages"]
++                    returns = batch["returns"]
++                else:
++                    self._validate_frozen_ppo_targets(view, frozen)
++                    raw_advantages = frozen.raw_advantages.to(
++                        device=self.device, dtype=torch.float32,
++                    )
++                    returns = frozen.returns.to(
++                        device=self.device, dtype=torch.float32,
++                    )
+                 assert advantage_mean is not None
+                 assert advantage_std is not None
+                 actor_advantages = self._normalize_ppo_advantages(
+@@ -2752,8 +2820,10 @@ class FSDPTrainWorker:
+             local_version_stats[1] += prepared.sample_count
+             self.train_micro_step += 1
+             del batch, trajectory_loss_sum, reduction_stats, backward_loss
+-            if frozen_window is not None:
+-                del view, raw_advantages, actor_advantages, returns, frozen
++            if rollout_gae or frozen_window is not None:
++                del view, raw_advantages, actor_advantages, returns
++                if frozen_window is not None:
++                    del frozen
+ 
+         dist.all_reduce(
+             local_reduction_stats,
+@@ -2833,6 +2903,11 @@ class FSDPTrainWorker:
+ 
+         ep_metrics = self._reduce_ep_dispatch_metrics()
+         current_lr = self._finalize_optimizer_step()
++        if self.research is not None:
++            self.research.emit("optimizer_committed", optimizer_step=self.optimizer_step,
++                               response_tokens=sum(pack.valid_token_count for pack in window),
++                               trajectories=sum(pack.valid_trajectory_count for pack in window),
++                               samples=[item for pack in window for item in pack.telemetry_samples])
+         if ema_mode:
+             assert candidate_ema_mean is not None
+             assert candidate_ema_variance is not None
+@@ -2997,9 +3072,11 @@ class FSDPTrainWorker:
+         if num_optimizer_steps < 1:
+             raise ValueError("num_optimizer_steps must be >= 1")
+         start_optimizer_step = self.optimizer_step
++        stop_after_steps = getattr(self.args, "stop_after_steps", 0)
+         target_optimizer_step = min(
+             self.optimizer_step + num_optimizer_steps,
+             self.args.max_steps,
++            stop_after_steps if stop_after_steps > 0 else self.args.max_steps,
+         )
+         global_steps = []
+         aggregate_ppo_stats = {
+@@ -3017,6 +3094,12 @@ class FSDPTrainWorker:
+                 for name, value in step_stats["global_ppo_stats"].items():
+                     aggregate_ppo_stats[name] += value
+             global_steps.append(step_stats)
++            if self.rank == 0 and os.environ.get("TW_EVENT_DIR"):
++                from framework_benchmark.events import emit
++                emit({"kind": "optimizer_commit", "episode_id": "optimizer",
++                      "optimizer_step": self.optimizer_step,
++                      "response_token_uses": int(step_stats["global_valid_token_count"]),
++                      "metrics": step_stats})
+             if (
+                 self.rank == 0
+                 and self.optimizer_step % self.args.log_every == 0
+@@ -3068,6 +3151,9 @@ class FSDPTrainWorker:
+             "optimizer_steps_run": self.optimizer_step - start_optimizer_step,
+             "optimizer_step": self.optimizer_step,
+             "reached_max_steps": self.optimizer_step >= self.args.max_steps,
++            "reached_stop_after_steps": (
++                stop_after_steps > 0 and self.optimizer_step >= stop_after_steps
++            ),
+             "segment_valid_tokens": valid_tokens,
+             "segment_version_lag_mean": (
+                 version_lag_sum / sample_count if sample_count else 0.0
+@@ -3363,8 +3449,21 @@ class FSDPTrainWorker:
+             for _, param in self.policy_params:
+                 full_param = param.full_tensor()
+                 del full_param
++        critic_snapshot = None
++        if getattr(self.args, "ppo_gae_mode", "jit") == "rollout":
++            # Same stopped optimizer step as the policy broadcast above.
++            # Keep the small FP32 head out of the policy loader/NCCL payload.
++            state = {}
++            for name, param in self.value_head_params:
++                full_param = param.full_tensor()
++                if self.rank == 0:
++                    state[name] = full_param.detach().float().cpu().tolist()
++                del full_param
++            if self.rank == 0:
++                critic_snapshot = {"state": state, "version": self.optimizer_step}
+         torch.cuda.synchronize()
+         torch.cuda.empty_cache()
++        return critic_snapshot
+ 
+     def save_checkpoint(self, checkpoint_dir: str, tag: str) -> Dict[str, Any]:
+         """
+@@ -3440,6 +3539,7 @@ class FSDPTrainWorker:
+                 "train_ep_size": self.args.train_ep_size,
+                 "rl_algorithm": self.args.rl_algorithm,
+                 "max_steps": self.args.max_steps,
++                "stop_after_steps": getattr(self.args, "stop_after_steps", 0),
+                 "sync_every_optimizer_steps": self.args.sync_every_optimizer_steps,
+                 "checkpoint_kind": "fp32_model_weights",
+                 "policy_storage_dtype": "float32",
+@@ -3693,6 +3793,7 @@ class InterruptibleGenerationRunner:
+         self.resume_event.set()
+         self._active_attempts = 0
+         self._active_changed = asyncio.Condition()
++        self.research_observer = None
+ 
+     def pause(self) -> None:
+         self.resume_event.clear()
+@@ -3729,7 +3830,7 @@ class InterruptibleGenerationRunner:
+ 
+             attempt_version = self.version
+             sampling_kwargs = {
+-                "temperature": self.temperature,
++                "temperature": getattr(state, "sampling_temperature", self.temperature),
+                 "top_p": self.top_p,
+                 "max_tokens": remaining,
+                 "stop": self.stop_sequences,
+@@ -3746,14 +3847,19 @@ class InterruptibleGenerationRunner:
+             attempt_prompt_token_ids = state.restart_prompt_token_ids
+ 
+             await self._increment_active_attempts()
++            if self.research_observer is not None:
++                self.research_observer.attempt_start(state, request_id)
+             try:
+                 # 调用vllm生成接口，拿到输出后更新state，如果生成过程中被weight update打断了，engine.generate()会抛出异常，直接进入finally块结束这个attempt
+                 async for request_output in self.engine.generate(
+-                    {"prompt_token_ids": attempt_prompt_token_ids},
++                    {"prompt_token_ids": attempt_prompt_token_ids,
++                     **({"cache_salt": state.research_cache_salt} if hasattr(state, "research_cache_salt") else {})},
+                     sampling_params,
+                     request_id=request_id,
+                 ):
+                     final_output = request_output
++                    if self.research_observer is not None:
++                        self.research_observer.stream(state, request_id, request_output)
+                     request_finished = bool(
+                         getattr(request_output, "finished", False)
+                     )
+@@ -3787,6 +3893,8 @@ class InterruptibleGenerationRunner:
+                 state.output_tokens.extend(attempt_tokens)
+                 state.output_logprobs.extend(attempt_logprobs)
+                 state.output_versions.extend(
++                    self.research_observer.versions(request_id, attempt_tokens)
++                    if self.research_observer is not None else
+                     [attempt_version] * len(attempt_tokens)
+                 )
+ 
+@@ -3846,7 +3954,22 @@ class VLLMInferenceActor:
+             weight_transfer_config=WeightTransferConfig(backend="nccl"),
+             load_format="dummy",
+         )
++        self.research = None
++        if getattr(args, "research_config", None):
++            from testForAcceRL.live import LiveInference, engine_kwargs as research_engine_kwargs
++            engine_kwargs.update(research_engine_kwargs(args))
++            self.research = LiveInference(args)
++        if getattr(args, "ppo_gae_mode", "jit") == "rollout":
++            engine_kwargs["worker_extension_cls"] = (
++                "accerl_agent.rollout_critic_research.ResearchRolloutCriticWorker"
++                if self.research is not None
++                else "accerl_agent.rollout_critic.RolloutCriticWorkerExtension"
++            )
+         self.engine = create_async_engine(**engine_kwargs)
++        self.rollout_critic = None
++        if getattr(args, "ppo_gae_mode", "jit") == "rollout":
++            from accerl_agent.rollout_critic import RolloutCriticClient
++            self.rollout_critic = RolloutCriticClient(self.engine)
+         self.runner = InterruptibleGenerationRunner(
+             self.engine,
+             temperature=args.infer_temperature,
+@@ -3854,6 +3977,8 @@ class VLLMInferenceActor:
+             stop_sequences=["\n"],
+             collect_logprobs=True,
+         )
++        if self.research is not None:
++            self.runner.research_observer = self.research
+         self.active_generation_tasks = set()
+         self.total_tokens = 0
+         self.interval_request_count = 0
+@@ -3869,9 +3994,12 @@ class VLLMInferenceActor:
+         self,
+         input_ids: List[int],
+         infer_max_tokens: int,
++        context: dict | None = None,
+     ) -> InferenceResult:
+         if self.stopped:
+             raise RuntimeError("VLLMInferenceActor is stopped.")
++        if self.research is not None:
++            await self.research.accept.wait()
+         request_index = self.next_request_index
+         self.next_request_index += 1
+         state = OnlineGenerationState(
+@@ -3879,6 +4007,13 @@ class VLLMInferenceActor:
+             input_ids=list(input_ids),
+             requested_max_tokens=int(infer_max_tokens),
+         )
++        if self.research is not None:
++            if (context or {}).get("evaluation"):
++                state.sampling_temperature = 0.0
++                # Separate evaluation cache namespace: retained training KV
++                # from B must not contaminate a fresh-current-policy score.
++                state.research_cache_salt = f"independent-evaluation-v{self.runner.version}"
++            self.research.begin(state, context)
+         return await self._run_generation(state)
+ 
+     async def _run_generation(
+@@ -3902,6 +4037,8 @@ class VLLMInferenceActor:
+             output_versions=list(completed_state.output_versions),
+             stop_reason=completed_state.stop_reason,
+         )
++        if self.research is not None:
++            self.research.complete(completed_state)
+         if len(result.output_logprobs) != len(result.output_tokens):
+             raise RuntimeError(
+                 "Inference output token/logprob lengths differ: "
+@@ -3940,6 +4077,11 @@ class VLLMInferenceActor:
+         }
+ 
+     async def pause_and_wait_idle(self) -> None:
++        if self.rollout_critic is not None:
++            await self.rollout_critic.pause()
++        if self.research is not None and self.research.initialized:
++            await self.research.pause(self)
++            return
+         self.runner.pause()
+         await self.engine.pause_generation(mode="abort", clear_cache=True)
+         await self.runner.wait_for_idle()
+@@ -3947,10 +4089,27 @@ class VLLMInferenceActor:
+     async def resume_generation(self, increment_version: bool = False):
+         if increment_version:
+             self.runner.version += 1
++        if self.research is not None:
++            if not self.research.initialized:
++                await self.engine.collective_rpc("research_initialize")
++                self.research.initialized = True
++            await self.research.resume(self)
+         await self.engine.resume_generation()
+         self.runner.resume()
++        if self.rollout_critic is not None:
++            self.rollout_critic.resume()
+         return self.runner.version
+ 
++    async def request_rollout_values(self, transcripts: List[List[int]]):
++        if self.rollout_critic is None:
++            raise RuntimeError("Rollout value inference requires --ppo-gae-mode rollout.")
++        return await self.rollout_critic.score(transcripts)
++
++    async def update_rollout_critic(self, snapshot):
++        if self.rollout_critic is None:
++            raise RuntimeError("Unexpected critic snapshot in JIT GAE mode.")
++        await self.rollout_critic.load(snapshot["state"], snapshot["version"])
++
+     async def init_weight_transfer_engine(
+         self,
+         master_address: str,
+@@ -4005,12 +4164,16 @@ class VLLMInferenceActor:
+ 
+     async def shutdown(self):
+         self.stopped = True
++        if self.rollout_critic is not None:
++            self.rollout_critic.close()
+         self.runner.resume()
+         for task in list(self.active_generation_tasks):
+             if not task.done():
+                 task.cancel()
+         if self.active_generation_tasks:
+             await asyncio.gather(*self.active_generation_tasks, return_exceptions=True)
++        if self.research is not None and self.research.initialized:
++            await self.engine.collective_rpc("research_snapshot")
+         await shutdown_vllm_engine(self.engine)
+         return self.get_stats()
+ 
+@@ -4036,6 +4199,7 @@ class TextWorldTrajectoryState:
+     won: bool = False
+     lost: bool = False
+     termination_reason: TerminationReason | None = None
++    telemetry_id: str = ""
+ 
+ 
+ @dataclass
+@@ -4048,6 +4212,13 @@ class TextWorldPendingRequest:
+ 
+ 
+ def load_textworld_game_files(args: argparse.Namespace) -> List[str]:
++    manifest_path = getattr(args, "tw_game_manifest", None)
++    if manifest_path:
++        from framework_benchmark.prepare import verify_manifest
++        with open(manifest_path) as stream:
++            manifest = json.load(stream)
++        verify_manifest(manifest)
++        return [row["path"] for row in manifest["splits"]["train"]]
+     pattern = os.path.join(args.tw_game_dir, args.tw_game_pattern)
+     game_files = sorted(glob.glob(pattern))
+     game_files = [path for path in game_files if os.path.isfile(path)]
+@@ -4243,6 +4414,10 @@ class TextWorldRolloutWorkerActor:
+         self.worker_id = int(worker_id)
+         self.replay_buffer = replay_buffer
+         self.stats_actor = stats_actor
++        self.research = None
++        if getattr(args, "research_config", None):
++            from testForAcceRL.live import recorder_for
++            self.research = recorder_for(args, "evaluation" if worker_id < 0 else "rollout", worker_id)
+         wait_for_selected_ray_actor_debugger("rollout", self.worker_id)
+         self.tokenizer = build_tokenizer(args, log=False)
+         self.game_files = load_textworld_game_files(args)
+@@ -4352,6 +4527,10 @@ class TextWorldRolloutWorkerActor:
+             selected_action = parsed_action.action
+             obs, step_score, done, infos = state.env.step(selected_action)
+             state.environment_steps += 1
++            if os.environ.get("TW_EVENT_DIR"):
++                from framework_benchmark.events import emit
++                emit({"kind": "env_step", "episode_id": state.telemetry_id,
++                      "attempt": len(state.step_records), "evaluation": self.worker_id < 0})
+             state.obs = obs
+             state.infos = dict(infos)
+             state.latest_score = _textworld_score(step_score, infos)
+@@ -4439,6 +4618,10 @@ class TextWorldRolloutWorkerActor:
+                 self.infer_actor.request_generation.remote(
+                     list(input_ids),
+                     infer_max_tokens,
++                    **({"context": {"episode_id": state.telemetry_id,
++                                     "environment_step": len(state.step_records),
++                                     "evaluation": self.worker_id < 0}}
++                       if self.research is not None else {}),
+                 )
+             )
+             # 当前 TextWorld step 中“已经提交推理、但结果尚未返回”的请求上下文列表。
+@@ -4654,6 +4837,7 @@ class TextWorldRolloutWorkerActor:
+                         transcript_ids=transcript_ids,
+                         won=bool(infos.get("won", False)),
+                         lost=bool(infos.get("lost", False)),
++                        telemetry_id=(str(uuid.uuid4()) if self.research is not None or os.environ.get("TW_EVENT_DIR") else ""),
+                     )
+                 )
+ 
+@@ -4683,12 +4867,33 @@ class TextWorldRolloutWorkerActor:
+                         state=state,
+                         algorithm="ppo",
+                     )
++                    if os.environ.get("TW_EVENT_DIR"):
++                        from framework_benchmark.events import accerl_episode
++                        accerl_episode(state, sample)
++                    if self.research is not None:
++                        from testForAcceRL.live import attach_sample
++                        sample = attach_sample(self.research, state, sample)
+                     if sample is not None:
+                         samples.append(sample)
+             else:
+                 samples = self._build_valid_grpo_group_samples(states)
+ 
+             if samples:
++                if algorithm == "ppo" and getattr(self.args, "ppo_gae_mode", "jit") == "rollout":
++                    snapshot = await self.infer_actor.request_rollout_values.remote(
++                        [list(sample.input_ids) for sample in samples]
++                    )
++                    if len(snapshot["token_values"]) != len(samples):
++                        raise RuntimeError("Rollout critic returned the wrong number of trajectories.")
++                    samples = [
++                        freeze_rollout_ppo_targets(
++                            sample, values,
++                            value_version=snapshot["value_version"],
++                            gamma=self.args.gae_gamma,
++                            gae_lambda=self.args.gae_lambda,
++                        )
++                        for sample, values in zip(samples, snapshot["token_values"])
++                    ]
+                 self.replay_buffer.add_samples.remote(samples)
+ 
+             max_score = _textworld_max_score(states[0].infos) if states else 0.0
+@@ -4726,6 +4931,35 @@ class TextWorldRolloutWorkerActor:
+         )
+         return {"episodes": episode_index}
+ 
++    async def evaluate_fixed_games(self, optimizer_step: int) -> Dict:
++        results = []
++        for game_file in self.game_files:
++            env = textworld.gym.make(self.game_env_ids[game_file])
++            try:
++                if hasattr(env, "seed"):
++                    env.seed(self.args.seed)
++                obs, infos = env.reset()
++                state = TextWorldTrajectoryState(env=env, obs=obs, infos=dict(infos),
++                    latest_score=_textworld_score(0, infos), transcript_ids=self._initial_transcript_ids(obs, infos),
++                    telemetry_id="eval-" + str(uuid.uuid4()))
++                for _ in range(self.args.tw_max_episode_steps):
++                    if not await self._run_textworld_step_batch([state]):
++                        break
++                results.append({"game": game_file, "won": bool(state.won),
++                                "score": state.latest_score, "max_score": _textworld_max_score(state.infos),
++                                "steps": len(state.step_records), "invalid_actions": state.invalid_actions})
++            finally:
++                env.close()
++        denominator = sum(row["max_score"] for row in results)
++        metrics = {"optimizer_step": optimizer_step, "independent_eval": True, "temperature": 0.0,
++                   "win_rate": sum(row["won"] for row in results) / len(results),
++                   "normalized_score": sum(row["score"] for row in results) / denominator if denominator > 0 else 0.0,
++                   "normalized_score_macro": sum(row["score"] / row["max_score"] if row["max_score"] > 0 else 0.0 for row in results) / len(results),
++                   "score_aggregation": "sum(score)/sum(max_score), consistent with training statistics; macro also reported",
++                   "games": results}
++        self.research.emit("evaluation", **metrics)
++        return metrics
++
+ 
+ def summarize_weight_payload(dtype_names: List[str], shapes: List[List[int]]) -> float:
+     total_weight_bytes = sum(
+@@ -4794,6 +5028,13 @@ async def sync_weights_to_vllm(
+             num_returns=1,
+         )
+         ray.get(ready_handles[0])
++    critic_snapshot = ray.get(broadcast_handles[0])
++    if critic_snapshot is not None:
++        ray.get(infer_actor.update_rollout_critic.remote(critic_snapshot))
++        print(
++            "[sync] rollout critic snapshot synchronized: "
++            f"optimizer_step={critic_snapshot['version']} (FP32 Value Head)"
++        )
+     ray.get(infer_actor.finish_weight_update.remote())
+     elapsed = time.perf_counter() - t0
+     print(
+@@ -4926,6 +5167,7 @@ async def run_textworld_train(args: argparse.Namespace):
+         f"grpo_group_size={args.grpo_group_size} "
+         f"gae_gamma={args.gae_gamma} "
+         f"gae_lambda={args.gae_lambda} "
++        f"ppo_gae_mode={args.ppo_gae_mode} "
+         f"value_loss_coef={args.value_loss_coef} "
+         "ppo_advantage_normalization="
+         f"{args.ppo_advantage_normalization} "
+@@ -4942,6 +5184,8 @@ async def run_textworld_train(args: argparse.Namespace):
+     infer_actor = None
+     rollout_workers = []
+     rollout_refs = []
++    research_eval_worker = None
++    research_config = None
+     try:
+         # Use local/shared model weights directly.
+         print(f"[init] Loading local model from {args.model_path}")
+@@ -5057,6 +5301,17 @@ async def run_textworld_train(args: argparse.Namespace):
+         ray.get(infer_actor.resume_generation.remote(increment_version=False))
+         print("[sync] Initial full sync complete; generation can start.")
+ 
++        if getattr(args, "research_config", None):
++            from testForAcceRL.telemetry import load_config
++            research_config = load_config(args.research_config)
++            eval_args = argparse.Namespace(**vars(args))
++            # A training manifest must never override the independent evaluation directory.
++            eval_args.tw_game_manifest = None
++            eval_args.tw_game_dir = research_config["eval_game_dir"]
++            eval_args.tw_game_limit = research_config.get("eval_games", 4)
++            research_eval_worker = remote_rollout_worker.remote(eval_args, infer_actor, -1, None, None)
++            ray.get(research_eval_worker.evaluate_fixed_games.remote(0))
++
+         rollout_workers = [
+             remote_rollout_worker.remote(
+                 args,
+@@ -5078,6 +5333,7 @@ async def run_textworld_train(args: argparse.Namespace):
+             f"grpo_group_size={args.grpo_group_size} "
+             f"gae_gamma={args.gae_gamma} "
+             f"gae_lambda={args.gae_lambda} "
++            f"ppo_gae_mode={args.ppo_gae_mode} "
+             f"value_loss_coef={args.value_loss_coef} "
+             "ppo_advantage_normalization="
+             f"{args.ppo_advantage_normalization} "
+@@ -5130,8 +5386,26 @@ async def run_textworld_train(args: argparse.Namespace):
+             ])
+             check_rollout_workers()
+             rank0_summary = next(item for item in summaries if item["rank"] == 0)
+-            training_reached_max = bool(rank0_summary["reached_max_steps"])
++            training_reached_max = bool(
++                rank0_summary["reached_max_steps"]
++                or rank0_summary["reached_stop_after_steps"]
++            )
+             latest_optimizer_step = int(rank0_summary["optimizer_step"])
++            if rank0_summary["reached_stop_after_steps"]:
++                print(
++                    "[train] --stop-after-steps reached: "
++                    f"optimizer_step={latest_optimizer_step}; "
++                    f"learning-rate schedule max_steps={args.max_steps}."
++                )
++            if research_config is not None:
++                elapsed = (time.monotonic_ns() - research_config["start_ns"]) / 1e9
++                wall_limit = research_config.get("max_wall_seconds")
++                gpu_limit = research_config.get("max_gpu_hours")
++                if ((wall_limit is not None and elapsed >= wall_limit) or
++                    (gpu_limit is not None and elapsed * len(research_config["gpus"]) / 3600 >= gpu_limit)):
++                    # Stop at a collective optimizer boundary, then publish and
++                    # independently evaluate the final policy before cleanup.
++                    training_reached_max = True
+             if rank0_summary["optimizer_steps_run"] <= 0:
+                 print("[train] No optimizer steps left; stopping sync loop.")
+                 break
+@@ -5183,6 +5457,9 @@ async def run_textworld_train(args: argparse.Namespace):
+                 rank0_summary["segment_kl_trajectory_mean"]
+             )
+             clip_fraction = float(rank0_summary["segment_clip_frac"])
++            if research_config is not None:
++                from testForAcceRL.telemetry import Recorder
++                Recorder(research_config, "driver").publish_control(trainer_behavior_kl_proxy=kl_token_mean)
+             version_lag_mean = float(
+                 rank0_summary["segment_version_lag_mean"]
+             )
+@@ -5369,6 +5646,10 @@ async def run_textworld_train(args: argparse.Namespace):
+             next_version = ray.get(
+                 infer_actor.resume_generation.remote(increment_version=True)
+             )
++            if research_eval_worker is not None and (
++                latest_optimizer_step % research_config.get("eval_every_steps", 5) == 0 or training_reached_max
++            ):
++                ray.get(research_eval_worker.evaluate_fixed_games.remote(latest_optimizer_step))
+             print(
+                 f"[sync] Round {sync_rounds}: resumed generation with "
+                 f"weight version {next_version}."
+@@ -5421,6 +5702,8 @@ async def run_textworld_train(args: argparse.Namespace):
+                 ray.get(infer_actor.shutdown.remote())
+             except Exception as exc:
+                 print(f"[cleanup] Ignoring InferActor shutdown error: {exc!r}")
++        if research_eval_worker is not None:
++            ray.kill(research_eval_worker, no_restart=True)
+         if fsdp_workers:
+             try:
+                 ray.get([worker.close.remote() for worker in fsdp_workers])
+@@ -5437,6 +5720,8 @@ def parse_args() -> argparse.Namespace:
+             "NCCL weight-sync demo."
+         )
+     )
++    parser.add_argument("--research-config", default=None, help="Opt-in real experiment telemetry and ABC sync policy JSON.")
++    parser.add_argument("--tw-game-manifest", default=None, help="Frozen benchmark game manifest; overrides training game selection, independently of --seed.")
+     parser.add_argument(
+         "--model-path",
+         required=True,
+@@ -5564,7 +5849,16 @@ def parse_args() -> argparse.Namespace:
+         "--max-steps",
+         type=int,
+         default=5000,
+-        help="Maximum optimizer steps to run before stopping the demo.",
++        help="Maximum optimizer steps and total steps for learning-rate scheduling.",
++    )
++    parser.add_argument(
++        "--stop-after-steps",
++        type=int,
++        default=0,
++        help=(
++            "Stop after this many optimizer updates without changing the "
++            "learning-rate schedule defined by --max-steps. 0 disables early stopping."
++        ),
+     )
+     parser.add_argument("--learning-rate", type=float, default=1e-6)
+     parser.add_argument(
+@@ -5592,6 +5886,16 @@ def parse_args() -> argparse.Namespace:
+         choices=["ppo", "gipo", "sapo"],
+         help="Policy objective clipping mode.",
+     )
++    parser.add_argument(
++        "--ppo-gae-mode",
++        choices=("jit", "rollout"),
++        default="jit",
++        help=(
++            "jit preserves trainer-side GAE. rollout freezes GAE and returns "
++            "before replay using a synchronized critic snapshot, and overrides "
++            "--ppo-advantage-normalization to optimizer_window (no EMA)."
++        ),
++    )
+     parser.add_argument(
+         "--ppo-advantage-normalization",
+         choices=("none", "optimizer_window", "ema_rms", "ema_zscore"),
+@@ -5618,7 +5922,7 @@ def parse_args() -> argparse.Namespace:
+         "--gae-lambda",
+         type=float,
+         default=0.95,
+-        help="Trace parameter for on-the-fly token TD(lambda) targets.",
++        help="Trace parameter for token TD(lambda) targets in either GAE mode.",
+     )
+     parser.add_argument(
+         "--value-loss-coef",
+@@ -5922,6 +6226,13 @@ def parse_args() -> argparse.Namespace:
+         args.grpo_group_size = args.rollout_batch_size
+     if args.vllm_max_model_len is None:
+         args.vllm_max_model_len = args.tw_history_token_window
++    if args.ppo_gae_mode == "rollout":
++        args.ppo_advantage_normalization = "optimizer_window"
++        # Scoring evaluates the whole transcript as a prompt, then generates
++        # one discarded token to obtain the final prefill hidden state.
++        args.vllm_max_model_len = max(
++            args.vllm_max_model_len, args.tw_history_token_window + 1,
++        )
+     if args.log_dir is None:
+         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+         args.log_dir = os.path.join("runs", "TextWorld_FSDP", timestamp)
+@@ -5932,6 +6243,11 @@ def parse_args() -> argparse.Namespace:
+ 
+ def validate_args(args: argparse.Namespace) -> None:
+     pick_dtype(args.dtype)
++    if args.ppo_gae_mode == "rollout":
++        if args.rl_algorithm != "ppo":
++            raise ValueError("--ppo-gae-mode rollout requires --rl-algorithm ppo.")
++        if args.ppo_advantage_normalization != "optimizer_window":
++            raise ValueError("Rollout GAE requires optimizer_window normalization.")
+     if args.tw_game_limit is not None and args.tw_game_limit < 1:
+         raise ValueError("--tw-game-limit must be >= 1 when set")
+     if args.tw_max_episode_steps < 1:
+@@ -5954,6 +6270,8 @@ def validate_args(args: argparse.Namespace) -> None:
+         raise ValueError("--grad-accum-steps must be >= 1")
+     if args.max_steps < 1:
+         raise ValueError("--max-steps must be >= 1")
++    if args.stop_after_steps < 0:
++        raise ValueError("--stop-after-steps must be >= 0")
+     if args.learning_rate < 0:
+         raise ValueError("--learning-rate must be >= 0")
+     if args.lr_warmup_steps < 0:
+diff --git a/accerl_agent/rl_data.py b/accerl_agent/rl_data.py
+index 9b8f1f8..61255b0 100644
+--- a/accerl_agent/rl_data.py
++++ b/accerl_agent/rl_data.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++import math
++from dataclasses import dataclass, replace
+ from typing import List, Literal, Tuple, TypeAlias
+ 
+ import torch
+@@ -62,6 +63,15 @@ class RawPPOSample:
+     # Maximum policy version among this sample's response tokens. Training
+     # only uses the latest behavior version for replay-lag diagnostics.
+     behavior_version: int
++    telemetry_id: str | None = None
++    created_monotonic_ns: int | None = None
++    telemetry_oldest_version: int | None = None
++    # Present together only for rollout GAE; aligned with response tokens.
++    # These targets remain unchanged when the sample is replayed.
++    raw_advantages: Tuple[float, ...] | None = None
++    returns: Tuple[float, ...] | None = None
++    # Optimizer step of the synchronized backbone + Value Head snapshot.
++    value_version: int | None = None
+ 
+     def __post_init__(self) -> None:
+         # Canonical tuples make a validated replay sample deeply immutable;
+@@ -83,6 +93,10 @@ class RawPPOSample:
+                 "response_rewards",
+                 tuple(self.response_rewards),
+             )
++            for name in ("raw_advantages", "returns"):
++                values = getattr(self, name)
++                if values is not None:
++                    object.__setattr__(self, name, tuple(values))
+         except TypeError as exc:
+             raise ValueError(
+                 "PPO replay sequence fields must be iterable."
+@@ -103,6 +117,9 @@ class GRPOSample:
+     # Maximum policy version among this sample's response tokens. It is used
+     # only for replay-lag diagnostics.
+     behavior_version: int
++    telemetry_id: str | None = None
++    created_monotonic_ns: int | None = None
++    telemetry_oldest_version: int | None = None
+ 
+     def __post_init__(self) -> None:
+         try:
+@@ -170,6 +187,16 @@ def validate_raw_ppo_sample(sample: RawPPOSample) -> None:
+                 f"{name} must align with response tokens: "
+                 f"{len(values)} != {response_count}"
+             )
++    frozen_fields = (sample.raw_advantages, sample.returns, sample.value_version)
++    if any(value is not None for value in frozen_fields):
++        if any(value is None for value in frozen_fields):
++            raise ValueError("PPO rollout advantages, returns and value_version are required together.")
++        if type(sample.value_version) is not int or sample.value_version < 0:
++            raise ValueError("PPO value_version must be a non-negative optimizer step.")
++        for name in ("raw_advantages", "returns"):
++            values = getattr(sample, name)
++            if len(values) != response_count or not all(math.isfinite(v) for v in values):
++                raise ValueError(f"PPO {name} must contain one finite value per response token.")
+     if sample.boundary_kind not in {"terminated", "truncated"}:
+         raise ValueError(
+             "PPO boundary_kind must be 'terminated' or 'truncated'."
+@@ -388,3 +415,53 @@ def _compute_batched_token_gae_unchecked(
+         torch.zeros_like(values),
+     )
+     return advantages.detach(), returns.detach(), deltas.detach()
++
++
++def freeze_rollout_ppo_targets(
++    sample: RawPPOSample,
++    token_values: List[float],
++    *,
++    value_version: int,
++    gamma: float,
++    gae_lambda: float,
++) -> RawPPOSample:
++    """Freeze GAE from one completed transcript and one critic snapshot.
++
++    ``token_values[i]`` is V after consuming input_ids[i]. A response token
++    at position p therefore uses V[p - 1], exactly as the trainer does.
++    Observation tokens stay in the context, but not in the GAE timeline.
++    """
++    if sample.raw_advantages is not None:
++        raise ValueError("Rollout PPO targets are already frozen.")
++    if len(token_values) != len(sample.input_ids):
++        raise ValueError("Critic values must align with the complete input transcript.")
++    values = torch.tensor(token_values, dtype=torch.float32)
++    if not torch.isfinite(values).all():
++        raise ValueError("Rollout critic values must be finite.")
++    prediction_indices = [
++        position - 1
++        for start, end in sample.response_spans
++        for position in range(start, end)
++    ]
++    baseline = values[prediction_indices].unsqueeze(0)
++    valid = torch.ones_like(baseline, dtype=torch.bool)
++    terminated = torch.zeros_like(valid)
++    truncated = torch.zeros_like(valid)
++    terminal = sample.boundary_kind == "terminated"
++    (terminated if terminal else truncated)[0, -1] = True
++    advantages, returns, _ = compute_batched_token_gae(
++        rewards=torch.tensor([sample.response_rewards], dtype=torch.float32),
++        baseline_values=baseline,
++        valid_mask=valid,
++        terminated=terminated,
++        truncated=truncated,
++        bootstrap_values=values.new_tensor([0.0]) if terminal else values[-1:],
++        gamma=gamma,
++        gae_lambda=gae_lambda,
++    )
++    return replace(
++        sample,
++        raw_advantages=tuple(advantages[0].tolist()),
++        returns=tuple(returns[0].tolist()),
++        value_version=value_version,
++    )
+diff --git a/accerl_agent/train_textworld_ppo_gipo.sh b/accerl_agent/train_textworld_ppo_gipo.sh
+index dd112a7..21cf3e8 100755
+--- a/accerl_agent/train_textworld_ppo_gipo.sh
++++ b/accerl_agent/train_textworld_ppo_gipo.sh
+@@ -33,33 +33,34 @@ cmd=("$PYTHON_BIN" -m accerl_agent.run_agent_textworld
+   --model-path /mnt/data/lcx4/hf_cache/Qwen1.5-MoE-A2.7B-Chat
+   --tw-game-dir /mnt/data/lcx4/AcceRL/accerl_vllm/data/tw_games/ftwp/games/train
+   --tw-game-pattern '*.z8'
+-  --tw-game-limit 400
+-  --tw-max-episode-steps 40
+-  --tw-history-token-window 4096
++  --tw-game-limit 400                 # 400个不同文件作为训练关卡
++  --tw-max-episode-steps 40           # 每局游戏最多40steps，可以提前结束，每个step包含st, at, rt
++  --tw-history-token-window 4096      # 每局episode累计上下文，包含初始提示，环境观察，历史动作等
+   --tw-win-bonus 1.0
+   --tw-lost-penalty 0.5
+   --tw-invalid-action-penalty 0.1
+-  --max-length 4096
++  --max-length 4096                   # 训练时只接受 input_ids 长度不超过 4096 的样本，超过就过滤，不会自动截成 4096
+   --fsdp-world-size 3
+   --infer-size 1
+   --infer-tp-size 1
+-  --num-rollout-workers 15
+-  --rollout-batch-size 8
+-  --infer-max-tokens 16
++  --num-rollout-workers 15            # 15*8=120 一次可以开120局
++  --rollout-batch-size 8              # 一个rollout worker可以开8局游戏8个episode
++  --infer-max-tokens 16               # 每次回答at最长16个token
+   --infer-temperature 1
+   --infer-top-p 1.0
+-  --vllm-max-model-len 8192
+-  --vllm-max-num-seqs 128
++  --vllm-max-model-len 8192           # 单条推理序列的最大长度，即输入上下文＋本次生成最多 8192 token
++  --vllm-max-num-seqs 128             # vLLM 最多同时调度 128 条序列，一次最多开15*8局
+   --vllm-max-num-batched-tokens 8192
+-  --train-max-sequences-per-pack 2
++  --train-max-sequences-per-pack 2    # pack是实际送入训练的样本，样本即episode，max-length=4096任意两条样本小于8192，两条样本组成一个pack，A3000，B4000，cu_seqlens = [0, 3000, 7000]
+   --train-token-budget 8192
+   --train-pack-candidate-pool-size 2
+-  --grad-accum-steps 32
+-  --replay-capacity 64
++  --grad-accum-steps 32               # 每个训练rank累计32个pack更新一次，即64条episode
++  --replay-capacity 64                # 缓冲区容量，3张卡每张卡一个缓冲区，总共3*64=192条轨迹
+   --min-replay-size-per-rank 32
+   --replay-sample-timeout-seconds 0.0
+   --replay-wait-sleep-seconds 0.2
+-  --max-steps 500000
++  --max-steps 500000                 # 学习率调度仍按500000次优化器更新计算
++  --stop-after-steps 2500            # 提前结束的更新次数；设为0则训练到max-steps
+   --learning-rate 1e-6
+   --lr-warmup-steps 500
+   --weight-decay 0.0
+@@ -83,7 +84,7 @@ cmd=("$PYTHON_BIN" -m accerl_agent.run_agent_textworld
+   "$@"
+ )
+ 
+-# Extra CLI arguments are appended, e.g. --max-steps 2 for a short run.
++# Extra CLI arguments override defaults, e.g. --stop-after-steps 1000 (0 disables it).
+ printf "Project: %s\nGPUs: %s\nLog directory: %s\n" "$PROJECT_ROOT" "$CUDA_VISIBLE_DEVICES" "$LOG_DIR"
+ printf "%q " "${cmd[@]}" > "$LOG_DIR/launch_command.sh"
+ printf "\n" >> "$LOG_DIR/launch_command.sh"

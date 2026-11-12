@@ -1,0 +1,58 @@
+diff --git a/slime/backends/megatron_utils/megatron_to_hf/__init__.py b/slime/backends/megatron_utils/megatron_to_hf/__init__.py
+index 8f687e39..b024eb73 100644
+--- a/slime/backends/megatron_utils/megatron_to_hf/__init__.py
++++ b/slime/backends/megatron_utils/megatron_to_hf/__init__.py
+@@ -46,7 +46,7 @@ def _convert_to_hf_core(args, model_name, name, param):
+         converted_named_tensors = convert_glm4_to_hf(args, name, param)
+     elif "gpt_oss" in model_name or "gpt-oss" in model_name or "gptoss" in model_name:
+         converted_named_tensors = convert_gpt_oss_to_hf(args, name, param)
+-    elif "qwen3moe" in model_name:
++    elif "qwen3moe" in model_name or "qwen2moe" in model_name or "qwen2_moe" in model_name:
+         converted_named_tensors = convert_qwen3moe_to_hf(args, name, param)
+     elif "qwen3next" in model_name:
+         converted_named_tensors = convert_qwen3_next_to_hf(args, name, param)
+diff --git a/slime/ray/rollout.py b/slime/ray/rollout.py
+index d0653522..0dfd8e50 100644
+--- a/slime/ray/rollout.py
++++ b/slime/ray/rollout.py
+@@ -845,6 +845,7 @@ class RolloutManager:
+                 "loss_masks",
+                 "round_number",
+                 "sample_indices",
++                "metadata",
+                 "rollout_ids",
+                 "rollout_mask_sums",
+                 "rollout_log_probs",
+diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
+index 0a79b99d..8a597112 100644
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -1618,7 +1618,7 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
+         # Critic-specific: disable features that only apply to actors.
+         role_args.kl_coef = 0
+         role_args.use_opd = False
+-        role_args.custom_advantage_function_path = None
++        # Task-specific reward placement must also define critic targets.
+         role_args.untie_embeddings_and_output_weights = True
+         if "disable_param_buffers_cpu_backup" not in overrides:
+             role_args.disable_param_buffers_cpu_backup = False
+diff --git a/slime/utils/logging_utils.py b/slime/utils/logging_utils.py
+index 1fc3d94b..6ac02129 100644
+--- a/slime/utils/logging_utils.py
++++ b/slime/utils/logging_utils.py
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ 
+ import wandb
+ 
+@@ -43,6 +44,9 @@ def finish_tracking(args):
+ 
+ # TODO further refactor, e.g. put TensorBoard init to the "init" part
+ def log(args, metrics, step_key: str):
++    if os.environ.get("TW_EVENT_DIR"):
++        from framework_benchmark.events import emit
++        emit({"kind": "training_metrics", "episode_id": "metrics", "step_key": step_key, "metrics": metrics})
+     if args.use_wandb:
+         wandb.log(metrics)
+ 
