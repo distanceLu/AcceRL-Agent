@@ -67,10 +67,11 @@ cmd=("$PYTHON_BIN" -m accerl_agent.run_agent_textworld
   --gipo-sigma 0.3
   --clip-eps 0.1
   --early-stop-kl "${EARLY_STOP_KL:-0.01}"
+  --token-filter-kl-threshold "${TOKEN_FILTER_KL_THRESHOLD:-0.01}"
   --old-new-kl-coef 0.05
   --dtype bfloat16
   --seed 42
-  --metrics-window-size 1000
+  --metrics-window-size 192
   --metrics-active-timeout-seconds 600
   --log-dir "$LOG_DIR"
   --trust-remote-code
@@ -80,6 +81,9 @@ cmd=("$PYTHON_BIN" -m accerl_agent.run_agent_textworld
 
 # Preview without creating output directories, starting Python, or using GPUs.
 # Trailing CLI arguments override earlier defaults.
+# Add --token-level-filter to mask policy terms above TOKEN_FILTER_KL_THRESHOLD; raw differentiable K3 still covers all response tokens.
+# DRY_RUN=1 bash accerl_agent/train_textworld_ppo_gipo_varlenPack.sh --token-level-filter
+# TOKEN_FILTER_KL_THRESHOLD=0.02 bash accerl_agent/train_textworld_ppo_gipo_varlenPack.sh --token-level-filter
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
   printf '%q ' "${cmd[@]}"
   printf '\n'
@@ -95,3 +99,19 @@ printf "Project: %s\nGPUs: %s\nLog directory: %s\n" "$PROJECT_ROOT" "$CUDA_VISIB
 printf "%q " "${cmd[@]}" > "$LOG_DIR/launch_command.sh"
 printf "\n" >> "$LOG_DIR/launch_command.sh"
 "${cmd[@]}" 2>&1 | tee "$LOG_DIR/console.log"
+
+# bash /mnt/data/lcx4/AcceRL-Agent/accerl_agent/train_textworld_ppo_gipo_varlenPack.sh --token-level-filter
+
+# bash /mnt/data/lcx4/AcceRL-Agent/accerl_agent/train_textworld_ppo_gipo_varlenPack.sh --early-stop-kl 0 不启用过滤 batch/token级
+
+# bash /mnt/data/lcx4/AcceRL-Agent/accerl_agent/train_textworld_ppo_gipo_varlenPack.sh \
+#  --token-level-filter \
+#  --token-filter-kl-threshold 0.02
+
+
+
+
+# 11-16 17:17 token kl 0.01 过滤后k3算kl_loss
+# 11-17 11:09 无batch/token 过滤
+# 11-18 10:41 优化rollout策略，减缓震荡
+# 11-19 10:55 过滤前k3，token kl 0.02

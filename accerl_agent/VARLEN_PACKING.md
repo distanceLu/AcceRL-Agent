@@ -66,6 +66,32 @@ JIT GAE 仍使用当前训练模型重新计算价值、优势和 return；EMA �
 而不是保留触发前的部分梯度；被拒绝窗口不增加成功更新计数、不提交 EMA、
 也不发布权重。详见 [K2 KL 窗口保护](EARLY_STOP_KL.md)。
 
+可在脚本末尾添加 `--token-level-filter`，改为逐 token 过滤：
+
+```bash
+bash accerl_agent/train_textworld_ppo_gipo_varlenPack.sh --token-level-filter
+# 将逐 token K2 阈值设为 0.02：
+TOKEN_FILTER_KL_THRESHOLD=0.02 \
+  bash accerl_agent/train_textworld_ppo_gipo_varlenPack.sh --token-level-filter
+# 也可用尾部 CLI 参数覆盖：
+bash accerl_agent/train_textworld_ppo_gipo_varlenPack.sh \
+  --token-level-filter --token-filter-kl-threshold 0.02
+```
+
+该选项默认关闭；启用后优先于整窗口保护，每个 rank 独立屏蔽
+`0.5 * (new_logprob - old_logprob)^2 > token_filter_kl_threshold` 的 Actor
+policy 项，保留原有 loss 分母。`old_new_kl` 项使用过滤前、带梯度的原始
+K3（`expm1(raw_logratio) - raw_logratio`），覆盖全部原始有效 response token。
+阈值由独立参数
+`--token-filter-kl-threshold` 控制，默认 `0.01`；脚本环境变量为
+`TOKEN_FILTER_KL_THRESHOLD`，不随 `EARLY_STOP_KL` 改变。阈值须有限且非负，
+`0` 只保留 logratio 恰为 `0` 的 token；省略 `--token-level-filter` 才关闭
+逐 token 过滤（如需同时关闭窗口保护，再传 `--early-stop-kl 0`）。
+其它 token、此前梯度和后续 pack 继续参与本次更新，
+Critic 仍使用全部有效 token。由于共享优化器，即使 policy token 全部被屏蔽，
+有限的 Critic loss 或原始 K3 正则仍可更新参数；非有限 loss（含原始 K3）、
+模型输出或目标会取消整个联合窗口。
+
 ## 长度预算分别控制什么
 
 | 参数 | 控制范围 |

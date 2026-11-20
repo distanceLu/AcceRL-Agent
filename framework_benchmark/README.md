@@ -73,13 +73,49 @@ artifacts/conversion_weight_audit/weight_parity.json记录4,659个张量全部�
 发现Megatron在FP32 softmax之后、top-k之前转BF16，而Qwen先top-k再转BF16。
 qwen2_router.install为本实验保留Qwen的选择顺序，修正后的完整GPU检查另存新目录。
 runtime.py修复了两套cuDNN混用的加载顺序，不修改任何已安装包。
+FlashInfer 缓存默认使用本仓库的 `.cache/flashinfer/`，避免 home 下的缓存软链接目标
+被清理后导致导入失败；可用 `FLASHINFER_WORKSPACE_BASE` 指定其它基目录
+（FlashInfer 会在该目录下追加 `.cache/flashinfer/`）。转换与训练共用此设置。
 
 ## 四卡容量实测
 
 常用启动脚本：`bash framework_benchmark/train_textworld_ppo.sh`。
-默认EP=3、3训练+1推理、192 episodes/更新、2500次更新，每100轮保存checkpoint。
+启动前需要原始 HF 模型和转换后的 Megatron checkpoint；默认转换路径为
+`framework_benchmark/artifacts/conversion_v1/checkpoint`。若提示
+`Missing converted Megatron checkpoint`，先检查报错中的完整路径；已有初始转换可通过
+`MEGATRON_CHECKPOINT=/absolute/path/to/checkpoint` 指定。
+若转换权重已丢失，在 GPU 0–3 空闲时重新转换（转换使用 GPU 0）：
+
+```bash
+cd /mnt/data/lcx4/AcceRL-Agent
+conversion_output="$PWD/framework_benchmark/artifacts/conversion_rebuilt_$(date +%Y%m%d_%H%M%S)_$$"
+/mnt/data/lcx4/miniforge3/envs/accerl-agent/bin/python -m framework_benchmark.convert_checkpoint --output "$conversion_output" &&
+MEGATRON_CHECKPOINT="$conversion_output/checkpoint" bash framework_benchmark/train_textworld_ppo.sh --token-level-filter
+```
+
+转换器要求 output 目录尚不存在；使用新目录可保留之前的转换日志。
+不要用训练产物替代初始转换：新训练的 Actor/Critic 也从 `--ref-load` 初始化，会改变实验起点。
+
+默认EP=3、3训练+1推理、192 episodes/更新、2500次更新，
+`--save-interval 100` 每100 step保存完整 checkpoint，`--save-total-limit 1` 只保留最新成功保存的一套。
 `DRY_RUN=1`仅打印命令；尾部Slime参数覆盖默认值，`SEED=43`切换种子。
 日志、原始指标事件和checkpoint保存到`runs/TextWorld_Slime/`。
+脚本默认启用 `--save-full-ppo-checkpoint`：Actor、Critic 分目录保存，并包含各自的
+optimizer、scheduler、RNG 和同一步的 rollout 数据源状态。两者和 rollout 状态全部写完后，
+才原子更新 `checkpoints/latest_complete.json` 并清理旧套件；部分保存失败不删除上一套完整断点。
+正常结束和收到 SIGINT/SIGTERM 后完成当前 rollout 时，也会保存最后一套完整断点。
+
+下次需要续训时，指定之前运行的 checkpoint 根目录，并保留原来的训练参数：
+
+```bash
+RESUME_FROM=/absolute/path/to/previous/run/checkpoints bash framework_benchmark/train_textworld_ppo.sh --token-level-filter
+```
+
+恢复会自动选择最近完整断点，例如保存编号 `799` 后从 `800` 开始；`--num-rollout 2500`
+仍表示累计目标，不是再训练2500步。默认新建日志目录，避免覆盖旧日志。
+旧的 Actor/Critic 共用目录 checkpoint 无法自动补回 Actor，恢复入口会拒绝将它当作完整断点。
+该配置从加载本改动的新进程生效。布局、停止行为和恢复说明见
+[完整 PPO checkpoint](CHECKPOINTS.md)，源码增量保存在 `slime_full_ppo_checkpoint.patch`。
 TensorBoard记录`textworld/train/WinRate`与`textworld/train/NormalizedScore`，按每轮选中批次的完整episode统计，
 横轴沿用Slime的rollout step；胜率为0–1比例，归一化分数为逐局score/max_score的均值。
 步数/历史上限结束计入，abort与缺失结果不计入；max_score=0不参与分数均值，并记录有效分母。
@@ -114,6 +150,42 @@ ratio、log_ratio、old/new/rollout logprob、advantage的均值、最小/最大
 guard 支持当前 TP=PP=CP=1、DP/EP 配置及模型层重计算；
 暂不支持 loss 函数重计算、MTP 和 TIS/mismatch metrics，启用时会明确报错。
 该改动保存在 `slime_k2_early_stop.patch`，已应用到指定 Slime checkout；运行中的训练需重新启动才会加载。
+
+可在脚本末尾添加 `--token-level-filter`，切换为逐 token 过滤：
+
+```bash
+bash /mnt/data/lcx4/AcceRL-Agent/framework_benchmark/train_textworld_ppo.sh --token-level-filter
+```
+
+Slime CLI 的 `--token-level-filter` 默认关闭；脚本不自动添加此参数，不传时仍执行上述整窗口早停逻辑。
+启用后，即使脚本同时传入默认的
+`--early-stop-kl 0.01`，也优先使用 token 过滤，不启用“触发后持续清零并丢弃整窗口”的 guard。
+每个 DP rank 在每个 microbatch 内独立检查有效动作 token，屏蔽
+`0.5 * (new_logprob - old_logprob)^2 > 0.01` 的位置；阈值固定为 `0.01`，
+不随 `EARLY_STOP_KL` 改变。屏蔽位置不贡献 Actor 直接训练 loss，但 token 仍作为上下文参与前向。
+一个 rank 的 mask 不连带屏蔽其它 rank；正常 token、此前已累计梯度及后续 microbatch 保留。
+所有 rank 仍完成原有前向、反向与通信，在实际最后一个 microbatch 后统一更新参数。
+192 指每步 episode 数，pack/microbatch 数随动态 packing 改变，不固定为 96 或每卡 32 个。
+
+过滤保留原有 episode 内 token 分母和全局 batch 分母，屏蔽项贡献零，不按保留 token 数重新平均。
+单个 rank/microbatch 全部被屏蔽时仍执行保留计算图的零 loss backward；
+整个 DP 窗口没有有效 token 时跳过 optimizer 与 LR scheduler，避免只有 Adam 动量或权重衰减仍移动参数。
+有效动作 token 的 log-ratio 非有限时，仍保留整窗口安全跳步；有限但 K2 超阈值只触发局部过滤。
+Critic 更新不受此参数影响。运行中的训练不会自动切换模式，需下次启动才生效。
+
+`train/token_filter/` 下的 `action_tokens`、`kept_tokens`、`masked_tokens`、`masked_fraction`
+记录整个 step 跨 DP 汇总的原始、保留、屏蔽 token 数及屏蔽比例；`nonfinite_tokens` 单列非有限数。
+`invalid_microbatches` 记录原始模型 logits 或保留项 advantage、启用的 entropy/reference loss
+存在非有限值的 rank-local microbatch 次数，跨 DP 求和；大于 0 时也跳过整窗口更新。
+它与仅统计动作 log-ratio 的 `nonfinite_tokens` 分开；`entropy_coef=0` 时非有限 entropy 诊断不参与训练 loss。
+`k2_kl` 是过滤前的整步 token 加权均值，`kept_k2_kl` 是仅保留 token 的均值，
+`threshold` 记录过滤阈值；`train/k2_kl` 同样保留过滤前均值，不能只看过滤后的 KL 判断策略漂移。
+token 模式的 `train/early_stop` 为 0；`train/optimizer_step_skipped` 仅在全局没有保留 token、
+动作 log-ratio 非有限、存在 invalid microbatch 或梯度保护拒绝更新时为 1，局部过滤本身不会将其置 1。
+
+token 模式支持 PPO、Megatron、TP=PP=CP=1 及 DP/EP，要求关闭 MoE auxiliary loss 和 z-loss；
+暂不支持 loss 函数重计算、MTP、TIS/mismatch metrics、OPSM 或自定义 policy loss reducer。
+源码增量保存在 `slime_token_level_filter.patch`，在现有 `slime_k2_early_stop.patch` 之后应用。
 
 EP=1在Critic首次Adam状态初始化时OOM；EP=3使用60专家分片后，3训练+1推理完整跑通。
 结果见`artifacts/four_gpu_ep3_v2/result.json`和同目录console.log、gpu.jsonl、events/。

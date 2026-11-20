@@ -73,7 +73,10 @@ from accerl_agent.rl_data import (
     textworld_ppo_boundary_is_terminal,
 )
 from accerl_agent.varlen_batching import pack_sequence_indices, split_packs_to_count
-from accerl_agent.ppo_early_stop import K2EarlyStopState, graph_zero
+from accerl_agent.ppo_early_stop import (
+    K2EarlyStopState, K2TokenFilterState, RawTokenKLState, graph_zero,
+)
+from accerl_agent.textworld_game_scheduler import ShuffledGameQueue
 
 
 def get_local_ip() -> str:
@@ -197,6 +200,7 @@ class PPOFlatTokenView:
     response_counts: torch.Tensor
     bootstrap_values: torch.Tensor
     bootstrap_mask: torch.Tensor
+    model_outputs_finite: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -1410,6 +1414,7 @@ class FSDPTrainWorker:
         self.train_window_step = 0
         self.optimizer_step = 0
         self._ppo_early_stop_state = None
+        self._ppo_token_filter_state = None
         self._gradient_precision_validated = False
         self._optimizer_precision_validated = False
         self.ppo_adv_ema_mean: float | None = None
@@ -2010,6 +2015,16 @@ class FSDPTrainWorker:
             bootstrap_mask[bootstrap_sample_indices] = True
         old_logprobs = batch["response_logprobs"].float()
         rewards = batch["response_rewards"].float()
+        model_outputs_finite = None
+        if getattr(self.args, "token_level_filter", False):
+            # Check before masking: a nonfinite softmax/model graph cannot
+            # be repaired by multiplying its direct token loss by zero.
+            finite_chunks = [
+                torch.isfinite(chunk).all()
+                for chunk in outputs.logits.detach().reshape(-1).split(1 << 24)
+            ]
+            finite_chunks.append(torch.isfinite(all_values.detach()).all())
+            model_outputs_finite = torch.stack(finite_chunks).all()
         return PPOFlatTokenView(
             current_logprobs=current_logprobs,
             old_logprobs=old_logprobs,
@@ -2022,6 +2037,7 @@ class FSDPTrainWorker:
             response_counts=batch["response_counts"],
             bootstrap_values=bootstrap_values,
             bootstrap_mask=bootstrap_mask,
+            model_outputs_finite=model_outputs_finite,
         )
 
     @staticmethod
@@ -2276,6 +2292,17 @@ class FSDPTrainWorker:
                 f"value shape {tuple(expected_shape)}."
             )
 
+    def _observe_ppo_raw_kl(self, view: PPOFlatTokenView) -> None:
+        monitor = getattr(self, "_ppo_raw_kl_state", None)
+        if monitor is not None:
+            # Keep diagnostics independent of the safe, masked policy
+            # log-ratio. Both estimators see every response token.
+            raw_logratio = (
+                view.current_logprobs.detach().double()
+                - view.old_logprobs.detach().double()
+            )
+            monitor.observe(raw_logratio)
+
     def _ppo_window_should_stop(self, view: PPOFlatTokenView) -> bool:
         guard = getattr(self, "_ppo_early_stop_state", None)
         if guard is None:
@@ -2301,13 +2328,44 @@ class FSDPTrainWorker:
         check_early_stop: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute loss for targets derived from a validated PPO pack."""
-        if check_early_stop and self._ppo_window_should_stop(view):
-            return self._zero_ppo_loss(view)
+        if check_early_stop:
+            self._observe_ppo_raw_kl(view)
+            if self._ppo_window_should_stop(view):
+                return self._zero_ppo_loss(view)
         raw_advantages = raw_advantages.detach().float()
         actor_advantages = actor_advantages.detach().float()
         returns = returns.detach().float()
 
-        valid_log_ratio = view.current_logprobs.float() - view.old_logprobs.float()
+        token_filter = getattr(self, "_ppo_token_filter_state", None)
+        keep = None
+        current_logprobs = view.current_logprobs.float()
+        old_logprobs = view.old_logprobs.float()
+        # Preserve the original differentiable ratio for KL regularization.
+        # The token filter only masks the policy objective below.
+        raw_log_ratio = current_logprobs - old_logprobs
+        if token_filter is not None:
+            keep = token_filter.observe(view.current_logprobs, view.old_logprobs)
+            finite_inputs = [
+                torch.isfinite(tensor).all()
+                for tensor in (
+                    view.current_values, view.bootstrap_values,
+                    raw_advantages, actor_advantages[keep], returns,
+                )
+            ]
+            if view.model_outputs_finite is not None:
+                finite_inputs.append(view.model_outputs_finite)
+            if not torch.stack(finite_inputs).all():
+                token_filter.invalidate()
+                return self._zero_ppo_loss(view)
+            if not (torch.isfinite(current_logprobs) & torch.isfinite(old_logprobs)).all():
+                return self._zero_ppo_loss(view)
+            # Sanitize the policy path before subtraction/exp, preserving
+            # token positions and the original trajectory denominators.
+            current_logprobs = torch.where(keep, current_logprobs, 0.0)
+            old_logprobs = torch.where(keep, old_logprobs, 0.0)
+            actor_advantages = torch.where(keep, actor_advantages, 0.0)
+
+        valid_log_ratio = current_logprobs - old_logprobs
         valid_ratio = torch.exp(valid_log_ratio)
         if self.args.clip_mode == "ppo":
             surrogate_1 = valid_ratio * actor_advantages
@@ -2363,7 +2421,11 @@ class FSDPTrainWorker:
                 sample_count,
             )
         )
-        old_new_kl = valid_ratio - 1.0 - valid_log_ratio
+        # Every original response token retains its KL gradient, including
+        # tokens excluded from the policy objective. expm1 is stable near 0.
+        old_new_kl = torch.expm1(raw_log_ratio) - raw_log_ratio
+        if keep is not None:
+            clipped_mask = clipped_mask & keep
         kl_trajectory_sum, kl_token_sum, _ = (
             sum_token_values_by_trajectory(
                 old_new_kl.float(),
@@ -2376,19 +2438,22 @@ class FSDPTrainWorker:
             + self.args.value_loss_coef * value_loss_trajectory_sum
             + self.args.old_new_kl_coef * kl_trajectory_sum
         )
-        _raise_if_nonfinite_tensors(
-            [
-                ("old_logprobs", view.old_logprobs),
-                ("raw_advantages", raw_advantages),
-                ("actor_advantages", actor_advantages),
-                ("returns", returns),
-                ("ratio", valid_ratio),
-                ("value_loss", value_loss_tokens),
-                ("old_new_kl", old_new_kl),
-                ("loss", trajectory_loss_sum),
-            ],
-            context="PPO ratio/loss",
-        )
+        loss_inputs = [
+            ("old_logprobs", view.old_logprobs),
+            ("raw_advantages", raw_advantages),
+            ("actor_advantages", actor_advantages),
+            ("returns", returns),
+            ("ratio", valid_ratio),
+            ("value_loss", value_loss_tokens),
+            ("old_new_kl", old_new_kl),
+            ("loss", trajectory_loss_sum),
+        ]
+        if token_filter is not None:
+            if not torch.stack([torch.isfinite(tensor).all() for _, tensor in loss_inputs]).all():
+                token_filter.invalidate()
+                return self._zero_ppo_loss(view)
+        else:
+            _raise_if_nonfinite_tensors(loss_inputs, context="PPO ratio/loss")
 
         with torch.no_grad():
             values_detached = view.current_values.detach().float()
@@ -2423,6 +2488,7 @@ class FSDPTrainWorker:
         ema_scale: float | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Hot-path PPO objective for a CPU-validated packed batch."""
+        self._observe_ppo_raw_kl(view)
         if self._ppo_window_should_stop(view):
             return self._zero_ppo_loss(view)
         mode = self.args.ppo_advantage_normalization
@@ -2803,12 +2869,17 @@ class FSDPTrainWorker:
     ) -> Dict[str, object]:
         """Run one attempt; never leak a guard into a target prepass/window."""
         threshold = getattr(self.args, "early_stop_kl", 0.0)
-        guard = K2EarlyStopState(threshold) if threshold > 0 else None
+        token_level_filter = getattr(self.args, "token_level_filter", False)
+        guard = K2EarlyStopState(threshold) if threshold > 0 and not token_level_filter else None
         self._ppo_early_stop_state = None
+        self._ppo_token_filter_state = None
+        self._ppo_raw_kl_state = None
         try:
             return self._run_ppo_optimizer_window(trainer_version, guard)
         finally:
             self._ppo_early_stop_state = None
+            self._ppo_token_filter_state = None
+            self._ppo_raw_kl_state = None
 
     def _run_ppo_optimizer_window(
         self, trainer_version: float, guard: K2EarlyStopState | None,
@@ -2887,6 +2958,13 @@ class FSDPTrainWorker:
         # Target prepasses do not backpropagate or consume guard observations.
         # Exactly one observation is made for each actual training pack.
         self._ppo_early_stop_state = guard
+        token_filter = (
+            K2TokenFilterState(getattr(self.args, "token_filter_kl_threshold", 0.01))
+            if getattr(self.args, "token_level_filter", False) else None
+        )
+        self._ppo_token_filter_state = token_filter
+        raw_kl_monitor = RawTokenKLState()
+        self._ppo_raw_kl_state = raw_kl_monitor
         local_reduction_stats = PPOReductionStats.zeros(self.device)
         local_version_stats = torch.zeros(
             2,
@@ -2972,7 +3050,31 @@ class FSDPTrainWorker:
         stats = PPOReductionStats.unpack(
             local_reduction_stats
         ).to_float_dict()
-        if guard is not None and guard.stop_ppo:
+        filter_metrics = token_filter.finalize(group=self.loss_pg) if token_filter is not None else {}
+        raw_kl_metrics = raw_kl_monitor.finalize(group=self.loss_pg)
+        if raw_kl_metrics["raw_kl_token_count"] != global_valid_token_count:
+            raise RuntimeError(
+                "Raw PPO KL response-token count does not match the optimizer window: "
+                f"{raw_kl_metrics['raw_kl_token_count']} != {global_valid_token_count}."
+            )
+        token_filter_discard = token_filter is not None and (
+            token_filter.nonfinite_tokens > 0 or token_filter.invalid_microbatches > 0
+            or (
+                token_filter.kept_tokens == 0
+                and self.args.value_loss_coef == 0
+                and self.args.old_new_kl_coef == 0
+            )
+        )
+        monitoring_metrics = {
+            **(guard.metrics() if guard is not None else {}),
+            **filter_metrics,
+            **raw_kl_metrics,
+            "k2_kl": raw_kl_metrics["raw_k2_kl"],
+            "k3_kl": raw_kl_metrics["raw_k3_kl"],
+        }
+        if token_filter is not None:
+            monitoring_metrics["early_stop"] = 0.0
+        if (guard is not None and guard.stop_ppo) or token_filter_discard:
             # Zero backward does not erase gradients accumulated before the
             # trigger. Clear the whole window and never enter AdamW/LR/EMA.
             self.optimizer.zero_grad(set_to_none=True)
@@ -2982,15 +3084,18 @@ class FSDPTrainWorker:
                     train_window_step=getattr(self, "train_window_step", 0) + 1,
                     response_tokens=sum(pack.valid_token_count for pack in window),
                     trajectories=sum(pack.valid_trajectory_count for pack in window),
-                    **guard.metrics())
+                    **monitoring_metrics)
             if self.rank == 0:
-                print(
-                    "[train] Discarded PPO window: "
-                    f"K2_max_microbatch={guard.max_microbatch_kl:.6g} "
-                    f"threshold={guard.threshold:.6g}; optimizer/LR/EMA unchanged."
+                reason = (
+                    f"K2_max_microbatch={guard.max_microbatch_kl:.6g} threshold={guard.threshold:.6g}"
+                    if guard is not None else
+                    f"token_filter kept={token_filter.kept_tokens} "
+                    f"nonfinite={token_filter.nonfinite_tokens} invalid={token_filter.invalid_microbatches}"
                 )
+                print(f"[train] Discarded PPO window: {reason}; optimizer/LR/EMA unchanged.")
             return {
-                **pack_stats, **ep_metrics, **guard.metrics(),
+                **pack_stats, **ep_metrics, **monitoring_metrics,
+                "optimizer_step_skipped": 1.0,
                 "global_ppo_stats": {name: 0.0 for name in PPOReductionStats.names()},
                 "global_valid_token_count": float(global_valid_token_count),
                 "global_valid_trajectory_count": float(global_valid_trajectory_count),
@@ -3094,7 +3199,7 @@ class FSDPTrainWorker:
         return {
             **pack_stats,
             **ep_metrics,
-            **(guard.metrics() if guard is not None else {}),
+            **monitoring_metrics,
             "optimizer_step_skipped": 0.0,
             "global_ppo_stats": stats,
             "global_valid_token_count": token_count,
@@ -3298,11 +3403,22 @@ class FSDPTrainWorker:
                     if self.expert_parallel_setup is not None
                     else ""
                 )
+                token_filter_text = (
+                    f" token_filter_kept={step_stats['token_filter/kept_tokens']:.0f}"
+                    f" token_filter_masked_fraction={step_stats['token_filter/masked_fraction']:.4f}"
+                    if "token_filter/kept_tokens" in step_stats else ""
+                )
+                raw_kl_text = (
+                    f" raw_k2_kl={step_stats['raw_k2_kl']:.6g}"
+                    f" raw_k3_kl={step_stats['raw_k3_kl']:.6g}"
+                    if "raw_k2_kl" in step_stats else ""
+                )
                 print(
                     "[train] "
                     f"train_window_step={self.train_window_step} "
                     f"optimizer_step={self.optimizer_step} "
-                    f"early_stop={int(skipped)} "
+                    f"early_stop={int(step_stats.get('early_stop', 0))} "
+                    f"optimizer_step_skipped={int(skipped)} "
                     f"loss={step_stats['loss_mean']:.6f}"
                     f"{value_text} "
                     f"{trajectory_kl_text} "
@@ -3312,6 +3428,8 @@ class FSDPTrainWorker:
                     f"episode_uses={step_stats['global_valid_trajectory_count']:.0f} "
                     f"microbatches_per_rank={step_stats['global_pack_count'] / self.fsdp_world_size:.0f} "
                     f"lr={step_stats['current_lr']:.8g}"
+                    f"{token_filter_text}"
+                    f"{raw_kl_text}"
                     f"{ep_text}"
                 )
 
@@ -3351,10 +3469,41 @@ class FSDPTrainWorker:
                 for step in global_steps if "k2_kl" in step) / k2_tokens
             if k2_tokens else 0.0
         )
+        raw_kl_steps = [step for step in global_steps if "raw_kl_token_count" in step]
+        raw_kl_tokens = sum(float(step["raw_kl_token_count"]) for step in raw_kl_steps)
+        result["segment_raw_kl_token_count"] = raw_kl_tokens
+        result["segment_raw_kl_nonfinite_tokens"] = sum(
+            int(step["raw_kl_nonfinite_tokens"]) for step in raw_kl_steps
+        )
+        result["segment_k3_kl"] = 0.0
+        if raw_kl_steps:
+            # Include rejected windows and weight both estimators by exactly
+            # the same original token counts, never by packs or trajectories.
+            for estimator in ("k2", "k3"):
+                result[f"segment_{estimator}_kl"] = sum(
+                    float(step[f"raw_{estimator}_kl"]) * float(step["raw_kl_token_count"])
+                    for step in raw_kl_steps
+                ) / max(raw_kl_tokens, 1.0)
         result["segment_k2_kl_max_microbatch"] = max(
             (float(step.get("k2_kl_max_microbatch", 0.0)) for step in global_steps), default=0.0,
         )
-        result["segment_early_stop_fraction"] = result["skipped_windows"] / max(len(global_steps), 1)
+        result["segment_early_stop_fraction"] = sum(
+            bool(step.get("early_stop", step.get("optimizer_step_skipped", False)))
+            for step in global_steps
+        ) / max(len(global_steps), 1)
+        token_filter_steps = [step for step in global_steps if "token_filter/action_tokens" in step]
+        if token_filter_steps:
+            prefix = "token_filter/"
+            for name in ("action_tokens", "kept_tokens", "masked_tokens", "nonfinite_tokens", "invalid_microbatches"):
+                result[prefix + name] = sum(float(step[prefix + name]) for step in token_filter_steps)
+            result[prefix + "masked_fraction"] = result[prefix + "masked_tokens"] / max(result[prefix + "action_tokens"], 1)
+            result[prefix + "k2_kl"] = result["segment_k2_kl"]
+            result[prefix + "kept_k2_kl"] = (
+                sum(float(step[prefix + "kept_k2_kl"]) * float(step[prefix + "kept_tokens"])
+                    for step in token_filter_steps)
+                / max(result[prefix + "kept_tokens"], 1)
+            )
+            result[prefix + "threshold"] = token_filter_steps[0][prefix + "threshold"]
         pack_token_count = sum(
             float(step["global_pack_token_count"])
             for step in global_steps
@@ -3742,6 +3891,9 @@ class FSDPTrainWorker:
                 "train_micro_step": self.train_micro_step,
                 "train_window_step": getattr(self, "train_window_step", self.optimizer_step),
                 "early_stop_kl": getattr(self.args, "early_stop_kl", 0.0),
+                "token_level_filter": getattr(self.args, "token_level_filter", False),
+                "token_filter_kl_threshold": getattr(self.args, "token_filter_kl_threshold", 0.01),
+                "ppo_kl_loss_token_scope": "all_response_tokens",
                 "fsdp_world_size": self.fsdp_world_size,
                 "train_ep_size": self.args.train_ep_size,
                 "rl_algorithm": self.args.rl_algorithm,
@@ -3858,7 +4010,7 @@ class InferenceResult:
 
 @ray.remote
 class StatsActor:
-    """Aggregates rollout metrics from async rollout workers."""
+    """Aggregates rolling episode metrics, with equal weight per game."""
 
     def __init__(self, window_size: int, active_timeout_seconds: float):
         self.worker_last_active = {}
@@ -3868,6 +4020,7 @@ class StatsActor:
         self.tw_wins = deque(maxlen=window_size)
         self.tw_steps = deque(maxlen=window_size)
         self.tw_invalid_actions = deque(maxlen=window_size)
+        self.tw_rewards = deque(maxlen=window_size)
 
     def add_textworld_episode(
         self,
@@ -3877,12 +4030,17 @@ class StatsActor:
         won: bool,
         steps: int,
         invalid_actions: int,
+        episode_reward: float | None = None,
     ) -> None:
         self.tw_scores.append(float(score))
         self.tw_max_scores.append(float(max_score))
         self.tw_wins.append(bool(won))
         self.tw_steps.append(int(steps))
         self.tw_invalid_actions.append(int(invalid_actions))
+        # Keep missing/unfinished rewards aligned with the episode window.
+        self.tw_rewards.append(
+            float(episode_reward) if episode_reward is not None else None
+        )
         self.worker_last_active[int(worker_id)] = time.time()
 
     def get_stats(self) -> Dict[str, float]:
@@ -3893,7 +4051,16 @@ class StatsActor:
         )
         tw_episode_count = len(self.tw_scores)
         tw_total_steps = sum(self.tw_steps)
-        tw_total_max_score = sum(self.tw_max_scores)
+        # Match Slime's per-episode normalization, including zero-max exclusion.
+        normalized_scores = []
+        for score, maximum in zip(self.tw_scores, self.tw_max_scores, strict=True):
+            if not math.isfinite(score) or not math.isfinite(maximum) or maximum < 0:
+                raise ValueError("Invalid TextWorld score/max_score")
+            if maximum > 0:
+                normalized_scores.append(score / maximum)
+        episode_rewards = [reward for reward in self.tw_rewards if reward is not None]
+        if any(not math.isfinite(reward) for reward in episode_rewards):
+            raise ValueError("Invalid TextWorld episode reward")
         return {
             "active_workers": active_workers,
             "tw_win_rate": (
@@ -3901,9 +4068,14 @@ class StatsActor:
                 if tw_episode_count else 0.0
             ),
             "tw_normalized_score": (
-                sum(self.tw_scores) / tw_total_max_score
-                if tw_total_max_score > 0 else 0.0
+                sum(normalized_scores) / len(normalized_scores)
+                if normalized_scores else 0.0
             ),
+            "tw_reward_mean": (
+                sum(episode_rewards) / len(episode_rewards)
+                if episode_rewards else 0.0
+            ),
+            "tw_reward_episode_count": len(episode_rewards),
             "tw_invalid_action_rate": (
                 sum(self.tw_invalid_actions) / tw_total_steps
                 if tw_total_steps else 0.0
@@ -4609,6 +4781,17 @@ def _textworld_max_score(infos: Dict) -> float:
         return 0.0
 
 
+@ray.remote(num_cpus=0)
+class TextWorldGameSchedulerActor:
+    """Serialize PPO game allocation across all asynchronous rollout workers."""
+
+    def __init__(self, game_files: List[str], seed: int):
+        self.queue = ShuffledGameQueue(game_files, seed)
+
+    def get_batch(self, batch_size: int) -> List[str]:
+        return self.queue.get_batch(batch_size)
+
+
 class TextWorldRolloutWorkerActor:
     """CPU Ray actor that collects TextWorld episodes and optional RL samples."""
 
@@ -4619,12 +4802,14 @@ class TextWorldRolloutWorkerActor:
         worker_id: int,
         replay_buffer,
         stats_actor,
+        game_scheduler=None,
     ):
         self.args = args
         self.infer_actor = infer_actor
         self.worker_id = int(worker_id)
         self.replay_buffer = replay_buffer
         self.stats_actor = stats_actor
+        self.game_scheduler = game_scheduler
         self.research = None
         if getattr(args, "research_config", None):
             from testForAcceRL.live import recorder_for
@@ -5022,20 +5207,18 @@ class TextWorldRolloutWorkerActor:
             for sample, advantage in zip(valid_samples, advantages)
         ]
 
-    async def _run_textworld_batch(self, game_file: str) -> None:
+    async def _run_textworld_batch(self, game_files: List[str]) -> None:
         algorithm = self.args.rl_algorithm
-        if algorithm == "ppo":
-            batch_size = int(self.args.rollout_batch_size)
-        elif algorithm == "grpo":
-            batch_size = int(self.args.grpo_group_size)
-        else:
+        if algorithm not in {"ppo", "grpo"}:
             raise ValueError(f"Unsupported rl_algorithm: {algorithm}")
+        if not game_files:
+            raise ValueError("A TextWorld rollout batch requires at least one game")
 
-        env_id = self.game_env_ids[game_file]
         states: List[TextWorldTrajectoryState] = []
 
         try:
-            for _ in range(batch_size):
+            for game_file in game_files:
+                env_id = self.game_env_ids[game_file]
                 env = textworld.gym.make(env_id)
                 obs, infos = env.reset()
                 transcript_ids = self._initial_transcript_ids(obs, infos)
@@ -5107,7 +5290,6 @@ class TextWorldRolloutWorkerActor:
                     ]
                 self.replay_buffer.add_samples.remote(samples)
 
-            max_score = _textworld_max_score(states[0].infos) if states else 0.0
             for state in states:
                 self.interval_episode_count += 1
                 self.interval_history_limit_count += (
@@ -5117,10 +5299,14 @@ class TextWorldRolloutWorkerActor:
                 self.stats_actor.add_textworld_episode.remote(
                     self.worker_id,
                     state.latest_score,
-                    max_score,
+                    _textworld_max_score(state.infos),
                     bool(state.won),
                     len(state.step_records),
                     state.invalid_actions,
+                    episode_reward=(
+                        sum(record.reward for record in state.step_records)
+                        if state.termination_reason is not None else None
+                    ),
                 )
 
         finally:
@@ -5128,19 +5314,32 @@ class TextWorldRolloutWorkerActor:
                 state.env.close()
 
     async def run(self) -> Dict[str, int]:
+        if self.args.rl_algorithm == "ppo" and self.game_scheduler is None:
+            raise RuntimeError("PPO rollout workers require the shared game scheduler")
         episode_index = 0
+        episode_count = 0
         while not self.stopped:
-            game_file = self.game_files[
-                (self.worker_id + episode_index) % len(self.game_files)
-            ]
-            await self._run_textworld_batch(game_file)
+            if self.args.rl_algorithm == "ppo":
+                game_files = await self.game_scheduler.get_batch.remote(
+                    self.args.rollout_batch_size
+                )
+            else:
+                # GRPO compares repeated trajectories of the same game.
+                game_file = self.game_files[
+                    (self.worker_id + episode_index) % len(self.game_files)
+                ]
+                game_files = [game_file] * self.args.grpo_group_size
+            if self.stopped:
+                break
+            await self._run_textworld_batch(game_files)
             episode_index += 1
+            episode_count += len(game_files)
 
         print(
             f"[tw-rollout] worker={self.worker_id} stopped; "
-            f"episodes={episode_index}"
+            f"batches={episode_index} episodes={episode_count}"
         )
-        return {"episodes": episode_index}
+        return {"batches": episode_index, "episodes": episode_count}
 
     async def evaluate_fixed_games(self, optimizer_step: int) -> Dict:
         results = []
@@ -5166,7 +5365,7 @@ class TextWorldRolloutWorkerActor:
                    "win_rate": sum(row["won"] for row in results) / len(results),
                    "normalized_score": sum(row["score"] for row in results) / denominator if denominator > 0 else 0.0,
                    "normalized_score_macro": sum(row["score"] / row["max_score"] if row["max_score"] > 0 else 0.0 for row in results) / len(results),
-                   "score_aggregation": "sum(score)/sum(max_score), consistent with training statistics; macro also reported",
+                   "score_aggregation": "sum(score)/sum(max_score) for independent evaluation; macro also reported",
                    "games": results}
         self.research.emit("evaluation", **metrics)
         return metrics
@@ -5367,6 +5566,9 @@ async def run_textworld_train(args: argparse.Namespace):
         f"global_batch_size={args.global_batch_size} "
         f"grad_accum_steps={args.grad_accum_steps} "
         f"early_stop_kl={args.early_stop_kl} "
+        f"token_level_filter={args.token_level_filter} "
+        f"token_filter_kl_threshold={getattr(args, 'token_filter_kl_threshold', 0.01)} "
+        "ppo_kl_loss_token_scope=all_response_tokens "
         f"train_max_sequences_per_pack={args.train_max_sequences_per_pack} "
         "logprob_forward=response_only_lm_head "
         "ppo_forward_mode="
@@ -5399,6 +5601,7 @@ async def run_textworld_train(args: argparse.Namespace):
     infer_actor = None
     rollout_workers = []
     rollout_refs = []
+    game_scheduler = None
     research_eval_worker = None
     research_config = None
     try:
@@ -5527,6 +5730,16 @@ async def run_textworld_train(args: argparse.Namespace):
             research_eval_worker = remote_rollout_worker.remote(eval_args, infer_actor, -1, None, None)
             ray.get(research_eval_worker.evaluate_fixed_games.remote(0))
 
+        if args.rl_algorithm == "ppo":
+            game_files = load_textworld_game_files(args)
+            game_scheduler = TextWorldGameSchedulerActor.remote(game_files, args.seed)
+            print(
+                "[rollout] PPO game sampling: global_shuffled_epochs; "
+                f"games_per_epoch={len(game_files)} "
+                f"distinct_games_per_worker_batch<={args.rollout_batch_size}; "
+                "each game is dispatched once per epoch, without a completion barrier."
+            )
+
         rollout_workers = [
             remote_rollout_worker.remote(
                 args,
@@ -5534,6 +5747,7 @@ async def run_textworld_train(args: argparse.Namespace):
                 worker_id,
                 replay_buffers[worker_id % args.fsdp_world_size],
                 stats_actor,
+                game_scheduler,
             )
             for worker_id in range(args.num_rollout_workers)
         ]
@@ -5692,10 +5906,16 @@ async def run_textworld_train(args: argparse.Namespace):
             tb_step = rank0_summary["train_window_step"]
             writer.add_scalar("Train/OptimizerStep", rank0_summary["optimizer_step"], tb_step)
             writer.add_scalar("Train/SkippedWindows", rank0_summary["skipped_windows"], tb_step)
-            if args.early_stop_kl > 0:
+            if args.rl_algorithm == "ppo":
                 writer.add_scalar("Train/K2KL", rank0_summary["segment_k2_kl"], tb_step)
+                writer.add_scalar("Train/K3KL", rank0_summary["segment_k3_kl"], tb_step)
+            if args.early_stop_kl > 0 and not args.token_level_filter:
                 writer.add_scalar("Train/K2KLMaxMicrobatch", rank0_summary["segment_k2_kl_max_microbatch"], tb_step)
                 writer.add_scalar("Train/EarlyStopFraction", rank0_summary["segment_early_stop_fraction"], tb_step)
+            if args.token_level_filter:
+                for name, value in rank0_summary.items():
+                    if name.startswith("token_filter/"):
+                        writer.add_scalar("Train/" + name, value, tb_step)
             writer.add_scalar(
                 "TextWorld/NormalizedScore",
                 rollout_stats["tw_normalized_score"],
@@ -5704,6 +5924,16 @@ async def run_textworld_train(args: argparse.Namespace):
             writer.add_scalar(
                 "TextWorld/WinRate",
                 rollout_stats["tw_win_rate"],
+                tb_step,
+            )
+            writer.add_scalar(
+                "TextWorld/Reward",
+                rollout_stats["tw_reward_mean"],
+                tb_step,
+            )
+            writer.add_scalar(
+                "TextWorld/RewardEpisodes",
+                rollout_stats["tw_reward_episode_count"],
                 tb_step,
             )
             writer.add_scalar(
@@ -5842,7 +6072,8 @@ async def run_textworld_train(args: argparse.Namespace):
                 + f"clip={clip_fraction:.4f} "
                 f"train_tokens_per_sec={train_tokens_per_sec:.2f} "
                 f"infer_tokens_per_sec={infer_tokens_per_sec:.2f} "
-                f"score={rollout_stats['tw_normalized_score']:.4f}"
+                f"score={rollout_stats['tw_normalized_score']:.4f} "
+                f"reward={rollout_stats['tw_reward_mean']:.6f}"
             )
             writer.flush()
 
@@ -5942,6 +6173,8 @@ async def run_textworld_train(args: argparse.Namespace):
                 print(f"[cleanup] Ignoring InferActor shutdown error: {exc!r}")
         if research_eval_worker is not None:
             ray.kill(research_eval_worker, no_restart=True)
+        if game_scheduler is not None:
+            ray.kill(game_scheduler, no_restart=True)
         if fsdp_workers:
             try:
                 ray.get([worker.close.remote() for worker in fsdp_workers])
@@ -6120,6 +6353,24 @@ def parse_args() -> argparse.Namespace:
             "gradients, and skip optimizer/LR/EMA updates. 0 disables it."
         ),
     )
+    parser.add_argument(
+        "--token-level-filter", action="store_true", default=False,
+        help=(
+            "Mask the policy loss of rank-local PPO action tokens whose half squared log-ratio exceeds "
+            "--token-filter-kl-threshold "
+            "instead of the --early-stop-kl window guard. Keep raw differentiable K3 "
+            "regularization on all response tokens, original loss normalizers, "
+            "Critic training and the full microbatch/update schedule."
+        ),
+    )
+    parser.add_argument(
+        "--token-filter-kl-threshold", type=float, default=0.01,
+        help=(
+            "Per-token K2 threshold used with --token-level-filter (default: 0.01). "
+            "Independent of --early-stop-kl. Must be finite and nonnegative; "
+            "0 retains only exact zero log-ratios, rather than disabling filtering."
+        ),
+    )
     batch_mode = parser.add_mutually_exclusive_group()
     batch_mode.add_argument(
         "--global-batch-size",
@@ -6273,8 +6524,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metrics-window-size",
         type=int,
-        default=1000,
-        help="Sliding window size for rollout metrics.",
+        default=192,
+        help="Number of recent episodes used for rollout metrics (default: 192).",
     )
     parser.add_argument(
         "--metrics-active-timeout-seconds",
@@ -6414,7 +6665,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help=(
-            "Number of parallel TextWorld PPO episodes per rollout worker batch; "
+            "Maximum parallel TextWorld PPO episodes on distinct games per worker batch, "
+            "allocated from a shared shuffled game queue; "
             "also the default GRPO group size."
         ),
     )
@@ -6517,8 +6769,13 @@ def validate_args(args: argparse.Namespace) -> None:
     early_stop_kl = getattr(args, "early_stop_kl", 0.0)
     if not math.isfinite(early_stop_kl) or early_stop_kl < 0:
         raise ValueError("--early-stop-kl must be finite and nonnegative (0 disables it)")
+    token_filter_kl_threshold = getattr(args, "token_filter_kl_threshold", 0.01)
+    if not math.isfinite(token_filter_kl_threshold) or token_filter_kl_threshold < 0:
+        raise ValueError("--token-filter-kl-threshold must be finite and nonnegative")
     if early_stop_kl > 0 and args.rl_algorithm != "ppo":
         raise ValueError("--early-stop-kl currently supports --rl-algorithm ppo only")
+    if getattr(args, "token_level_filter", False) and args.rl_algorithm != "ppo":
+        raise ValueError("--token-level-filter requires --rl-algorithm ppo")
     if args.ppo_gae_mode == "rollout":
         if args.rl_algorithm != "ppo":
             raise ValueError("--ppo-gae-mode rollout requires --rl-algorithm ppo.")

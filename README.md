@@ -9,6 +9,11 @@ python -m accerl_agent.run_agent_textworld --help
 ```
 
 `accerl_agent/run_agent_textworld.py` is the Ray-safe launcher.
+It defaults `FLASHINFER_WORKSPACE_BASE` to the project root before importing
+vLLM or starting Ray, so FlashInfer uses `.cache/flashinfer/` inside the project
+instead of a possibly stale home-cache symlink. An explicit
+`FLASHINFER_WORKSPACE_BASE` environment variable overrides this default; set it
+to a base directory, since FlashInfer appends `.cache/flashinfer` itself.
 `accerl_agent/agent_textworld.py` contains the training implementation and is
 not the documented direct entry point.
 
@@ -309,12 +314,37 @@ flowchart LR
 
 `ReplayBufferActor` stores samples sharded by FSDP rank. Rollout workers write to `replay_buffers[worker_id % fsdp_world_size]`, so `--num-rollout-workers` must be at least `--fsdp-world-size`.
 
-`StatsActor` maintains sliding-window win rate, normalized score, invalid action
-rate, and active-worker state. The main loop writes a compact TensorBoard set
-covering task quality, replay health, training stability, throughput, rollout
-limits, and weight-sync latency.
+`StatsActor` maintains sliding-window win rate, normalized score, episode reward,
+invalid action rate, and active-worker state. TextWorld training metrics use the latest 192
+reported episodes by default (`--metrics-window-size 192`), or all reported
+episodes until that window fills. Win rate is the fraction of won episodes;
+normalized score is the mean of each episode's `score / max_score`, matching
+Slime's score formula. Episodes with `max_score=0` do not contribute to the score
+mean. The AcceRL window still slides across asynchronous rollout reports; Slime
+summarizes each selected rollout batch separately. The main loop writes a compact
+TensorBoard set covering task quality, replay health, training stability,
+throughput, rollout limits, and weight-sync latency.
+
+`TextWorld/Reward` is the mean raw episode return: the sum of the actual step
+rewards, including win/loss bonuses and invalid-action penalties, before any
+advantage normalization or KL penalty. It includes episodes ended by step or
+history limits; unfinished shutdown episodes and reports without reward are
+excluded from the reward mean. `TextWorld/RewardEpisodes` records its denominator
+within the same rolling episode-report window. This applies to PPO and GRPO;
+compare it with Slime's raw episode reward (`rollout/raw_reward`), allowing for
+the different aggregation windows. Existing processes need a restart to load the
+new metric; past runs without saved step rewards cannot be backfilled exactly.
 
 ## TextWorld Rollout
+
+PPO rollout workers share one shuffled game queue. With 15 workers and
+`--rollout-batch-size 8`, each worker receives up to eight different games and
+runs one episode per game in parallel. The next available worker receives the
+next batch; each game is assigned once per epoch across all workers. After all
+games have been assigned, the queue reshuffles immediately without waiting for
+unfinished episodes or a trainer update. An epoch's final batch can contain
+fewer than eight games. Games can recur across epochs, including while an older
+epoch's episode is still running. GRPO retains same-game trajectory groups.
 
 The TextWorld prompt includes the objective, observation, inventory, and admissible commands. It asks the model to return exactly one command. The parser:
 
@@ -368,6 +398,30 @@ The training-side policy objective is controlled by `--clip-mode`:
 - `gipo`: log-ratio Gaussian soft clipping using `--gipo-sigma`.
 - `sapo`: separate gate temperatures for positive and negative advantages using `--sapo-tau-pos` and `--sapo-tau-neg`.
 
+PPO additionally supports `--token-level-filter`: each training rank masks
+response-token policy terms whose K2 exceeds
+`--token-filter-kl-threshold` (default `0.01`). This threshold is independent
+of the whole-window `--early-stop-kl` guard; token filtering takes precedence
+when enabled. The KL regularizer still uses the original differentiable K3
+(`expm1(new_logprob - old_logprob) - (new_logprob - old_logprob)`) over all
+valid response tokens, including tokens excluded from the policy objective.
+Policy, value and KL retain their original within-trajectory token and global
+trajectory denominators. The token threshold must be finite and nonnegative. Zero keeps
+only tokens whose log-ratio is exactly zero; omit `--token-level-filter` to
+disable token filtering, and use `--early-stop-kl 0` to also disable the window
+guard. The three PPO launch scripts accept `TOKEN_FILTER_KL_THRESHOLD` as the
+environment default; trailing CLI arguments override it:
+
+```bash
+TOKEN_FILTER_KL_THRESHOLD=0.02 \
+  bash accerl_agent/train_textworld_ppo_gipo_varlenPack.sh --token-level-filter
+bash accerl_agent/train_textworld_ppo_gipo_varlenPack.sh \
+  --token-level-filter --token-filter-kl-threshold 0.02
+```
+
+See [K2 KL guards and token filtering](accerl_agent/EARLY_STOP_KL.md) for the
+loss, gradient and metric semantics.
+
 ## Replay Sample Contract
 
 Replay stores `RawPPOSample | GRPOSample`. Both algorithms use compact
@@ -410,13 +464,16 @@ labels, logprobs, or per-token policy versions.
 | `--infer-size` | vLLM data-parallel size. |
 | `--infer-tp-size` | vLLM tensor-parallel size. |
 | `--num-rollout-workers` | Number of CPU rollout actors; must be at least `--fsdp-world-size`. |
-| `--rollout-batch-size` | Episode batch size per rollout worker in PPO mode; also the default GRPO group size. |
+| `--rollout-batch-size` | Maximum parallel PPO episodes on different games per worker, allocated from the global shuffled queue; also the default GRPO group size. |
 | `--train-max-sequences-per-pack` | Maximum number of independent `RLSample` objects in one packed microbatch, per FSDP rank. |
 | `--gae-lambda` | PPO token TD(λ) trace parameter; defaults to `0.95`. |
 | `--value-loss-coef` | Coefficient for unclipped per-token Value MSE with trajectory-equal PPO reduction; defaults to `0.5`. |
 | `--ppo-advantage-normalization` | PPO advantage mode: `optimizer_window` (default), `ema_rms`, `ema_zscore`, or `none`. |
 | `--ppo-advantage-ema-beta` | Per-optimizer-step EMA decay for historical advantage moments; defaults to `0.9`. |
 | `--ppo-advantage-min-scale` | Positive scale floor for EMA normalization; defaults to `1e-3`. |
+| `--early-stop-kl` | Whole-window PPO K2 guard threshold; CLI default `0` disables the guard. PPO launch scripts default to `EARLY_STOP_KL=0.01`. |
+| `--token-level-filter` | Enable rank-local response-token policy filtering instead of the whole-window guard; default off. KL uses all original response tokens with gradients. |
+| `--token-filter-kl-threshold` | Independent per-token K2 threshold; default `0.01`, finite and nonnegative. Zero keeps only exact-zero log-ratios and does not disable filtering. |
 | `--train-token-budget` | Maximum real tokens in a pack; required and must be at least `--max-length`. |
 | `--train-pack-candidate-pool-size` | Replay candidate pool used for length-aware packing; defaults to four times `--train-max-sequences-per-pack`. |
 | `--grad-accum-steps` | Gradient accumulation steps. |
@@ -457,6 +514,8 @@ than full training resume.
 | --- | --- |
 | `TextWorld/NormalizedScore` | Normalized score over the recent window. |
 | `TextWorld/WinRate` | Episode win rate over the recent window. |
+| `TextWorld/Reward` | Mean raw cumulative step reward per ended episode in the recent window. |
+| `TextWorld/RewardEpisodes` | Number of ended episodes with reward in that window. |
 | `TextWorld/InvalidActionRate` | Fraction of invalid actions. |
 | `Replay/FillRatio` | Replay-buffer fill ratio. |
 | `Replay/TrainSampleTrainerVersionLagMean` | Version lag between training samples and the current trainer. |
@@ -466,10 +525,11 @@ than full training resume.
 | `Rollout/EnvironmentStepsPerEpisodeMean` | Mean valid environment steps per completed episode. |
 | `Rollout/HistoryLimitRate` | Fraction of episodes stopped by the history-token limit. |
 | `Train/PolicyLoss` | Trajectory-equal policy loss used by optimization. |
+| `Train/K2KL` / `Train/K3KL` | PPO raw K2/K3 from the same unfiltered response-token log-ratios, globally token-weighted across ranks, packs, and all attempted windows (including rejected updates). Independent of the loss/filter computation. |
 | `Train/LearningRate` | Current optimizer learning rate. |
 | `Train/TokensPerSec` | Valid training tokens processed per second. |
 | `Train/PackTokenUtilization` | Fraction of `--train-token-budget` occupied by real tokens in a pack. |
-| `KL/OldNewK3TrajectoryMean` | PPO/GRPO KL penalty used by optimization: valid-token mean within each trajectory, then an equal mean across valid trajectories. |
+| `KL/OldNewK3TrajectoryMean` | PPO/GRPO KL penalty used by optimization: valid-token mean within each trajectory, then an equal mean across valid trajectories. PPO includes all original response tokens even with policy token filtering; it can differ from `Train/K3KL` because the latter weights tokens equally. |
 | `Clip/PPOClipFrac` | With `--clip-mode ppo`, fraction of global valid response tokens outside the PPO ratio clip interval. |
 | `Infer/TokensPerSec` | vLLM generation throughput. |
 | `Infer/LengthRate` | Fraction of logical requests that exhaust their generation-token limit. |

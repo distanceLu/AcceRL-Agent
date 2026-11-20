@@ -1,4 +1,4 @@
-"""Response-token K2 monitoring for one distributed PPO optimizer window."""
+"""Response-token KL monitoring for one distributed PPO optimizer window."""
 
 from __future__ import annotations
 
@@ -22,6 +22,50 @@ def graph_zero(*tensors: torch.Tensor) -> torch.Tensor:
     for tensor in tensors[1:]:
         loss = loss + tensor.reshape(-1)[:0].float().sum()
     return loss
+
+
+@dataclass
+class RawTokenKLState:
+    """Monitor K2/K3 over the same unfiltered response tokens.
+
+    The caller supplies the original log-ratio before constructing any safe
+    values for the loss. Monitoring is detached FP64 work: even a finite
+    log-ratio whose exponential overflows only makes the reported K3 infinite,
+    without changing the loss, token filter, or optimizer decision.
+    """
+
+    stats: torch.Tensor | None = None
+
+    @torch.no_grad()
+    def observe(self, raw_logratio: torch.Tensor) -> None:
+        """Accumulate local token sums without a distributed collective."""
+        delta = raw_logratio.detach().double()
+        finite = torch.isfinite(delta)
+        finite_delta = delta[finite]
+        stats = torch.stack((
+            0.5 * finite_delta.square().sum(),
+            (torch.expm1(finite_delta) - finite_delta).sum(),
+            delta.new_tensor(delta.numel()),
+            (~finite).double().sum(),
+        ))
+        self.stats = stats if self.stats is None else self.stats + stats
+
+    @torch.no_grad()
+    def finalize(self, *, group=None) -> dict[str, float | int]:
+        """Sum across ranks once, then divide both estimates by token count."""
+        if self.stats is None:
+            raise RuntimeError("Raw KL monitoring requires an observed microbatch")
+        stats = self.stats.clone()
+        if dist.is_initialized():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=group)
+        k2_sum, k3_sum, count, nonfinite = stats.tolist()
+        denominator = max(count, 1)
+        return {
+            "raw_k2_kl": math.inf if nonfinite else k2_sum / denominator,
+            "raw_k3_kl": math.inf if nonfinite else k3_sum / denominator,
+            "raw_kl_token_count": int(count),
+            "raw_kl_nonfinite_tokens": int(nonfinite),
+        }
 
 
 @dataclass
@@ -98,4 +142,96 @@ class K2EarlyStopState:
             "early_stop_microbatch": self.first_stopped_microbatch,
             "early_stop_nonfinite_tokens": self.nonfinite_tokens,
             "optimizer_step_skipped": float(self.stop_ppo),
+        }
+
+
+@dataclass
+class K2TokenFilterState:
+    """Reject action tokens locally and reduce statistics once per window.
+
+    The caller keeps the original loss denominators when applying the returned
+    mask. Finite high-K2 tokens only lose their direct policy objective;
+    raw K3 regularization remains active on every response token. They do not
+    latch an early stop. Nonfinite action log-ratios and invalid model/loss
+    inputs are reported separately so the shared optimizer can reject an
+    unsafe window after every rank completes its backward schedule.
+    """
+
+    threshold: float = 0.01
+    stats: torch.Tensor | None = None
+    kept_tokens: int = 0
+    nonfinite_tokens: int = 0
+    invalid_microbatches: int = 0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.threshold) or self.threshold < 0:
+            raise ValueError("K2 threshold must be finite and nonnegative")
+
+    @torch.no_grad()
+    def observe(
+        self,
+        new_logprobs: torch.Tensor,
+        old_logprobs: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the local keep mask without any distributed collective.
+
+        A missing action mask means every input position is a response token.
+        Detached FP64 subtraction/squaring avoids overflow on finite FP32
+        logprobs and keeps monitoring out of the actor's backward graph.
+        """
+        if new_logprobs.shape != old_logprobs.shape or (
+            mask is not None and new_logprobs.shape != mask.shape
+        ):
+            raise ValueError("K2 logprobs and action-token mask must have the same shape")
+        action = (
+            torch.ones_like(new_logprobs, dtype=torch.bool)
+            if mask is None else mask.to(device=new_logprobs.device, dtype=torch.bool)
+        )
+        delta = new_logprobs.detach().double() - old_logprobs.detach().double()
+        finite = torch.isfinite(delta)
+        k2 = 0.5 * delta.square()
+        keep = action & finite & (k2 <= self.threshold)
+        stats = torch.stack((
+            k2[action & finite].sum(),
+            action.double().sum(),
+            keep.double().sum(),
+            (action & ~finite).double().sum(),
+            k2[keep].sum(),
+            k2.new_zeros(()),
+        ))
+        self.stats = stats if self.stats is None else self.stats + stats
+        return keep
+
+    @torch.no_grad()
+    def invalidate(self) -> None:
+        """Record an unsafe model/loss input in the current microbatch."""
+        if self.stats is None:
+            raise RuntimeError("Token filtering requires an observed microbatch before invalidation")
+        self.stats[5] += 1
+
+    @torch.no_grad()
+    def finalize(self, *, group=None) -> dict[str, float | int]:
+        """DP-sum complete window statistics, including empty local packs."""
+        if self.stats is None:
+            raise RuntimeError("Token filtering requires at least one observed microbatch")
+        stats = self.stats.clone()
+        if dist.is_initialized():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=group)
+        squared_sum, count, kept, nonfinite, kept_sum, invalid = stats.tolist()
+        self.kept_tokens = int(kept)
+        self.nonfinite_tokens = int(nonfinite)
+        self.invalid_microbatches = int(invalid)
+        raw_k2 = math.inf if nonfinite else squared_sum / max(count, 1)
+        return {
+            "k2_kl": raw_k2,
+            "token_filter/action_tokens": int(count),
+            "token_filter/kept_tokens": self.kept_tokens,
+            "token_filter/masked_tokens": int(count - kept),
+            "token_filter/masked_fraction": (count - kept) / max(count, 1),
+            "token_filter/nonfinite_tokens": self.nonfinite_tokens,
+            "token_filter/invalid_microbatches": self.invalid_microbatches,
+            "token_filter/k2_kl": raw_k2,
+            "token_filter/kept_k2_kl": kept_sum / max(kept, 1),
+            "token_filter/threshold": self.threshold,
         }

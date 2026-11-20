@@ -19,12 +19,26 @@ LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/runs/TextWorld_Slime/$RUN_NAME}"
 HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/data/lcx4/hf_cache/Qwen1.5-MoE-A2.7B-Chat}"
 MEGATRON_CHECKPOINT="${MEGATRON_CHECKPOINT:-$SCRIPT_DIR/artifacts/conversion_v1/checkpoint}"
 PROMPT_DATA="${PROMPT_DATA:-$SCRIPT_DIR/prepared_v2/train.jsonl}"
+RESUME_FROM="${RESUME_FROM:-}"
 export TW_EVENT_DIR="$LOG_DIR/events"
 export TENSORBOARD_DIR="${TENSORBOARD_DIR:-$LOG_DIR/tensorboard}"
 
 [[ -x "$PYTHON_BIN" ]] || { echo "Missing Python: $PYTHON_BIN" >&2; exit 1; }
 [[ -r "$HF_CHECKPOINT/config.json" ]] || { echo "Missing HF config" >&2; exit 1; }
-[[ -d "$MEGATRON_CHECKPOINT" ]] || { echo "Missing converted Megatron checkpoint" >&2; exit 1; }
+if [[ ! -d "$MEGATRON_CHECKPOINT" ]]; then
+  # Conversion refuses an existing output directory; preserve earlier logs.
+  conversion_output="$SCRIPT_DIR/artifacts/conversion_rebuilt_$(date +%Y%m%d_%H%M%S)_$$"
+  {
+    printf 'Missing converted Megatron checkpoint: %s\n' "$MEGATRON_CHECKPOINT"
+    printf 'Set MEGATRON_CHECKPOINT to an existing initial conversion, or rebuild from HF (requires free GPUs 0–3):\n'
+    printf '  cd %q\n' "$PROJECT_ROOT"
+    printf '  %q -m framework_benchmark.convert_checkpoint --output %q &&\n' "$PYTHON_BIN" "$conversion_output"
+    printf '  MEGATRON_CHECKPOINT=%q bash %q' "$conversion_output/checkpoint" "$SCRIPT_DIR/train_textworld_ppo.sh"
+    if (( $# )); then printf ' %q' "$@"; fi
+    printf '\n'
+  } >&2
+  exit 1
+fi
 [[ -r "$PROMPT_DATA" ]] || { echo "Missing frozen TextWorld prompt manifest: $PROMPT_DATA" >&2; exit 1; }
 source "$SCRIPT_DIR/model_qwen15_moe.sh"
 
@@ -75,15 +89,26 @@ cmd=("$PYTHON_BIN" -m framework_benchmark.launch_slime
   --sglang-disable-cuda-graph --sglang-enable-metrics
   --attention-backend flash --bf16 --seed "$SEED"
   --use-tensorboard
-  --save "$LOG_DIR/checkpoints" --save-interval 1000
-  "$@"
+  --save "$LOG_DIR/checkpoints" --save-interval 100 --save-total-limit 1
+  --save-full-ppo-checkpoint
 )
+if [[ -n "$RESUME_FROM" ]]; then
+  cmd+=(--load "$RESUME_FROM")
+fi
+cmd+=("$@")
 
 # Preview without starting Ray or touching GPUs:
 # DRY_RUN=1 bash framework_benchmark/train_textworld_ppo.sh
+# Use rank-local action-token K2 filtering instead of the window early-stop guard:
+# bash framework_benchmark/train_textworld_ppo.sh --token-level-filter
+# K2 > 0.01 tokens contribute zero loss; original episode/batch denominators remain.
+# The number of packed microbatches is dynamic, independent of the 192-episode batch.
 # Small pilot (same batch/context as the successful capacity test):
 # bash framework_benchmark/train_textworld_ppo.sh --num-rollout 1 --rollout-batch-size 3 --global-batch-size 3
 # Additional Slime arguments override earlier defaults.
+# Resume the most recent complete Actor/Critic checkpoint in a new log directory:
+# RESUME_FROM=/absolute/path/to/previous/run/checkpoints bash framework_benchmark/train_textworld_ppo.sh --token-level-filter
+# --num-rollout remains the total target; checkpoint 799 resumes at rollout 800.
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
   printf '%q ' "${cmd[@]}"; printf '\n'
   exit 0
@@ -93,3 +118,16 @@ printf 'Project: %s\nGPUs: %s\nLogs: %s\nTensorBoard: %s\n' "$PROJECT_ROOT" "$CU
 printf '%q ' "${cmd[@]}" > "$LOG_DIR/launch_command.sh"
 printf '\n' >> "$LOG_DIR/launch_command.sh"
 "${cmd[@]}" 2>&1 | tee "$LOG_DIR/console.log"
+
+# 默认batch级过滤，开启token级过滤参数为--token-level-filter
+# bash /mnt/data/lcx4/AcceRL-Agent/framework_benchmark/train_textworld_ppo.sh --token-level-filter
+
+# 前向一致性导致old / new 比率ratio不为1，bash /mnt/data/lcx4/AcceRL-Agent/framework_benchmark/train_textworld_ppo.sh --token-level-filter --moe-permute-fusion
+
+# RESUME_FROM=/之前运行/checkpoints \
+# bash /mnt/data/lcx4/AcceRL-Agent/framework_benchmark/train_textworld_ppo.sh --token-level-filter
+
+
+# 11-09 10:50 ratio爆炸，moe专家合并前向不一致
+# 11-10 18:03 batch级过滤
+# 11-13 17:44 token级过滤

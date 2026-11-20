@@ -25,6 +25,9 @@ def environment(gpus=''):
             'PATH': f'{ENV}/bin:' + os.environ.get('PATH', ''),
             'LD_LIBRARY_PATH': ':'.join(map(str, libraries + [ENV/'lib'])),
             'LD_PRELOAD': str(ENV/'lib/libstdc++.so.6'),
+            # FlashInfer appends .cache/flashinfer to this base. The shared
+            # home cache may be a dangling symlink after cache cleanup.
+            'FLASHINFER_WORKSPACE_BASE': os.environ.get('FLASHINFER_WORKSPACE_BASE', str(ROOT)),
             'CUDA_HOME': str(ENV), 'RAY_ADDRESS': 'local'}
 
 

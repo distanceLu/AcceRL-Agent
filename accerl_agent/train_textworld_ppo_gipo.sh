@@ -74,10 +74,11 @@ cmd=("$PYTHON_BIN" -m accerl_agent.run_agent_textworld
   --gipo-sigma 0.3
   --clip-eps 0.1
   --early-stop-kl "${EARLY_STOP_KL:-0.01}"
+  --token-filter-kl-threshold "${TOKEN_FILTER_KL_THRESHOLD:-0.01}"
   --old-new-kl-coef 0.05
   --dtype bfloat16
   --seed 42
-  --metrics-window-size 1000
+  --metrics-window-size 192
   --metrics-active-timeout-seconds 600
   --log-dir "$LOG_DIR"
   --trust-remote-code
@@ -86,6 +87,9 @@ cmd=("$PYTHON_BIN" -m accerl_agent.run_agent_textworld
 )
 
 # Extra CLI arguments override defaults, e.g. --stop-after-steps 1000 (0 disables it).
+# Add --token-level-filter to mask policy terms above TOKEN_FILTER_KL_THRESHOLD; raw differentiable K3 still covers all response tokens.
+# bash accerl_agent/train_textworld_ppo_gipo.sh --token-level-filter
+# TOKEN_FILTER_KL_THRESHOLD=0.02 bash accerl_agent/train_textworld_ppo_gipo.sh --token-level-filter
 printf "Project: %s\nGPUs: %s\nLog directory: %s\n" "$PROJECT_ROOT" "$CUDA_VISIBLE_DEVICES" "$LOG_DIR"
 printf "%q " "${cmd[@]}" > "$LOG_DIR/launch_command.sh"
 printf "\n" >> "$LOG_DIR/launch_command.sh"

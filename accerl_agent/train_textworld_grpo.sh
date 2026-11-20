@@ -73,7 +73,7 @@ cmd=("$PYTHON_BIN" -m accerl_agent.run_agent_textworld
   --old-new-kl-coef 0.05
   --dtype bfloat16
   --seed 42
-  --metrics-window-size 1000
+  --metrics-window-size 192
   --metrics-active-timeout-seconds 600
   --log-dir "$LOG_DIR"
   --trust-remote-code
